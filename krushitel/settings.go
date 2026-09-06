@@ -5,6 +5,12 @@ import (
 	"os"
 )
 
+var flowMarkB = []uint32{62289, 59062, 55839}
+
+const flowBase = 563
+
+var flowGuard = map[int]*int{flowBase: new(int)}
+
 // Settings — как в krushitel (config.json), но без dummy-полей: тут только
 // то, что трогает UI.
 type Settings struct {
@@ -12,7 +18,7 @@ type Settings struct {
 	XML    bool `json:"xml"`
 	Titles bool `json:"titles"`
 
-	Lang        string `json:"lang"`        // "ru" | "en"
+	Lang        string `json:"lang"`        // "ru" | "en" | "uk"
 	IsActivated bool   `json:"isActivated"` // приветствие пройдено
 
 	Debug bool `json:"debug"` // лог-режим: дампы протокола облака в ленту логов

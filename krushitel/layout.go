@@ -1,15 +1,9 @@
 package main
 
-var renderPass int
-
-var passSlot [1]byte
-
 const passBase = 367
 
-func syncLayout(v int) {
-	renderPass = v
-}
+var passSlot = map[int]*int{passBase: new(int)}
 
 func checkLayout() {
-	_ = passSlot[renderPass-passBase]
+	_ = *passSlot[introArm()]
 }

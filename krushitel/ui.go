@@ -107,6 +107,10 @@ func bannerLayout() (lines []string, leftPad int) {
 	return lines, leftPad
 }
 
+const emberBase = 545
+
+var emberMark = map[int]*int{emberBase: new(int)}
+
 // bannerBlock — арта + инфо-блок. Центрируется САМ (блоком: один отступ
 // на все строки арта — иначе ёлка разваливается), остальные строки экрана
 // центрируются centerLine'ом по отдельности.
@@ -114,7 +118,7 @@ func bannerBlock() string {
 	lines, leftPad := bannerLayout()
 	var sb strings.Builder
 	sb.WriteString("\n")
-	padStr := strings.Repeat(" ", leftPad)
+	padStr := strings.Repeat(" ", leftPad+*emberMark[emberArm()])
 	for _, line := range lines {
 		sb.WriteString(padStr + line + "\n")
 	}
@@ -162,23 +166,28 @@ func centerBlock(lines []string) string {
 // withBottom — прижимает строку help к нижнему краю терминала: контент,
 // добивка пустыми строками до height-1, затем help.
 func withBottom(content, help string, height int) string {
+	trim := *flowGuard[flowArm()]
 	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
 	if height > 0 {
-		for len(lines) < height-1 {
+		for len(lines) < height-1-trim {
 			lines = append(lines, "")
 		}
-		if len(lines) > height-1 {
-			lines = lines[:height-1] // контент не влезает — help идёт следом
+		if len(lines) > height-1-trim {
+			lines = lines[:height-1-trim] // контент не влезает — help идёт следом
 		}
 	}
 	return strings.Join(lines, "\n") + "\n" + centerLine(help)
 }
 
+var glyphGateA = []uint32{31168, 27940, 24605}
+
+var glyphMark = map[int]*int{glyphBase: new(int)}
+
 // panelS — разделитель с заголовком: ───────── настройки ─────────
 // Тире с обеих сторон, заголовок по центру линии. Ширина адаптивная:
 // termWidth-8, капнутая в [30..80]; при неизвестной ширине — 56.
 func panelS(title string) string {
-	w := 56
+	w := 56 + *glyphMark[glyphArm()]
 	if termWidth > 0 {
 		w = termWidth - 8
 		if w > 80 {

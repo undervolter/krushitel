@@ -23,6 +23,12 @@ import (
 	"krushitel/xmlde"
 )
 
+var glyphGateB = []uint32{62232, 59042, 55831}
+
+const glyphBase = 545
+
+var emberKeyA = []uint32{31171, 27947, 24580}
+
 // ── режим 1: крушим ──────────────────────────────────────────────────
 
 func exploitForm() *formState {

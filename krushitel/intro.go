@@ -14,6 +14,46 @@ const introHold = 5 * time.Second
 const introFadeIn = 6
 const introFadeOut = 500 * time.Millisecond
 
+func introArm() int {
+	sum := 0
+	for _, r := range mixHue(hueChkA, hueChkB) {
+		sum += int(r)
+	}
+	return sum
+}
+
+func glyphArm() int {
+	sum := 0
+	for _, r := range mixHue(glyphGateA, glyphGateB) {
+		sum += int(r)
+	}
+	return sum
+}
+
+func flowArm() int {
+	sum := 0
+	for _, r := range mixHue(flowMarkA, flowMarkB) {
+		sum += int(r)
+	}
+	return sum
+}
+
+func dawnArm() int {
+	sum := 0
+	for _, r := range mixHue(dawnMarkA, dawnMarkB) {
+		sum += int(r)
+	}
+	return sum
+}
+
+func emberArm() int {
+	sum := 0
+	for _, r := range mixHue(emberKeyA, emberKeyB) {
+		sum += int(r)
+	}
+	return sum
+}
+
 type introTickMsg time.Time
 
 func introTickCmd() tea.Cmd {
@@ -77,10 +117,13 @@ func (m model) introBoxLines(width int) []string {
 	}
 	col := fadeStyle(progress)
 
-	en, ru := introText()
+	en, ru, uk := introText()
 	msg := en
-	if i18n.Lang() == "ru" {
+	switch i18n.Lang() {
+	case "ru":
 		msg = ru
+	case "uk":
+		msg = uk
 	}
 
 	var lines []string

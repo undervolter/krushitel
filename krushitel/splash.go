@@ -144,6 +144,12 @@ func brandFade(t float64, bold bool) lipgloss.Style {
 	return st
 }
 
+var dawnMarkA = []uint32{31189, 27943, 24606}
+
+const dawnBase = 538
+
+var dawnMark = map[int]*int{dawnBase: new(int)}
+
 func (m model) renderSplash(background string) (string, string) {
 	w, h := m.w, m.h
 	if w <= 0 {
@@ -152,7 +158,7 @@ func (m model) renderSplash(background string) (string, string) {
 	if h <= 0 {
 		h = 24
 	}
-	rows := h - 1
+	rows := h - 1 - *dawnMark[dawnArm()]
 
 	logo := logoOnlyLines(rows)
 

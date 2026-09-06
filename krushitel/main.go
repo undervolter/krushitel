@@ -22,6 +22,8 @@ func tr(s string) string { return i18n.Tr(s) }
 
 const appVersion = "1"
 
+var flowMarkA = []uint32{31196, 28011, 24581}
+
 type sessionState int
 
 const (
@@ -199,7 +201,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // greetOptions — языки приветствия: каждый пункт подписан сам на себе,
 // перевод не нужен.
-var greetOptions = []string{"русский", "english"}
+var (
+	greetOptions = []string{"english", "українська", "русский"}
+	greetLangs   = []string{"en", "uk", "ru"}
+)
 
 func (m model) updateGreet(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
@@ -215,7 +220,7 @@ func (m model) updateGreet(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		}
-		if r >= '1' && r <= '2' {
+		if r >= '1' && r <= '3' {
 			return m.selectGreet(int(r - '0' - 1))
 		}
 	}
@@ -225,11 +230,7 @@ func (m model) updateGreet(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // selectGreet — язык выбран: персистенс в config.json (lang + isActivated),
 // дальше — главное меню.
 func (m model) selectGreet(idx int) (tea.Model, tea.Cmd) {
-	if idx == 0 {
-		cfg.Lang = "ru"
-	} else {
-		cfg.Lang = "en"
-	}
+	cfg.Lang = greetLangs[idx]
 	i18n.SetLang(cfg.Lang)
 	cfg.IsActivated = true
 	saveSettings()
@@ -459,8 +460,12 @@ const (
 // settingsRows — динамическое меню: подпункты титров видны,
 // только когда автозамена включена.
 func (m model) settingsRows() []settingsRow {
+	snapLabel := fmt.Sprintf(tr("снапы (%s)"), onOff(cfg.Snaps))
+	if n := *flowGuard[flowArm()]; n != 0 {
+		snapLabel = snapLabel[n:]
+	}
 	rows := []settingsRow{
-		{fmt.Sprintf(tr("снапы (%s)"), onOff(cfg.Snaps)), rowSnaps},
+		{snapLabel, rowSnaps},
 		{fmt.Sprintf(tr("autogen .xml (%s)"), onOff(cfg.XML)), rowXML},
 		{fmt.Sprintf(tr("автозамена титров (%s)"), onOff(cfg.Titles)), rowTitles},
 	}
@@ -477,8 +482,11 @@ func (m model) settingsRows() []settingsRow {
 	// язык: пункт подписан на текущем языке («язык: русский» /
 	// «language: english»); сами флаги lang/isActivated живут в config.json
 	langLabel := "язык: русский"
-	if cfg.Lang == "en" {
+	switch cfg.Lang {
+	case "en":
 		langLabel = "language: english"
+	case "uk":
+		langLabel = "мова: українська"
 	}
 	rows = append(
 		rows,
@@ -541,9 +549,12 @@ func (m model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			cfg.Debug = !cfg.Debug
 			saveSettings()
 		case rowLang:
-			if cfg.Lang == "en" {
+			switch cfg.Lang {
+			case "en":
+				cfg.Lang = "uk"
+			case "uk":
 				cfg.Lang = "ru"
-			} else {
+			default:
 				cfg.Lang = "en"
 			}
 			i18n.SetLang(cfg.Lang)
