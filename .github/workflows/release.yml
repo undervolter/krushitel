@@ -2,7 +2,7 @@ name: release
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     paths:
       - "krushitel/**"
       - ".github/workflows/release.yml"
@@ -15,6 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.compute.outputs.tag }}
+      is_prerelease: ${{ steps.compute.outputs.is_prerelease }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,21 +25,41 @@ jobs:
         id: compute
         run: |
           set -euo pipefail
+
           BASE=$(grep -oP 'appVersion\s*=\s*"\K[^"]+' krushitel/main.go)
           if [ -z "$BASE" ]; then
             echo "could not find appVersion in krushitel/main.go" >&2
             exit 1
           fi
+
+          BRANCH="${GITHUB_REF_NAME}"
+          IS_PRERELEASE="false"
+          if [ "$BRANCH" = "dev" ]; then
+            IS_PRERELEASE="true"
+          fi
+
           git fetch --tags --force
-          LAST=$(git tag -l "v${BASE}.[0-9]*" | sed -E "s/^v${BASE}\.//" | grep -E '^[0-9]+$' | sort -n | tail -1 || true)
+
+          PATTERN="v${BASE}.0*"
+          if [ "$BRANCH" = "dev" ]; then
+            PATTERN="v${BASE}.0*-dev"
+          fi
+
+          LAST=$(git tag -l "$PATTERN" | sed -E "s/^v${BASE}\.0([0-9]+).*/\1/" | grep -E '^[0-9]+$' | sort -n | tail -1 || true)
+
           if [ -z "$LAST" ]; then
             NEXT=1
           else
             NEXT=$((LAST + 1))
           fi
-          TAG="v${BASE}.$(printf '%02d' "$NEXT")"
-          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+          TAG="v${BASE}.0${NEXT}"
+          if [ "$BRANCH" = "dev" ]; then
+            TAG="${TAG}-dev"
+          fi
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
           echo "computed tag: $TAG"
 
   build:
@@ -116,7 +137,11 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ needs.tag.outputs.tag }}"
-          gh release create "$TAG" dist/* \
-            --title "$TAG" \
-            --generate-notes \
-            --target "${{ github.sha }}"
+          IS_PRERELEASE="${{ needs.tag.outputs.is_prerelease }}"
+
+          FLAGS=(--title "$TAG" --generate-notes --target "${{ github.sha }}")
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            FLAGS+=(--prerelease)
+          fi
+
+          gh release create "$TAG" dist/* "${FLAGS[@]}"
