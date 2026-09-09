@@ -1,0 +1,26 @@
+# креды/титры — не светить
+config.json
+
+# артефакты сборки
+*.exe
+*.exe~
+*.dll
+*.so
+bin/
+release/
+krushitel
+krushitel_linux*
+titlegrab
+kt
+krlin
+
+# локальные тестовые данные
+pref.txt
+
+# вывод прогонов
+results/
+snapshots/
+xml/
+exp.txt
+vuln.txt
+alive.txt
