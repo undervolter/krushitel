@@ -17,7 +17,7 @@
 </div>
 
 <div align="center">
-<img width="852" height="685" alt="изображение" src="https://github.com/user-attachments/assets/f727542a-e0fb-4714-a2f1-0916e030b5e4" />
+<img width="767" height="448" alt="изображение" src="https://github.com/user-attachments/assets/5200d9bb-1479-409c-b405-14b992e7e0de" />
 </div>
 
 > [!WARNING]
@@ -25,24 +25,29 @@
 
 ## Возможности
  - Поддерживает смену текста на OSD камеры
+ - Умеет делать снапшоты
  - Имеет интуитивно понятный интерфейс
  - Имеет сканер префиксов
  - Имеет чекер серийников
  - Позволяет вытащить креды с камеры
  - и многое другое...
 
-### Сборка
+### Сборка на Windows
   ```sh
 git clone github.com/undervolter/krushitel
-cd krushitel/krushitel
-go build .
-./krushitel
+cd krushitel
+build_all.cmd
+  ```
+### Сборка на Linux
+  ```sh
+git clone github.com/undervolter/krushitel
+cd krushitel
+build.sh
   ```
 <h2>Скомпилированные бинарники доступны в Releases.</h2>
 
 ### Баги
- - Плохо работают снапшоты
- - Иногда туннель может вылетать
+ - Пока не обнаружены
 
 <h2>Нашел какой то баг? Пожалуйста, отпиши в issues!</h2>
 
