@@ -20,6 +20,7 @@ import (
 	"krushitel/fwd"
 	"krushitel/ironscan"
 	"krushitel/scanner"
+	"krushitel/smartpss"
 	"krushitel/xmlde"
 )
 
@@ -410,6 +411,45 @@ func xmlBlobForm() *formState {
 		showMsg(m, tr("blob → пароль"), tr("   пароль: ")+green(plain))
 	})
 	f.addStr(tr("вставь base64 blob"), true, false)
+	return f
+}
+
+// txt → SmartPSS xml (креды → импорт-файлы для SmartPSS)
+func txtXMLForm() *formState {
+	f := newFormState(tr("креды → xml"), func(m *model) {
+		inFile := m.form.fields[0].strVal
+		outFile := m.form.fields[1].strVal
+
+		data, err := os.ReadFile(inFile)
+		if err != nil {
+			showMsg(m, tr("креды → xml"), red("[-] "+err.Error()))
+			return
+		}
+		creds, skipped := xmlde.ParseCreds(data)
+		if len(creds) == 0 {
+			showMsg(m, tr("креды → xml"), red(tr("[!] нет разобранных кредов")))
+			return
+		}
+		imports := make([]smartpss.DeviceImport, len(creds))
+		for i, c := range creds {
+			imports[i] = smartpss.DeviceImport{Serial: c.Domain, Login: c.Username, Password: c.Password}
+		}
+		files, err := smartpss.WriteXML(outFile, imports)
+		if err != nil {
+			showMsg(m, tr("креды → xml"), red("[-] "+err.Error()))
+			return
+		}
+		msg := green(fmt.Sprintf(tr("[+] %d камер -> %s"), len(creds), outFile))
+		if skipped > 0 {
+			msg += yellow(fmt.Sprintf(tr(" (мимо формата: %d)"), skipped))
+		}
+		if files > 1 {
+			msg += dim(fmt.Sprintf(tr(" (%d файла(ов) по 64)"), files))
+		}
+		showMsg(m, tr("креды → xml"), msg)
+	})
+	f.addStr(tr("файл с кредами (SN,login:pass)"), true, true)
+	f.addStr(tr("выходной xml-файл"), true, false)
 	return f
 }
 

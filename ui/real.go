@@ -423,15 +423,38 @@ func (r *runState) eventsBlock() string {
 
 func (r *runState) checkView() string {
 	st := r.chk
+	// фаза чтения входного файла: движок ещё не сканит — бар показывает
+	// загрузку/санитайз серийников, чтобы экран не выглядел повисшим
+	if atomic.LoadInt64(&st.Reading) == 1 {
+		readLines := atomic.LoadInt64(&st.ReadLines)
+		readTotal := atomic.LoadInt64(&st.ReadTotal)
+		valid := atomic.LoadInt64(&st.ReadValid)
+		var sb strings.Builder
+		if readTotal > 0 {
+			pct := float64(readLines) / float64(readTotal) * 100
+			sb.WriteString(centerLine(fmt.Sprintf("%s %.1f%%", bar(readLines, readTotal, 30), pct)) + "\n")
+			sb.WriteString(centerLine(fmt.Sprintf(tr("%d/%d строк"), readLines, readTotal)+
+				" | "+fmt.Sprintf(tr("серийников: %s"), green(fmt.Sprint(valid)))+
+				" | "+r.elapsed())+"\n\n")
+		} else {
+			sb.WriteString(centerLine(yellow(tr("читаю файл…"))) + "\n\n")
+		}
+		sb.WriteString(r.eventsBlock())
+		return sb.String()
+	}
 	pct := 0.0
 	if st.Total > 0 {
 		pct = float64(st.Checked) / float64(st.Total) * 100
 	}
 	var sb strings.Builder
 	sb.WriteString(centerLine(fmt.Sprintf("%s %.1f%%", bar(st.Checked, st.Total, 30), pct)) + "\n")
-	sb.WriteString(centerLine(fmt.Sprintf("%d/%d | alive: %s | dead: %s | %s | %s",
+	orph := atomic.LoadInt64(&st.OrphanAlive) + atomic.LoadInt64(&st.OrphanDead)
+	sb.WriteString(centerLine(fmt.Sprintf("%d/%d | alive: %s | dead: %s | late: %s | orphan: %s | %s | %s | %s",
 		st.Checked, st.Total,
 		green(fmt.Sprint(st.Alive)), red(fmt.Sprint(st.Dead)),
+		yellow(fmt.Sprint(atomic.LoadInt64(&st.Late))),
+		yellow(fmt.Sprint(orph)),
+		fmt.Sprintf(tr("%.0f/мин"), st.AliveRate),
 		fmt.Sprintf(tr("%.0f/сек"), st.Speed),
 		r.elapsed())) + "\n\n")
 	sb.WriteString(r.eventsBlock())

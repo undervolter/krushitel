@@ -316,6 +316,7 @@ func (m model) updateRun(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 var xmlMenuOptions = []string{
 	"расшифровать XML (SmartPSS export → креды)",
 	"расшифровать blob (base64 → пароль)",
+	"собрать xml (креды txt → SmartPSS импорт)",
 	"назад",
 }
 
@@ -335,6 +336,10 @@ func (m model) updateXMLMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.form = xmlBlobForm()
 			m.state = stForm
 			m.form.focus()
+		case 2:
+			m.form = txtXMLForm()
+			m.state = stForm
+			m.form.focus()
 		default:
 			m.state = stMenu
 		}
@@ -346,7 +351,7 @@ func (m model) updateXMLMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		}
-		if r >= '1' && r <= '3' {
+		if r >= '1' && r <= '4' {
 			m.xmlCur = int(r - '0' - 1)
 			return m.updateXMLMenu(tea.KeyMsg{Type: tea.KeyEnter})
 		}

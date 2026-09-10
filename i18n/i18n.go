@@ -39,6 +39,14 @@ var en = map[string]string{
 	// ── smartpss-подменю ──
 	"расшифровать XML (SmartPSS export → креды)": "decrypt XML (SmartPSS export → creds)",
 	"расшифровать blob (base64 → пароль)":        "decrypt blob (base64 → password)",
+	"собрать xml (креды txt → SmartPSS импорт)": "build xml (creds txt → SmartPSS import)",
+	"креды → xml":                               "creds → xml",
+	"файл с кредами (SN,login:pass)":            "creds file (SN,login:pass)",
+	"выходной xml-файл":                         "output xml file",
+	"[!] нет разобранных кредов":                "[!] no parsed creds",
+	"[+] %d камер -> %s":                        "[+] %d cams -> %s",
+	" (мимо формата: %d)":                       " (skipped malformed: %d)",
+	" (%d файла(ов) по 64)":                     " (%d file(s) of 64)",
 	"назад": "back",
 
 	// ── настройки + редактор титров ──
@@ -188,6 +196,9 @@ var en = map[string]string{
 	"ошибка открытия выходного файла: ":                                   "output file open error: ",
 	"ошибка резолва сервера: ":                                            "server resolve error: ",
 	"не смог создать необходимое кол-во сокетов (фикс: ulimit -n 100000)": "couldn't create enough UDP sockets (to fix: ulimit -n 100000)",
+	"читаю файл…":      "reading file…",
+	"серийников: %s":   "serials: %s",
+	"%.0f/мин":         "%.0f/min",
 }
 
 // Tr — перевод строки по словарю; при ru (или отсутствии ключа) — как есть.
