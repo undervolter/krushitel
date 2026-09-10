@@ -35,20 +35,19 @@
 * and much more...
 
 ### Building on Windows
-
-```sh
+  ```sh
 git clone github.com/undervolter/krushitel
 cd krushitel
-build_all.cmd
-cd bin
-```
+build_ffmpeg_static.cmd
+build_win_static.cmd
+  ```
 ### Building on Linux
-```sh
+  ```sh
 git clone github.com/undervolter/krushitel
 cd krushitel
-build.sh
-cd bin
-```
+build_ffmpeg_static_linux.sh
+build_linux_static.sh
+  ```
 <h2>Compiled binaries are available in Releases.</h2>
 
 ### Bugs
