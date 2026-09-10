@@ -36,13 +36,15 @@
   ```sh
 git clone github.com/undervolter/krushitel
 cd krushitel
-build_all.cmd
+build_ffmpeg_static.cmd
+build_win_static.cmd
   ```
 ### Сборка на Linux
   ```sh
 git clone github.com/undervolter/krushitel
 cd krushitel
-build.sh
+build_ffmpeg_static_linux.sh
+build_linux_static.sh
   ```
 <h2>Скомпилированные бинарники доступны в Releases.</h2>
 
