@@ -49,6 +49,7 @@ build_ffmpeg_static_linux.sh
 build_linux_static.sh
   ```
 <h2>Compiled binaries are available in Releases.</h2>
+
 ## Roadmap
 - **Switch scan output from `.txt` to `.csv`**
 - **Refactor prefix grabber**
