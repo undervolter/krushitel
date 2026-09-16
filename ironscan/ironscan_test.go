@@ -236,3 +236,100 @@ func TestParseResponse_ExtendedModels(t *testing.T) {
 		t.Errorf("r2 = %+v, want Serial AMC00065CPTBE31926 Model DHI-ITC237-PW1B", r2)
 	}
 }
+
+func TestCleanModel_DummyStrings(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"000000000000000000", ""},
+		{"00000000", ""},
+		{"unknown", ""},
+		{"UNKNOWN", ""},
+		{"null", ""},
+		{"123456", ""},
+		{"DH-XVR5108HS-X", "DH-XVR5108HS-X"},
+		{"NVR", "NVR"},
+		{"XVR", "XVR"},
+		{"SV131CX", "SV131CX"},
+		{"STANDVR-16H4200", "STANDVR-16H4200"},
+		{"IPC-HDBW2320R-ZS", "IPC-HDBW2320R-ZS"},
+	}
+	for _, c := range cases {
+		if got := cleanModel(c.in); got != c.want {
+			t.Errorf("cleanModel(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestDVRIP_0c_Fallback(t *testing.T) {
+	// Mock server that returns SN in probe, nothing on 0x0b, and model on 0x0c
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Read probe (32 bytes)
+		probe := make([]byte, 32)
+		io.ReadFull(conn, probe)
+
+		// Send probe resp with SN
+		realmBody := []byte("Realm:Login to 4H01557PAZ14C8F\r\nRandom:1234\r\n\r\n")
+		respHdr := make([]byte, 32)
+		respHdr[0] = 0xb0
+		respHdr[1] = 0x01
+		binary.LittleEndian.PutUint16(respHdr[4:6], uint16(len(realmBody)))
+		conn.Write(append(respHdr, realmBody...))
+
+		for {
+			cmdHdr := make([]byte, 32)
+			if _, err := io.ReadFull(conn, cmdHdr); err != nil {
+				return
+			}
+			opcode := binary.LittleEndian.Uint32(cmdHdr[8:12])
+			if opcode == 0x0b {
+				// Empty response for 0x0b
+				emptyHdr := make([]byte, 32)
+				emptyHdr[0] = 0xb0
+				emptyHdr[1] = 0x00
+				conn.Write(emptyHdr)
+			} else if opcode == 0x0c {
+				// Model in 0x0c!
+				modelBody := []byte("DHI-XVR7104E-FALLBACK\x00")
+				mHdr := make([]byte, 32)
+				mHdr[0] = 0xb0
+				mHdr[1] = 0x00
+				binary.LittleEndian.PutUint16(mHdr[4:6], uint16(len(modelBody)))
+				conn.Write(append(mHdr, modelBody...))
+			} else if opcode == 0x08 {
+				// Firmware
+				fwBody := []byte("4.000.0001.0\x00")
+				fwHdr := make([]byte, 32)
+				fwHdr[0] = 0xb0
+				fwHdr[1] = 0x00
+				binary.LittleEndian.PutUint16(fwHdr[4:6], uint16(len(fwBody)))
+				conn.Write(append(fwHdr, fwBody...))
+			}
+		}
+	}()
+
+	addr := ln.Addr().String()
+	res := tryConnect(context.Background(), addr, generateProbe(), 2*time.Second)
+	if res.Serial != "4H01557PAZ14C8F" {
+		t.Fatalf("res.Serial = %q, want 4H01557PAZ14C8F", res.Serial)
+	}
+	if res.Model != "DHI-XVR7104E-FALLBACK" {
+		t.Fatalf("res.Model = %q, want DHI-XVR7104E-FALLBACK (from 0x0c fallback)", res.Model)
+	}
+	if res.Firmware != "4.000.0001.0" {
+		t.Fatalf("res.Firmware = %q, want 4.000.0001.0", res.Firmware)
+	}
+}

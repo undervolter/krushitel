@@ -144,17 +144,25 @@ func cleanModel(s string) string {
 	if len(s) < 3 || len(s) > 64 {
 		return ""
 	}
+	// Отсекаем мусорные заглушки регистраторов (нули, repeating dummy, unknown)
+	if strings.Count(s, "0") == len(s) || strings.Contains(s, "00000000") || strings.EqualFold(s, "unknown") || strings.EqualFold(s, "null") {
+		return ""
+	}
 	hasAlpha := false
+	hasLetter := false
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if c < 0x20 || c > 0x7e {
 			return ""
 		}
-		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+			hasLetter = true
+			hasAlpha = true
+		} else if c >= '0' && c <= '9' {
 			hasAlpha = true
 		}
 	}
-	if !hasAlpha {
+	if !hasAlpha || !hasLetter {
 		return ""
 	}
 	return s
@@ -317,11 +325,17 @@ func tryConnect(ctx context.Context, addr string, probe []byte, timeout time.Dur
 		return res
 	}
 
-	// модель по 0x0b, прошивка по 0x08 (dahua-info.py)
+	// модель по 0x0b (DeviceType), фоллбэк на 0x0c (DeviceName), прошивка по 0x08 (dahua-info.py)
 	if res.Model == "" {
 		conn.SetDeadline(time.Now().Add(timeout))
 		if raw := dvripCmd(conn, 0x0b); len(raw) > 0 {
 			res.Model = extractModelFromRaw(raw)
+		}
+		if res.Model == "" {
+			conn.SetDeadline(time.Now().Add(timeout))
+			if raw := dvripCmd(conn, 0x0c); len(raw) > 0 {
+				res.Model = extractModelFromRaw(raw)
+			}
 		}
 	}
 	if res.Firmware == "" {
@@ -343,6 +357,12 @@ func tryConnect(ctx context.Context, addr string, probe []byte, timeout time.Dur
 			freshConn.SetDeadline(time.Now().Add(timeout))
 			if raw := dvripCmd(freshConn, 0x0b); len(raw) > 0 {
 				res.Model = extractModelFromRaw(raw)
+			}
+			if res.Model == "" {
+				freshConn.SetDeadline(time.Now().Add(timeout))
+				if raw := dvripCmd(freshConn, 0x0c); len(raw) > 0 {
+					res.Model = extractModelFromRaw(raw)
+				}
 			}
 			if res.Firmware == "" {
 				if raw := dvripCmd(freshConn, 0x08); len(raw) > 0 {
