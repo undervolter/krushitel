@@ -3,6 +3,8 @@ package ui
 import (
 	"strings"
 	"testing"
+
+	"krushitel/i18n"
 )
 
 // centerLine — центр одной строки по ширине терминала.
@@ -71,5 +73,30 @@ func TestBannerBlockCentered(t *testing.T) {
 	}
 	if len(pads) != 1 {
 		t.Fatalf("пад арта разъехался: %v", pads)
+	}
+}
+
+func TestBetaNoticeI18n(t *testing.T) {
+	// RU
+	i18n.SetLang("ru")
+	ruNotice := betaNotice()
+	if !strings.Contains(ruNotice, "Это beta версия софта - работать может нестабильно.") {
+		t.Fatalf("RU notice = %q", ruNotice)
+	}
+	ruBanner := bannerBlock()
+	if !strings.Contains(ruBanner, "крушитель v1.3 (beta)") {
+		t.Fatalf("RU banner should contain v1.3 (beta), got: %s", ruBanner)
+	}
+
+	// EN
+	i18n.SetLang("en")
+	defer i18n.SetLang("ru")
+	enNotice := betaNotice()
+	if !strings.Contains(enNotice, "This is a beta version - it can work unstably.") {
+		t.Fatalf("EN notice = %q", enNotice)
+	}
+	enBanner := bannerBlock()
+	if !strings.Contains(enBanner, "krushitel v1.3 (beta)") {
+		t.Fatalf("EN banner should contain krushitel v1.3 (beta), got: %s", enBanner)
 	}
 }

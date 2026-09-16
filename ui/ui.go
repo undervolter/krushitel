@@ -63,7 +63,7 @@ func bannerBlock() string {
 	art := strings.Split(strings.TrimRight(bannerArt, "\n"), "\n")
 	info := []string{
 		"",
-		styleCyan.Bold(true).Render("крушитель v1.2"),
+		styleCyan.Bold(true).Render(tr("крушитель v1.3 (beta)")),
 		styleDim.Render("exploit-based dahua sn scanner"),
 		"",
 		styleDim.Render("t.me/kkrushitel"),
@@ -111,12 +111,30 @@ func bannerBlock() string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("\n")
+	sb.WriteString(rightLine(betaNotice()) + "\n")
 	padStr := strings.Repeat(" ", leftPad)
 	for _, line := range lines {
 		sb.WriteString(fitWidth(padStr+line) + "\n")
 	}
 	return sb.String()
+}
+
+// betaNotice — постоянный текст beta-версии в углу.
+func betaNotice() string {
+	return styleYellow.Render(tr("Это beta версия софта - работать может нестабильно."))
+}
+
+// rightLine — прижимает строку к правому краю терминала (2 пробела от правого края).
+func rightLine(s string) string {
+	if termWidth <= 0 {
+		return margin + s
+	}
+	w := lipgloss.Width(s)
+	pad := termWidth - w - 2
+	if pad < 0 {
+		pad = 0
+	}
+	return fitWidth(strings.Repeat(" ", pad) + s)
 }
 
 // fitWidth — последний рубеж против ползущего рендера: строка НЕ должна

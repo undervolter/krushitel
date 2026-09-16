@@ -49,7 +49,7 @@ func (f *formState) addStr(label string, required bool, fileMustExist bool) {
 		if required && s == "" {
 			return tr("обязательное поле")
 		}
-		if fileMustExist && !fileExists(s) {
+		if s != "" && fileMustExist && !fileExists(s) {
 			return tr("такого файла нет! перепиши, пожалуйста")
 		}
 		return ""

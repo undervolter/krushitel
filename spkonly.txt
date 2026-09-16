@@ -1,0 +1,14 @@
+# Dahua модели с встроенным динамиком / двусторонним звуком (Two-way audio / Speaker / TiOC / Active Deterrence)
+-PV
+-AS
+IPC-K
+IPC-C
+IPC-A
+Hero
+SD1A
+SD2A
+SD3A
+SD4A
+SD5A
+VTO
+VTH

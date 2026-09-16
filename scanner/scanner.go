@@ -29,6 +29,56 @@ const (
 	USERKEY     = "996103384cdf19179e19243e959bbf8b"
 	SOCKET_BUF  = 65536
 
+	DMSS_MAIN_SERVER   = "p2p.dolynkcloud.com"
+	DMSS_MAIN_PORT     = 8800
+	DMSS_USERNAME      = "793k5zdi4dd5f037sooag8yo_dolynkc"
+	DMSS_USERKEY       = "ef8hatgmcuk4qamgg4fxx19x33s9q1xy"
+)
+
+type cloudProfileType int
+
+const (
+	profileSmartPSS cloudProfileType = iota
+	profileDMSS
+)
+
+type cloudProfile struct {
+	profileType cloudProfileType
+	name        string
+	server      string
+	port        int
+	user        string
+	userKey     string
+	verbGet     string
+	verbPost    string
+}
+
+var (
+	smartpssProfile = cloudProfile{
+		profileType: profileSmartPSS,
+		name:        "smartpss",
+		server:      MAIN_SERVER,
+		port:        MAIN_PORT,
+		user:        USERNAME,
+		userKey:     USERKEY,
+		verbGet:     "DHGET",
+		verbPost:    "DHPOST",
+	}
+
+	dmssProfile = cloudProfile{
+		profileType: profileDMSS,
+		name:        "dmss",
+		server:      DMSS_MAIN_SERVER,
+		port:        DMSS_MAIN_PORT,
+		user:        DMSS_USERNAME,
+		userKey:     DMSS_USERKEY,
+		verbGet:     "NFGET",
+		verbPost:    "NFPOST",
+	}
+)
+
+const (
+
 	// пайплайн: окно p2p-channel запросов в полёте управляется governor'ом
 	// в [W_MIN..W_MAX], старт = PIPELINE_WINDOW. late-доля цикла ниже 2% —
 	// окно растёт, выше 10% — сжимается (облако молча дропает перегруз).
@@ -161,6 +211,34 @@ func p2pChannelBody(lport int, aid []byte) string {
 		strings.Join(aidHex, " "), lport)
 }
 
+func dmssReq(method, path, body string, cseq int64, digest, nonce, curdate string) string {
+	pcsID := fmt.Sprintf("%016x%016x", rand.Uint64(), rand.Uint64())
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("%s %s HTTP/1.1\r\n", method, path))
+	sb.WriteString("X-Version: 6.7.15\r\n")
+	sb.WriteString("X-Sversion: 1.1.0\r\n")
+	sb.WriteString(fmt.Sprintf("x-pcs-request-id: %s\r\n", pcsID))
+	sb.WriteString("X-ToUType: Client/Dmss_Android\r\n")
+	sb.WriteString(fmt.Sprintf("CSeq: %d\r\n", int32(cseq)))
+	sb.WriteString(fmt.Sprintf("Authorization: WSSE profile=\"UsernameToken\"\r\nX-WSSE: UsernameToken Username=\"%s\", PasswordDigest=\"%s\", Nonce=\"%s\", Created=\"%s\"\r\n",
+		DMSS_USERNAME, digest, nonce, curdate))
+	if body != "" {
+		sb.WriteString(fmt.Sprintf("Content-Type: \r\nContent-Length: %d\r\n", len(body)))
+	}
+	sb.WriteString("\r\n" + body)
+	return sb.String()
+}
+
+func dmssChannelBody(lport int, aid []byte) string {
+	aidHex := make([]string, 8)
+	for i, b := range aid {
+		aidHex[i] = fmt.Sprintf("%02x", b)
+	}
+	clientID := fmt.Sprintf("%016x%016x:80", rand.Uint64(), rand.Uint64())
+	return fmt.Sprintf("<body><Identify>%s</Identify><IpEncrpt>true</IpEncrpt><NatValueT>0</NatValueT><version>6.7.15</version><sVersion>1.1.0</sVersion><LocalAddr>127.0.0.1:%d</LocalAddr><Pid>0</Pid><ClientId>%s</ClientId></body>",
+		strings.Join(aidHex, " "), lport, clientID)
+}
+
 // channelAckAlive — критерий живости (прежний, не менялся): финальный
 // 2xx-3xx ack на p2p-channel с непустым <LocalAddr> — устройство само
 // отчиталось своим адресом. 2xx без LocalAddr — облако приняло запрос в
@@ -209,6 +287,7 @@ type graveEntry struct {
 // так же, как раньше). RTT перестаёт складываться — скорость упирается
 // в полосу сокета и облако, а не в сумму задержек.
 type channelPipeline struct {
+	prof                      cloudProfile
 	conn                      *net.UDPConn
 	lport                     int
 	digest, nonceStr, curdate string
@@ -223,7 +302,12 @@ type channelPipeline struct {
 }
 
 func newChannelPipeline(conn *net.UDPConn, timeout time.Duration) *channelPipeline {
+	return newChannelPipelineWithProfile(conn, smartpssProfile, timeout)
+}
+
+func newChannelPipelineWithProfile(conn *net.UDPConn, prof cloudProfile, timeout time.Duration) *channelPipeline {
 	p := &channelPipeline{
+		prof:      prof,
 		conn:      conn,
 		lport:     conn.LocalAddr().(*net.UDPAddr).Port,
 		timeout:   timeout,
@@ -233,28 +317,51 @@ func newChannelPipeline(conn *net.UDPConn, timeout time.Duration) *channelPipeli
 		graveyard: make(map[int64]*graveEntry, PIPELINE_WINDOW),
 		buf:       make([]byte, 65536),
 	}
-	// WSSE-блок один на сокет (как раньше): nonce/curdate фиксируются на
-	// старте, дайджест считается один раз.
+
 	nonce := time.Now().UnixNano()
 	p.nonceStr = fmt.Sprintf("%d", nonce)
-	p.curdate = time.Now().UTC().Format("2006-01-02T15:04:05Z")
-	pwd := fmt.Sprintf("%d%sDHP2P:%s:%s", nonce, p.curdate, USERNAME, USERKEY)
-	hash := sha1.Sum([]byte(pwd))
-	p.digest = base64.StdEncoding.EncodeToString(hash[:])
 
-	// warm-up облака — раз на сокет (раньше слался на каждый серийник).
-	// Ответ по контенту не проверяется — факт сессии.
-	cseq := atomic.AddInt64(&cseqCounter, 1)
-	p.write("DHGET", "/probe/p2psrv", "", cseq)
-	dl := time.Now().Add(timeout)
-	for {
-		p.conn.SetReadDeadline(dl)
-		n, err := p.conn.Read(p.buf)
-		if err != nil {
-			break
+	if prof.profileType == profileDMSS {
+		p.curdate = time.Now().Format("2006-01-02T15:04:05-07:00")
+		pwd := fmt.Sprintf("%s%sDHP2P:%s:%s", p.nonceStr, p.curdate, prof.user, prof.userKey)
+		hash := sha1.Sum([]byte(pwd))
+		p.digest = base64.StdEncoding.EncodeToString(hash[:])
+
+		// warm-up для DMSS: NFGET /online/stun
+		cseq := atomic.AddInt64(&cseqCounter, 1)
+		req := fmt.Sprintf("NFGET /online/stun HTTP/1.1\r\nX-ToUType: Client/Dmss_Android\r\nCSeq: %d\r\n\r\n", cseq)
+		p.conn.SetWriteDeadline(time.Now().Add(timeout))
+		p.conn.Write([]byte(req))
+		dl := time.Now().Add(timeout)
+		for {
+			p.conn.SetReadDeadline(dl)
+			n, err := p.conn.Read(p.buf)
+			if err != nil {
+				break
+			}
+			if r := parseDHResp(p.buf[:n]); r.CSeq == cseq {
+				break
+			}
 		}
-		if r := parseDHResp(p.buf[:n]); r.CSeq == cseq {
-			break
+	} else {
+		p.curdate = time.Now().UTC().Format("2006-01-02T15:04:05Z")
+		pwd := fmt.Sprintf("%d%sDHP2P:%s:%s", nonce, p.curdate, prof.user, prof.userKey)
+		hash := sha1.Sum([]byte(pwd))
+		p.digest = base64.StdEncoding.EncodeToString(hash[:])
+
+		// warm-up для SmartPSS: DHGET /probe/p2psrv
+		cseq := atomic.AddInt64(&cseqCounter, 1)
+		p.write("DHGET", "/probe/p2psrv", "", cseq)
+		dl := time.Now().Add(timeout)
+		for {
+			p.conn.SetReadDeadline(dl)
+			n, err := p.conn.Read(p.buf)
+			if err != nil {
+				break
+			}
+			if r := parseDHResp(p.buf[:n]); r.CSeq == cseq {
+				break
+			}
 		}
 	}
 	return p
@@ -262,7 +369,13 @@ func newChannelPipeline(conn *net.UDPConn, timeout time.Duration) *channelPipeli
 
 func (p *channelPipeline) write(method, path, body string, cseq int64) bool {
 	p.conn.SetWriteDeadline(time.Now().Add(p.timeout))
-	_, err := p.conn.Write([]byte(dhReq(method, path, body, cseq, p.digest, p.nonceStr, p.curdate)))
+	var data []byte
+	if p.prof.profileType == profileDMSS {
+		data = []byte(dmssReq(method, path, body, cseq, p.digest, p.nonceStr, p.curdate))
+	} else {
+		data = []byte(dhReq(method, path, body, cseq, p.digest, p.nonceStr, p.curdate))
+	}
+	_, err := p.conn.Write(data)
 	return err == nil
 }
 
@@ -270,7 +383,15 @@ func (p *channelPipeline) write(method, path, body string, cseq int64) bool {
 func (p *channelPipeline) send(serial string) bool {
 	cseq := atomic.AddInt64(&cseqCounter, 1)
 	aid := randomAID()
-	if !p.write("DHPOST", fmt.Sprintf("/device/%s/p2p-channel", serial), p2pChannelBody(p.lport, aid), cseq) {
+	var body string
+	method := "DHPOST"
+	if p.prof.profileType == profileDMSS {
+		method = "NFPOST"
+		body = dmssChannelBody(p.lport, aid)
+	} else {
+		body = p2pChannelBody(p.lport, aid)
+	}
+	if !p.write(method, fmt.Sprintf("/device/%s/p2p-channel", serial), body, cseq) {
 		return false
 	}
 	p.inflight[cseq] = &inflightChannel{serial: serial, aid: aid, deadline: time.Now().Add(p.timeout)}
@@ -534,6 +655,142 @@ func scanWorker(ctx context.Context, conn *net.UDPConn, jobs <-chan string, aliv
 	p.run(ctx, jobs, aliveCh, lateCh, stats)
 }
 
+type probeVerdict struct {
+	serial string
+	alive  bool
+	late   bool
+}
+
+func (p *channelPipeline) expireVerdicts(verdictCh chan<- probeVerdict) {
+	now := time.Now()
+	for c, ir := range p.inflight {
+		if now.After(ir.deadline) {
+			delete(p.inflight, c)
+			p.lateCycle++
+			p.graveyard[c] = &graveEntry{serial: ir.serial, aid: ir.aid, deadline: now.Add(p.graceTTL)}
+		}
+	}
+	for c, g := range p.graveyard {
+		if now.After(g.deadline) {
+			delete(p.graveyard, c)
+			if verdictCh != nil {
+				verdictCh <- probeVerdict{serial: g.serial, alive: false, late: true}
+			}
+		}
+	}
+}
+
+func (p *channelPipeline) resolveVerdicts(r dhResp, verdictCh chan<- probeVerdict) {
+	if r.Code < 200 {
+		if ir, ok := p.inflight[r.CSeq]; ok && !ir.extended {
+			ir.extended = true
+			ir.deadline = time.Now().Add(p.timeout)
+		}
+		return
+	}
+	if ir, ok := p.inflight[r.CSeq]; ok {
+		delete(p.inflight, r.CSeq)
+		alive := channelAckAlive(r)
+		if alive {
+			p.teardown(ir.aid, r)
+		}
+		if verdictCh != nil {
+			verdictCh <- probeVerdict{serial: ir.serial, alive: alive, late: false}
+		}
+		return
+	}
+	if g, ok := p.graveyard[r.CSeq]; ok {
+		delete(p.graveyard, r.CSeq)
+		alive := channelAckAlive(r)
+		if alive {
+			p.teardown(g.aid, r)
+		}
+		if verdictCh != nil {
+			verdictCh <- probeVerdict{serial: g.serial, alive: alive, late: false}
+		}
+		return
+	}
+}
+
+func (p *channelPipeline) pumpVerdicts(ctx context.Context, verdictCh chan<- probeVerdict) {
+	dl := p.minDeadline()
+	now := time.Now()
+	wait := dl.Sub(now)
+	if wait < time.Millisecond {
+		wait = time.Millisecond
+	}
+	r, got := p.readResp(now.Add(wait))
+	if !got {
+		p.expireVerdicts(verdictCh)
+		return
+	}
+	p.resolveVerdicts(r, verdictCh)
+}
+
+func (p *channelPipeline) runVerdicts(ctx context.Context, jobs <-chan string, verdictCh chan<- probeVerdict) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		var s string
+		var ok bool
+		select {
+		case <-ctx.Done():
+			return
+		case s, ok = <-jobs:
+		}
+		if !ok {
+			break
+		}
+		if !p.send(s) {
+			select {
+			case verdictCh <- probeVerdict{serial: s, alive: false, late: false}:
+			case <-ctx.Done():
+				return
+			}
+		}
+
+	fill:
+		for len(p.inflight) < PIPELINE_WINDOW {
+			select {
+			case <-ctx.Done():
+				return
+			case s, ok := <-jobs:
+				if !ok {
+					break fill
+				}
+				if !p.send(s) {
+					select {
+					case verdictCh <- probeVerdict{serial: s, alive: false, late: false}:
+					case <-ctx.Done():
+						return
+					}
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(SEND_STAGGER):
+				}
+			default:
+				break fill
+			}
+		}
+
+		for len(p.inflight) > 0 {
+			p.pumpVerdicts(ctx, verdictCh)
+		}
+		p.govern()
+	}
+	for (len(p.inflight) > 0 || len(p.graveyard) > 0) && ctx.Err() == nil {
+		p.pumpVerdicts(ctx, verdictCh)
+	}
+}
+
+func scanWorkerWithProfile(ctx context.Context, conn *net.UDPConn, prof cloudProfile, jobs <-chan string, verdictCh chan<- probeVerdict, timeout time.Duration) {
+	p := newChannelPipelineWithProfile(conn, prof, timeout)
+	p.runVerdicts(ctx, jobs, verdictCh)
+}
+
 // readSerialsFile — загрузка входного файла в два прохода с прогрессом
 // в stats: фаза 1 быстро считает строки (чистый подсчёт \n по чанкам —
 // бар знает свой 100% заранее), фаза 2 санитайзит серийники и двигает бар.
@@ -594,12 +851,9 @@ func readSerialsFile(f *os.File, stats *ScanStats) ([]string, string) {
 	return serials, ""
 }
 
-// lookupCloudIPs — все IPv4 A-записи облака. Бюджеты облака могут
-// вестись на пару клиент↔сервер: распределение воркеров по всем адресам
-// (round-robin) даёт шанс масштабировать бюджет на число серверов.
-// Пустой срез — фолбэк на единственный адрес через ResolveUDPAddr.
-func lookupCloudIPs() []net.IP {
-	ips, err := net.LookupIP(MAIN_SERVER)
+// lookupServerIPs — все IPv4 A-записи сервера.
+func lookupServerIPs(server string) []net.IP {
+	ips, err := net.LookupIP(server)
 	if err != nil {
 		return nil
 	}
@@ -612,11 +866,17 @@ func lookupCloudIPs() []net.IP {
 	return v4
 }
 
-// newEgress — шов для будущих исходящих идентичностей (SOCKS5 UDP
-// ASSOCIATE и т.п.): сокет на облако создаётся только здесь. При появлении
-// прокси пул egress'ов раздаётся воркерам вместо round-robin по IP.
+// lookupCloudIPs — обратная совместимость (SmartPSS).
+func lookupCloudIPs() []net.IP {
+	return lookupServerIPs(MAIN_SERVER)
+}
+
 func newEgress(ip net.IP) (*net.UDPConn, error) {
-	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: MAIN_PORT})
+	return newEgressTo(ip, MAIN_PORT)
+}
+
+func newEgressTo(ip net.IP, port int) (*net.UDPConn, error) {
+	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: port})
 	if err != nil {
 		return nil, err
 	}
@@ -653,11 +913,20 @@ func RunScanner(ctx context.Context, inputFile, outputFile string, appendMode bo
 
 	ulimit := getUlimit()
 	maxWorkers := int(ulimit - 200)
-	if maxWorkers < 1 {
-		maxWorkers = 1
+	if maxWorkers < 2 {
+		maxWorkers = 2
 	}
 	if workers <= 0 || workers > maxWorkers {
 		workers = maxWorkers
+	}
+
+	smartWorkers := workers / 2
+	dmssWorkers := workers - smartWorkers
+	if smartWorkers < 1 {
+		smartWorkers = 1
+	}
+	if dmssWorkers < 1 {
+		dmssWorkers = 1
 	}
 
 	// appendMode: true — дописывать в конец (накопление по префиксам),
@@ -690,83 +959,180 @@ func RunScanner(ctx context.Context, inputFile, outputFile string, appendMode bo
 	defer lateFile.Close()
 	lateWriter := bufio.NewWriterSize(lateFile, 256*1024)
 
-	aliveCh := make(chan string, workers*10)
-	lateCh := make(chan string, workers*10)
-	jobs := make(chan string, workers*10)
-
-	cloudIPs := lookupCloudIPs()
-	if len(cloudIPs) == 0 {
+	smartIPs := lookupServerIPs(MAIN_SERVER)
+	if len(smartIPs) == 0 {
 		if raddr, rerr := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", MAIN_SERVER, MAIN_PORT)); rerr == nil {
-			cloudIPs = []net.IP{raddr.IP}
+			smartIPs = []net.IP{raddr.IP}
 		}
 	}
-	if len(cloudIPs) == 0 {
+	if len(smartIPs) == 0 {
 		stats.ErrorMsg = i18n.Tr("ошибка резолва сервера: ") + MAIN_SERVER
 		return
 	}
 
-	var wg sync.WaitGroup
-	conns := make([]*net.UDPConn, 0, workers)
-	for i := 0; i < workers; i++ {
-		conn, err := newEgress(cloudIPs[i%len(cloudIPs)])
-		if err != nil {
-			workers = i
-			break
+	dmssIPs := lookupServerIPs(DMSS_MAIN_SERVER)
+	if len(dmssIPs) == 0 {
+		if raddr, rerr := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", DMSS_MAIN_SERVER, DMSS_MAIN_PORT)); rerr == nil {
+			dmssIPs = []net.IP{raddr.IP}
 		}
-		conns = append(conns, conn)
+	}
+	if len(dmssIPs) == 0 {
+		stats.ErrorMsg = i18n.Tr("ошибка резолва сервера: ") + DMSS_MAIN_SERVER
+		return
 	}
 
-	if len(conns) == 0 {
+	smartConns := make([]*net.UDPConn, 0, smartWorkers)
+	for i := 0; i < smartWorkers; i++ {
+		conn, err := newEgressTo(smartIPs[i%len(smartIPs)], MAIN_PORT)
+		if err != nil {
+			break
+		}
+		smartConns = append(smartConns, conn)
+	}
+
+	dmssConns := make([]*net.UDPConn, 0, dmssWorkers)
+	for i := 0; i < dmssWorkers; i++ {
+		conn, err := newEgressTo(dmssIPs[i%len(dmssIPs)], DMSS_MAIN_PORT)
+		if err != nil {
+			break
+		}
+		dmssConns = append(dmssConns, conn)
+	}
+
+	if len(smartConns) == 0 || len(dmssConns) == 0 {
+		for _, c := range smartConns {
+			c.Close()
+		}
+		for _, c := range dmssConns {
+			c.Close()
+		}
 		stats.ErrorMsg = i18n.Tr("не смог создать необходимое кол-во сокетов (фикс: ulimit -n 100000)")
 		return
 	}
 
-	for _, conn := range conns {
-		wg.Add(1)
+	smartJobs := make(chan string, smartWorkers*10)
+	smartVerdicts := make(chan probeVerdict, smartWorkers*10)
+	dmssJobs := make(chan string, dmssWorkers*10)
+	dmssVerdicts := make(chan probeVerdict, dmssWorkers*10)
+
+	var smartWg sync.WaitGroup
+	for _, conn := range smartConns {
+		smartWg.Add(1)
 		go func(c *net.UDPConn) {
-			defer wg.Done()
-			scanWorker(ctx, c, jobs, aliveCh, lateCh, stats, ACK_TIMEOUT)
+			defer smartWg.Done()
+			scanWorkerWithProfile(ctx, c, smartpssProfile, smartJobs, smartVerdicts, ACK_TIMEOUT)
 		}(conn)
 	}
 
-	var writeWg sync.WaitGroup
-	writeWg.Add(1)
 	go func() {
-		defer writeWg.Done()
-		for s := range aliveCh {
-			outWriter.WriteString(s + "\n")
-			outWriter.Flush() // Пишем сразу в файл, а не в память
-			if events != nil {
-				select {
-				case events <- "[VALID] " + s:
-				default:
+		smartWg.Wait()
+		close(smartVerdicts)
+	}()
+
+	var dmssWg sync.WaitGroup
+	for _, conn := range dmssConns {
+		dmssWg.Add(1)
+		go func(c *net.UDPConn) {
+			defer dmssWg.Done()
+			scanWorkerWithProfile(ctx, c, dmssProfile, dmssJobs, dmssVerdicts, ACK_TIMEOUT)
+		}(conn)
+	}
+
+	go func() {
+		dmssWg.Wait()
+		close(dmssVerdicts)
+	}()
+
+	var smartState sync.Map // serial -> probeVerdict
+
+	// Маршрутизация: каждый серийник после SmartPSS направляется на проверку в DMSS
+	go func() {
+		for sv := range smartVerdicts {
+			smartState.Store(sv.serial, sv)
+			select {
+			case dmssJobs <- sv.serial:
+			case <-ctx.Done():
+				break
+			}
+		}
+		close(dmssJobs)
+	}()
+
+	// Оценка вердиктов SmartPSS vs DMSS и запись в файлы
+	var evalWg sync.WaitGroup
+	evalWg.Add(1)
+	go func() {
+		defer evalWg.Done()
+		lateBatch := 0
+		for dv := range dmssVerdicts {
+			var sv probeVerdict
+			if v, ok := smartState.LoadAndDelete(dv.serial); ok {
+				sv = v.(probeVerdict)
+			}
+
+			if sv.alive && dv.alive {
+				// Ответило на обоих серверах = мусор!
+				atomic.AddInt64(&stats.Dead, 1)
+				atomic.AddInt64(&stats.Checked, 1)
+				if events != nil {
+					select {
+					case events <- "[TRASH/DUAL] " + dv.serial:
+					default:
+					}
+				}
+				continue
+			}
+
+			if sv.alive && !dv.alive {
+				// Только SmartPSS
+				atomic.AddInt64(&stats.Alive, 1)
+				atomic.AddInt64(&stats.Checked, 1)
+				outWriter.WriteString(dv.serial + ",profile=smartpss\n")
+				outWriter.Flush()
+				if events != nil {
+					select {
+					case events <- "[VALID] " + dv.serial + ",profile=smartpss":
+					default:
+					}
+				}
+				continue
+			}
+
+			if !sv.alive && dv.alive {
+				// Только DMSS
+				atomic.AddInt64(&stats.Alive, 1)
+				atomic.AddInt64(&stats.Checked, 1)
+				outWriter.WriteString(dv.serial + ",profile=dmss\n")
+				outWriter.Flush()
+				if events != nil {
+					select {
+					case events <- "[VALID] " + dv.serial + ",profile=dmss":
+					default:
+					}
+				}
+				continue
+			}
+
+			// Не ответило ни на одном: dead
+			atomic.AddInt64(&stats.Dead, 1)
+			atomic.AddInt64(&stats.Checked, 1)
+			if sv.late && dv.late {
+				atomic.AddInt64(&stats.Late, 1)
+				lateWriter.WriteString(dv.serial + "\n")
+				lateBatch++
+				if lateBatch >= 128 {
+					lateWriter.Flush()
+					lateBatch = 0
 				}
 			}
 		}
 		outWriter.Flush()
-	}()
-
-	// late-писатель: батчами по 128 строк — на скорости пайплайна построчный
-	// флиш на каждый серийник стал бы заметной долей syscall-бюджета
-	var lateWg sync.WaitGroup
-	lateWg.Add(1)
-	go func() {
-		defer lateWg.Done()
-		batch := 0
-		for s := range lateCh {
-			lateWriter.WriteString(s + "\n")
-			batch++
-			if batch >= 128 {
-				lateWriter.Flush()
-				batch = 0
-			}
-		}
 		lateWriter.Flush()
 	}()
 
 	start := time.Now()
 
-	// Stats updater loop (ETA выпилен — врёт)
+	// Stats updater loop
 	updStop := make(chan struct{})
 	var lastAliveMark int64
 	lastAliveT := start
@@ -785,8 +1151,6 @@ func RunScanner(ctx context.Context, inputFile, outputFile string, appendMode bo
 				if elapsed > 0 {
 					stats.Speed = float64(checked) / elapsed
 				}
-				// alive/мин за последнее 10-секундное окно: отличает
-				// «застряло намертво» от «капает по бюджету облака»
 				now := time.Now()
 				if now.Sub(lastAliveT) >= 10*time.Second {
 					alive := atomic.LoadInt64(&stats.Alive)
@@ -801,20 +1165,21 @@ func RunScanner(ctx context.Context, inputFile, outputFile string, appendMode bo
 		select {
 		case <-ctx.Done():
 			goto shutdown
-		case jobs <- s:
+		case smartJobs <- s:
 		}
 	}
 
 shutdown:
-	close(jobs)
-	wg.Wait()
-	close(aliveCh)
-	writeWg.Wait()
-	close(lateCh)
-	lateWg.Wait()
+	close(smartJobs)
+	smartWg.Wait()
+	dmssWg.Wait()
+	evalWg.Wait()
 	close(updStop)
 
-	for _, conn := range conns {
+	for _, conn := range smartConns {
+		conn.Close()
+	}
+	for _, conn := range dmssConns {
 		conn.Close()
 	}
 }

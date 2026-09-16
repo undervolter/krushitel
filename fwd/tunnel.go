@@ -1,4 +1,4 @@
-﻿package fwd
+package fwd
 
 // tunnel.go — сетевая часть из dh-fwd v2.0.0 (рекод), портирована в
 // библиотечный пакет fwd: без CLI/UI/PortRegistry, с krushitel-хвостами
@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,12 +34,52 @@ var (
 	RELAY_READ_TIMEOUT = 15 * time.Second
 )
 
-var errDeviceNotFound = errors.New("device response: code=404 Not Found")
+// Бюджет восстановления на месте (in-place recovery, паритет SmartPSS): после
+// HEARTBEAT_TIMEOUT тишины readLoop повторно пробивает сохранённый STUN init
+// (с троттлингом rePunchEvery); туннель объявляется упавшим (и пересобирается
+// runWithRetries) только после silenceGiveUp непрерывной тишины.
+var (
+	rePunchEvery  = 4 * time.Second
+	silenceGiveUp = 30 * time.Second
+)
+
+var (
+	relayLookupTimeout = 3 * time.Second
+	relayAgentTimeout  = 3 * time.Second
+
+	// Первый повтор уходит быстро (700 мс): ack агента обычно идёт 200-400 мс.
+	// Последующие повторы отступают на relayChannelRetransInterval (1200 мс).
+	relayChannelFirstInterval   = 700 * time.Millisecond
+	relayChannelRetransInterval = 1200 * time.Millisecond
+	relayChannelMaxRetransmits  = 3
+)
+
+// readLoopIdleTimeout — потолок одного ReadPTCP в readLoop. Var, чтобы
+// тесты могли сжимать.
+var readLoopIdleTimeout = 5 * time.Second
+
+var (
+	errDeviceNotFound    = errors.New("device response: code=404 Not Found")
+	errDeviceRequireAuth = errors.New("device requires authentication (code=403 Forbidden), specify credentials with --creds <user>:<pass>")
+	errAuthFailed        = errors.New("device authentication failed: check credentials or salt (code=403 Forbidden)")
+)
 
 // ErrAuthRequired — устройство требует Type-1 auth на p2p-channel
 // (403 при dtype 0). Терминальный вердикт: туннель без известных кредов
 // не поднимется, рестарты попыток и ре-очередь бессмысленны.
-var ErrAuthRequired = errors.New("device requires authentication")
+var ErrAuthRequired = errDeviceRequireAuth
+
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, errDeviceRequireAuth) ||
+		errors.Is(err, errAuthFailed) ||
+		errors.Is(err, ErrAuthRequired) ||
+		strings.Contains(err.Error(), "device requires authentication") ||
+		strings.Contains(err.Error(), "device authentication failed") ||
+		strings.Contains(err.Error(), "code=403")
+}
 
 // errCloudStall — облако/девайс молчит в хендшейке (любят глотать пакеты).
 // Такой срыв НЕ тратит внешние попытки: Run() быстро рестартует попытку
@@ -131,6 +172,12 @@ type Client struct {
 	cseq          int
 	remotePort    int
 
+	// Счётчики живости дата-паса (zombieWatchdog): dataUp — байты от клиента
+	// в сторону камеры; dataDown — байты DATA от камеры к клиенту.
+	created  time.Time
+	dataUp   uint64
+	dataDown uint64
+
 	// Downstream coalescing: устройство стримит DATA-фреймы по 1280 байт;
 	// запись каждого отдельным TCP-сегментом душит HTTP, объёмное видео
 	// терпит. Батчим.
@@ -159,6 +206,9 @@ func writeAll(conn net.Conn, b []byte) {
 // writeData буферизует даунстрим-фрагмент; сброс в сокет — по заполнению
 // батча или через coalesceDelay.
 func (c *Client) writeData(b []byte) {
+	if len(b) > 0 {
+		atomic.AddUint64(&c.dataDown, uint64(len(b)))
+	}
 	c.flushMu.Lock()
 	c.pending = append(c.pending, b...)
 	if len(c.pending) >= coalesceMax {
@@ -183,11 +233,20 @@ func (c *Client) flushNow() {
 	c.flushMu.Lock()
 	out := c.pending
 	c.pending = nil
-	c.flushTimer = nil
+	if c.flushTimer != nil {
+		c.flushTimer.Stop()
+		c.flushTimer = nil
+	}
 	c.flushMu.Unlock()
 	if len(out) > 0 {
 		writeAll(c.conn, out)
 	}
+}
+
+// close дренирует буфер перед закрытием клиентского сокета.
+func (c *Client) close() {
+	c.flushNow()
+	c.conn.Close()
 }
 
 type acceptConn struct {
@@ -210,6 +269,7 @@ type Tunnel struct {
 	profile                              *appProfile
 	debug                                bool
 	useTCP                               bool // форс TCP-relay data path
+	forceAppRelay                        bool // data path на апп-диалекте (SYNC only, без 0x17/0x19), sticky across reset()
 
 	specs   []PortSpec
 	specIdx []int
@@ -235,7 +295,7 @@ type Tunnel struct {
 	stageMu   sync.Mutex
 	lastStage string
 
-	readerWG  sync.WaitGroup // readLoop/heartbeat/poolKeeper горутины
+	readerWG  sync.WaitGroup // readLoop/heartbeat/zombie/poolKeeper горутины
 	bindMu    sync.Mutex
 	bindWait  map[uint32]chan struct{}
 	bindReqMu sync.Mutex // сериализует BIND-запросы
@@ -244,14 +304,28 @@ type Tunnel struct {
 	errMu     sync.Mutex
 	failErr   error
 
+	scanMu      sync.Mutex
+	scanWait    map[uint32]chan scanOutcome
+	scanResults map[uint32]chan []byte
+
+	// In-place data-path recovery (паритет SmartPSS): сохранённый STUN init
+	// для повторного пробития прямого пути без облака при замирании канала.
+	rePunchMu       sync.Mutex
+	rePunchPacket   []byte
+	rePunchLaddr    *net.UDPAddr
+	rePunchPub      *net.UDPAddr
+	lastRePunch     time.Time
+	rePunchAttempts int
+
 	// Пул realm'ов: пребинженные realm'ы на каждый форвард-порт. Веб-сервер
 	// камеры рвёт HTTP-коннекты, браузер реконнектится на каждый запрос;
 	// пребинженный realm убирает BIND round-trip из критического пути.
 	// Кипер-горутина держит фиксированный уровень, in-flight бинды
 	// учитываются, чтобы рефилл не проскакивал.
-	poolMu     sync.Mutex
-	pools      map[int]*poolState
-	poolTarget int
+	poolMu       sync.Mutex
+	pools        map[int]*poolState
+	poolTarget   int
+	poolExplicit bool
 }
 
 // poolState — пул одного порта. Все поля под poolMu.
@@ -279,28 +353,44 @@ func (t *Tunnel) getPrimary() *UDP {
 }
 
 func newTunnel(serial string, dtype int, username, password, randsalt string, debug, forceTCP bool, poolSize int, g specGroup) *Tunnel {
+	return newTunnelWithProfile(serial, nil, dtype, username, password, randsalt, debug, forceTCP, poolSize, false, g)
+}
+
+func newTunnelWithProfile(serial string, prof *appProfile, dtype int, username, password, randsalt string, debug, forceTCP bool, poolSize int, poolExplicit bool, g specGroup) *Tunnel {
+	if prof == nil {
+		prof = activeProfile
+		if i := strings.Index(serial, ",profile="); i >= 0 {
+			pName := strings.TrimSpace(serial[i+len(",profile="):])
+			serial = strings.TrimSpace(serial[:i])
+			if p, err := profileByName(pName); err == nil {
+				prof = p
+			}
+		}
+	}
+
 	// Апп-релейный диалект биндит каждый realm СВЕЖИМ, за секунды до
 	// использования (захват: BIND → 0x12 CONN → DATA, ~6 мс друг от
 	// друга). Пре-бинженные realm'ы протухают на стороне устройства и их
 	// DATA отбрасывается, поэтому пулинг отключён для noRelayAuth
 	// профилей независимо от --pool.
 	poolSizeAdj := poolSize
-	if prof := activeProfile; prof.noRelayAuth && poolSizeAdj > 0 {
+	if prof.noRelayAuth && poolSizeAdj > 0 && !poolExplicit {
 		poolSizeAdj = 0
 	}
 	t := &Tunnel{
-		serial:      serial,
-		dtype:       dtype,
-		profile:     activeProfile,
-		username:    username,
-		password:    password,
-		randsalt:    randsalt,
-		debug:       debug,
-		useTCP:      forceTCP,
-		poolTarget:  poolSizeAdj,
-		specs:       g.specs,
-		specIdx:     g.idxs,
-		cseqCounter: CSEQ_BASE,
+		serial:       serial,
+		dtype:        dtype,
+		profile:      prof,
+		username:     username,
+		password:     password,
+		randsalt:     randsalt,
+		debug:        debug,
+		useTCP:       forceTCP,
+		poolTarget:   poolSizeAdj,
+		poolExplicit: poolExplicit,
+		specs:        g.specs,
+		specIdx:      g.idxs,
+		cseqCounter:  CSEQ_BASE,
 	}
 	t.reset()
 	return t
@@ -329,8 +419,22 @@ func (t *Tunnel) reset() {
 	t.setPrimary(nil)
 	t.chanKey = nil
 	t.bindWait = make(map[uint32]chan struct{})
+	t.scanMu.Lock()
+	t.scanWait = make(map[uint32]chan scanOutcome)
+	t.scanResults = make(map[uint32]chan []byte)
+	t.scanMu.Unlock()
 	t.pools = make(map[int]*poolState)
+	if t.forceAppRelay && !t.poolExplicit {
+		t.poolTarget = 0
+	}
 	t.failErr = nil
+	t.rePunchMu.Lock()
+	t.rePunchPacket = nil
+	t.rePunchLaddr = nil
+	t.rePunchPub = nil
+	t.lastRePunch = time.Time{}
+	t.rePunchAttempts = 0
+	t.rePunchMu.Unlock()
 }
 
 func (t *Tunnel) close() {
@@ -342,9 +446,20 @@ func (t *Tunnel) close() {
 	for _, ln := range t.listeners {
 		ln.Close()
 	}
+	// Дренируем очередь acceptCh: припаркованные соединения иначе утекут —
+	// после close никто не читает acceptCh, а зомби acceptLoop прошлой попытки
+	// мог успеть закинуть сокеты в буфер.
+	for {
+		select {
+		case ac := <-t.acceptCh:
+			ac.conn.Close()
+		default:
+		}
+		break
+	}
 	t.clientsMu.Lock()
 	for _, c := range t.clients {
-		c.conn.Close()
+		c.close()
 	}
 	t.clientsMu.Unlock()
 	t.socksMu.Lock()
@@ -489,6 +604,26 @@ func (t *Tunnel) LocalPorts() map[int]int {
 	return out
 }
 
+// IsRelay возвращает true, если туннель работает через промежуточный relay-сервер,
+// а не через прямое P2P-соединение (STUN punch).
+func (t *Tunnel) IsRelay() bool {
+	t.socksMu.Lock()
+	defer t.socksMu.Unlock()
+	if t.useTCPPath {
+		return true
+	}
+	if t.primary != nil && t.mainRemote != nil && t.primary == t.mainRemote {
+		return true
+	}
+	if t.primary != nil && t.deviceRemote != nil && t.primary != t.deviceRemote {
+		return true
+	}
+	t.stageMu.Lock()
+	st := t.lastStage
+	t.stageMu.Unlock()
+	return strings.Contains(st, "relay")
+}
+
 // Failure возвращает последнюю ошибку туннеля (если есть).
 func (t *Tunnel) Failure() error {
 	t.errMu.Lock()
@@ -555,7 +690,7 @@ func (t *Tunnel) establish() error {
 	t.setStage("device probe")
 	p2psrvRemote := NewUDP(p2psrv[0], p2psrvPort, t.debug, prof)
 	p2psrvRemote.debugLog = t.logf
-	if prof.autoSalt && t.dtype > 0 && t.randsalt == "" {
+	if t.dtype > 0 && t.randsalt == "" {
 		salt, err := resolveAutoSalt(prof, t.dtype, t.randsalt,
 			probeDeviceInfo(p2psrvRemote, t.serial), t.logf)
 		p2psrvRemote.Close()
@@ -602,6 +737,7 @@ func (t *Tunnel) establish() error {
 		}
 		relayHost = relay[0]
 		relayPort, _ = strconv.Atoi(relay[1])
+		relayDispatch.remember(res.Body["body/Address"])
 	}
 
 	// Data-сокет для стороны устройства, пробитый через главный облачный хост.
@@ -654,8 +790,8 @@ func (t *Tunnel) establish() error {
 	var agentPort int
 	var agentToken string
 	if relayHost != "" {
-		mainRemote.SetRemote(relayHost, relayPort)
 		if prof.relayAgentOptional {
+			mainRemote.SetRemote(relayHost, relayPort)
 			mainRemote.RequestEx("/relay/agent", "", true, false, reqOpts{})
 			res, err = mainRemote.Read(false, relayAgentTimeout)
 			if err != nil {
@@ -667,26 +803,18 @@ func (t *Tunnel) establish() error {
 				agentPort, _ = strconv.Atoi(agent[1])
 			}
 		} else {
-			res, err = mainRemote.Request("/relay/agent", "", true, true)
-			if err != nil {
-				return fmt.Errorf("%w: relay agent: %v", errCloudStall, err)
+			// Глобальный семафор + per-host backoff + перебор кэшированных
+			// диспетчеров (easy4ip роняет до 70% alloc-запросов под нагрузкой).
+			var ok bool
+			agentHost, agentPort, agentToken, ok = t.allocRelayAgent(mainRemote, fmt.Sprintf("%s:%d", relayHost, relayPort))
+			if !ok {
+				return fmt.Errorf("relay agent: all dispatchers silent (%s and cached alternates)", relayHost)
 			}
-			agentToken = res.Body["body/Token"]
-			agent := strings.SplitN(res.Body["body/Agent"], ":", 2)
-			if len(agent) != 2 || agent[0] == "" {
-				return fmt.Errorf("relay agent: bad agent %q", agent)
-			}
-			agentHost = agent[0]
-			agentPort, _ = strconv.Atoi(agent[1])
 		}
 	}
 	agentOK := agentHost != ""
 	if agentOK {
-		// Регистрация клиента на САМОМ АГЕНТЕ (agentHost, не диспетчер).
-		mainRemote.SetRemote(agentHost, agentPort)
-		if _, err = mainRemote.Request(fmt.Sprintf("/relay/start/%s", agentToken), "<body><Client>:0</Client></body>", true, true); err != nil {
-			t.logf("relay start silent (%v) — продолжаем, агент может подняться", err)
-		}
+		t.startRelayAgent(mainRemote, agentHost, agentPort, agentToken)
 	}
 
 	// Phase 4: Server Nat Info от устройства (через cloud/US). Облако и
@@ -722,9 +850,22 @@ func (t *Tunnel) establish() error {
 			return errDeviceNotFound
 		}
 		if t.dtype == 0 && res.Code == 403 {
-			return ErrAuthRequired
+			return errDeviceRequireAuth
+		}
+		if t.dtype > 0 && res.Code == 403 {
+			return errAuthFailed
 		}
 		return fmt.Errorf("device response: code=%d %s", res.Code, res.Status)
+	}
+
+	if v := res.Body["body/version"]; strings.HasPrefix(v, "6.") || strings.HasPrefix(v, "7.") {
+		t.forceAppRelay = true
+		if t.poolExplicit {
+			t.logf("device version %s (2024+) detected — enabling app relay dialect, keeping explicit pool=%d", v, t.poolTarget)
+		} else {
+			t.logf("device version %s (2024+) detected — disabling realm pool and enabling app relay dialect", v)
+			t.poolTarget = 0
+		}
 	}
 
 	deviceLaddr := res.Body["body/LocalAddr"]
@@ -741,7 +882,7 @@ func (t *Tunnel) establish() error {
 	}
 
 	devParts := strings.SplitN(devicePub, ":", 2)
-	if len(devParts) != 2 || devParts[0] == "" {
+	if len(devParts) != 2 || devParts[0] == "" || devParts[1] == "" {
 		// камера ответила ack'ом без PubAddr — бывает на загруженном
 		// облаке; ошибка вместо паники: runWithRetries перезапустит
 		return fmt.Errorf("%w: device ack missing PubAddr (LocalAddr=%q)", errCloudStall, deviceLaddr)
@@ -751,56 +892,49 @@ func (t *Tunnel) establish() error {
 
 	// Сообщаем устройству про relay-агента. Только при реально
 	// аллоцированном агенте (dmss best-effort): приложение не шлёт
-	// relay-channel без агента. Агент иногда ack'ает не сразу — облако
-	// propagate'ит назначение релея несколько секунд: один повтор на
-	// месте дешевле рестарта всего handshake.
+	// relay-channel без агента.
 	if agentOK {
-		mainRemote.SetRemote(prof.mainServer, prof.mainPort)
 		authStr := ""
 		if t.dtype > 0 {
 			nonce2 := getNonce()
 			authStr = getAuth(t.username, xchg.req.key, nonce2, "", t.randsalt)
 		}
-		sendRelayChannel := func() {
-			mainRemote.Request(fmt.Sprintf("/device/%s/relay-channel", t.serial),
-				fmt.Sprintf("<body>%s<agentAddr>%s:%d</agentAddr></body>", authStr, agentHost, agentPort),
-				true, false)
-		}
-		sendRelayChannel()
-		mainRemote.SetRemote(agentHost, agentPort)
-		if _, err := mainRemote.Read(true, deviceAckTimeout); err != nil {
-			t.logf("relay-channel ack silent (%v) — повтор запроса", err)
-			mainRemote.SetRemote(prof.mainServer, prof.mainPort)
-			sendRelayChannel()
-			mainRemote.SetRemote(agentHost, agentPort)
-			if _, err2 := mainRemote.Read(true, deviceAckTimeout); err2 != nil {
-				return fmt.Errorf("%w: relay-channel silent", errCloudStall)
+		if err := t.waitRelayChannelAck(mainRemote, agentHost, agentPort, authStr); err != nil {
+			if t.useTCP {
+				return err
 			}
+			t.logf("relay-channel ack timed out (%v) — continuing to STUN punch without relay agent", err)
+			agentOK = false
 		}
 	}
 
 	policy := res.Body["body/Policy"]
 	tcpRelayAllowed := strings.Contains(policy, "tcprelay")
 
-	// Форс TCP-relay: TOU-канал заменяет PTCP-over-UDP полностью.
+	// Forced TCP-relay mode: try TOU over TCP, but gracefully fall back if unavailable.
 	if t.useTCP {
 		if !agentOK {
-			return fmt.Errorf("TCP relay принудителен, но relay-агент недоступен")
+			t.logf("TCP relay forced but no relay agent is available — falling back to UDP")
+			t.useTCP = false
+		} else {
+			t.setStage("ptcp handshake (tcp relay)")
+			if err := t.attachTCPRelay(agentHost, agentPort, agentToken); err != nil {
+				t.logf("TCP relay forced failed (%v) — falling back to UDP", err)
+				t.useTCP = false
+			} else {
+				t.logf("TCP relay channel attached (forced)")
+				return nil
+			}
 		}
-		if err := t.attachTCPRelay(agentHost, agentPort, agentToken); err != nil {
-			return err
-		}
-		t.logf("TCP relay channel attached (forced)")
-		return nil
 	}
 
 	// PTCP через relay: SYNC, затем token-запрос (0x17 -> 0x18). Только при
 	// аллоцированном агенте — без него (dmss best-effort) пробитый прямой
 	// канал единственный data-путь, establishment идёт сразу в NAT punch.
-	// ForceAppRelay (дев): пропуск целиком — 0x17/0x19 на data-сокете
-	// инвалидирует канал на камерах поколения 2024+.
+	// forceAppRelay (зомби-ретрай) / ForceAppRelay (дев): пропуск целиком —
+	// 0x17/0x19 на data-сокете инвалидирует канал на камерах поколения 2024+.
 	var sign []byte
-	if agentOK && !ForceAppRelay {
+	if agentOK {
 		t.setStage("ptcp sync (relay)")
 		t.logf("phase: ptcp sync over relay (policy tcprelay=%v)…", tcpRelayAllowed)
 		mainRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
@@ -820,17 +954,22 @@ func (t *Tunnel) establish() error {
 			return fmt.Errorf("ptcp sync: %v", err)
 		}
 
-		t.setStage("ptcp token")
-		mainRemote.RequestPTCP([]byte{
-			0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00,
-		})
-		p, err = t.waitForPTCPToken(mainRemote, RELAY_READ_TIMEOUT)
-		if err != nil {
-			return fmt.Errorf("ptcp 0x17: %v", err)
-		}
-		sign = p.Body[12:]
+		// Complete the 3-way PTCP handshake by acknowledging the relay's SYNC frame.
 		mainRemote.RequestPTCP(nil)
+
+		if !prof.noRelayAuth && !t.forceAppRelay && !ForceAppRelay {
+			t.setStage("ptcp token")
+			mainRemote.RequestPTCP([]byte{
+				0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00,
+			})
+			p, err = t.waitForPTCPToken(mainRemote, RELAY_READ_TIMEOUT)
+			if err != nil {
+				return fmt.Errorf("ptcp 0x17: %v", err)
+			}
+			sign = p.Body[12:]
+			mainRemote.RequestPTCP(nil)
+		}
 	}
 	t.setStage("stun punch")
 	t.logf("phase: ptcp sign ok (%d bytes), stun punch…", len(sign))
@@ -883,12 +1022,14 @@ func (t *Tunnel) establish() error {
 				if attempt <= 2 {
 					t.logf("Retransmit STUN init (attempt %d)", attempt)
 					deviceRemote.Send(stunInit)
+					continue
 				}
-				continue
+				break
 			}
 			break
 		}
-		if len(data) < 4 {
+		if len(data) < 20 {
+			t.logf("STUN <<< short datagram (%d bytes) — ignored", len(data))
 			continue
 		}
 		magic := data[:4]
@@ -900,6 +1041,7 @@ func (t *Tunnel) establish() error {
 			break
 		} else if string(magic) == "\xFF\xFE\xFF\xE7" {
 			if len(data) < 40 {
+				t.logf("STUN <<< cross-STUN init too short (%d bytes) — ignored", len(data))
 				continue
 			}
 			t.logf("Got device cross-STUN init (fffeffe7), responding...")
@@ -956,8 +1098,11 @@ func (t *Tunnel) establish() error {
 	}
 	deviceRemote.SetTimeout(0)
 
-	// Direct-путь: полный PTCP auth-handshake с sign-токеном.
-	if prof.noRelayAuth || ForceAppRelay {
+	// Direct-путь: полный PTCP auth-handshake с sign-токеном. Попытка
+	// forceAppRelay (зомби-вотчдог) тоже идёт по ветке апп-паритета:
+	// предыдущий обмен 0x17/0x19 — вероятная причина, по которой камера
+	// перестала роутить DATA.
+	if prof.noRelayAuth || t.forceAppRelay || ForceAppRelay {
 		// Апп-релейный диалект (захват 2026-09-06): после STUN-обмена
 		// клиент шлёт ровно ОДИН PTCP SYNC и затем BIND/DATA — никогда
 		// 0x17 token-запрос и 0x19 auth. Устройство отвечает на 0x19
@@ -970,6 +1115,7 @@ func (t *Tunnel) establish() error {
 			t.logf("app-parity sync: %v (продолжаем на пробитом канале)", err)
 		}
 		t.setStage("ready (direct)")
+		t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
 		t.setPrimary(deviceRemote)
 		return nil
 	}
@@ -988,6 +1134,7 @@ func (t *Tunnel) establish() error {
 				t.logf("app-parity sync: %v (продолжаем на пробитом канале)", perr)
 			}
 			t.setStage("ready (direct, app dialect)")
+			t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
 			t.setPrimary(deviceRemote)
 			return nil
 		}
@@ -1003,6 +1150,7 @@ func (t *Tunnel) establish() error {
 	}
 	t.logf("PTCP handshake complete (direct)")
 	t.setStage("ready (direct)")
+	t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
 	t.setPrimary(deviceRemote)
 	return nil
 }
@@ -1021,18 +1169,94 @@ func (t *Tunnel) attachTCPRelay(agentHost string, agentPort int, token string) e
 	return nil
 }
 
+// waitRelayChannelAck сообщает устройству через главный сервер о выделенном
+// relay-агенте и ждёт подтверждения от агента с ретрансмитами.
+func (t *Tunnel) waitRelayChannelAck(mainRemote *UDP, agentHost string, agentPort int, authStr string) error {
+	reqPath := fmt.Sprintf("/device/%s/relay-channel", t.serial)
+	reqBody := fmt.Sprintf("<body>%s<agentAddr>%s:%d</agentAddr></body>", authStr, agentHost, agentPort)
+	cseq := nextCSeqFor(t.profile)
+
+	sendRelayChannel := func() {
+		mainRemote.SetRemote(t.profile.mainServer, t.profile.mainPort)
+		mainRemote.RequestEx(reqPath, reqBody, true, false, reqOpts{cseq: cseq})
+		mainRemote.SetRemote(agentHost, agentPort)
+	}
+
+	interval := relayChannelFirstInterval
+	if RELAY_READ_TIMEOUT < interval {
+		interval = RELAY_READ_TIMEOUT
+	}
+
+	sendRelayChannel()
+	t.logf("waiting for relay-channel ack from agent %s:%d (interval %v, max %d retries)",
+		agentHost, agentPort, interval, relayChannelMaxRetransmits)
+
+	var lastErr error
+	for attempt := 0; attempt < relayChannelMaxRetransmits; attempt++ {
+		if res, err := mainRemote.Read(true, interval); err == nil {
+			t.logf("relay-channel ack received from agent")
+			if v := res.Body["body/version"]; strings.HasPrefix(v, "6.") || strings.HasPrefix(v, "7.") {
+				t.forceAppRelay = true
+				if t.poolExplicit {
+					t.logf("device version %s (2024+) detected — enabling app relay dialect, keeping explicit pool=%d", v, t.poolTarget)
+				} else {
+					t.logf("device version %s (2024+) detected — disabling realm pool and enabling app relay dialect", v)
+					t.poolTarget = 0
+				}
+			}
+			return nil
+		} else {
+			lastErr = err
+			t.logf("relay-channel ack timed out (%v) — retransmitting %d/%d", err, attempt+1, relayChannelMaxRetransmits)
+			sendRelayChannel()
+			// После первой быстрой пробы переходим на полный интервал
+			interval = relayChannelRetransInterval
+		}
+	}
+	return fmt.Errorf("relay-channel read: %w", lastErr)
+}
+
+// storeRePunch сохраняет пакет и адреса для in-place recovery прямого пути:
+// инвертированный STUN init плюс локальный и публичный адреса устройства.
+func (t *Tunnel) storeRePunch(packet []byte, laddrIP string, lport int, pubParts []string) {
+	if len(pubParts) < 2 {
+		return
+	}
+	pubPort, _ := strconv.Atoi(pubParts[1])
+	t.rePunchMu.Lock()
+	defer t.rePunchMu.Unlock()
+	t.rePunchPacket = append([]byte(nil), packet...)
+	t.rePunchLaddr = &net.UDPAddr{IP: net.ParseIP(laddrIP), Port: lport}
+	t.rePunchPub = &net.UDPAddr{IP: net.ParseIP(pubParts[0]), Port: pubPort}
+}
+
+// tryRePunch повторно шлёт сохранённый STUN init (и один PTCP SYNC)
+// на адреса устройства. Троттлится через rePunchEvery.
+func (t *Tunnel) tryRePunch() {
+	t.rePunchMu.Lock()
+	defer t.rePunchMu.Unlock()
+	if time.Since(t.lastRePunch) < rePunchEvery {
+		return
+	}
+	t.lastRePunch = time.Now()
+	t.rePunchAttempts++
+	p := t.getPrimary()
+	if p == nil || len(t.rePunchPacket) == 0 {
+		return
+	}
+	t.logf("data path silent — re-punching STUN (recovery %d)", t.rePunchAttempts)
+	if t.rePunchLaddr != nil {
+		p.SendTo(t.rePunchPacket, t.rePunchLaddr)
+	}
+	if t.rePunchPub != nil {
+		p.SendTo(t.rePunchPacket, t.rePunchPub)
+	}
+	// Дополнительный PTCP SYNC: девайсы на апп-диалекте отвечают на SYNC
+	p.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
+}
+
 // ── эталонное ядро dh-fwd v2.1: channelRequest/channelSender, early-ack,
 // local-channel, AutoSalt ──────────────────────────────────────────────
-
-// Bounded reads для best-effort relay-диспетчерского обмена
-// (только relayAgentOptional-профили). Диспетчер может быть мёртв
-// (live 2026-09-06: dolynk-диспетчер молчал на /relay/agent, 17 с × 3),
-// а приложение DMSS вообще не аллоцирует агента — обоим чтениям короткий
-// потолок вместо RELAY_READ_TIMEOUT.
-var (
-	relayLookupTimeout = 3 * time.Second
-	relayAgentTimeout  = 3 * time.Second
-)
 
 // waitForPTCPToken читает PTCP-фреймы, пока один из них не принесёт
 // правдоподобное 0x17 token-тело — кусок, который вызывающий срезает с
@@ -1486,7 +1710,7 @@ func resolveAutoSalt(prof *appProfile, dtype int, randsalt string, payload []byt
 		}
 		return randsalt, nil
 	}
-	if !prof.autoSalt || dtype == 0 || randsalt != "" {
+	if dtype == 0 || randsalt != "" {
 		return randsalt, nil
 	}
 	salt, err := randsaltFromInfo(payload)
@@ -1661,10 +1885,12 @@ func (t *Tunnel) serve() error {
 		go t.touReadLoop(done)
 		go t.touHeartbeatLoop(done)
 	} else {
-		t.readerWG.Add(3)
+		t.readerWG.Add(4)
 		go t.readLoop(done, t.deviceRemote)
 		go t.readLoop(done, t.mainRemote)
 		go t.heartbeatLoop(done)
+		// Зомби-вотчдог: исходящий трафик без ответов триггерит рестарт на апп-диалекте
+		go t.zombieWatchdog(done)
 		// Киперы пула realm'ов: держат пребинженные realm'ы на каждый
 		// форвард-порт, чтобы волна браузерных коннектов не платила
 		// BIND round-trip.
@@ -1699,13 +1925,25 @@ func (t *Tunnel) readLoop(done chan struct{}, u *UDP) {
 		default:
 		}
 
-		p, err := u.ReadPTCP(5 * time.Second)
+		p, err := u.ReadPTCP(readLoopIdleTimeout)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				if u == t.getPrimary() && time.Since(u.LastRecv()) > HEARTBEAT_TIMEOUT {
-					t.fail(fmt.Errorf("heartbeat timeout: no PTCP on primary socket for %v", HEARTBEAT_TIMEOUT))
-					return
+				if u == t.getPrimary() {
+					silent := time.Since(u.LastRecv())
+					if silent > silenceGiveUp {
+						t.fail(fmt.Errorf("heartbeat timeout: no PTCP on primary socket for %v", silent.Round(time.Second)))
+						return
+					}
+					if silent > HEARTBEAT_TIMEOUT {
+						t.tryRePunch()
+					}
 				}
+				continue
+			}
+			// Не-PTCP дейтаграмма (поздний дубль DH ack, 100 Trying, мусор):
+			// ошибка парсинга — не смерть сокета. Игнорируем и читаем дальше.
+			if !isTransportDead(err) {
+				t.logf("readLoop: non-PTCP datagram ignored (%v)", err)
 				continue
 			}
 			// Если наше поколение уже закрыто — это зомби-пробуждение
@@ -1817,10 +2055,11 @@ func (t *Tunnel) heartbeatLoop(done chan struct{}) {
 			t.socksMu.Lock()
 			mr := t.mainRemote
 			t.socksMu.Unlock()
-			if mr != nil {
+			p := t.getPrimary()
+			if mr != nil && mr != p {
 				mr.RequestPTCP([]byte{})
 			}
-			if p := t.getPrimary(); p != nil {
+			if p != nil {
 				p.RequestPTCP(ptcpHeartbeat)
 			}
 
@@ -2107,6 +2346,10 @@ func (virtAddr) String() string  { return "camera-via-tunnel" }
 // realm. Закрытие коннекта гасит realm DISC'ом на камере. Для TOU-пути
 // realm открывается SYN'ом.
 func (t *Tunnel) DialCamera(remotePort int) (net.Conn, error) {
+	if remotePort == 80 && t.IsRelay() {
+		return nil, fmt.Errorf("relay tunnel: port 80 unavailable (camera drops connection)")
+	}
+
 	server, client := newVirtPipe()
 
 	// туннель мог умереть/рестартнуть до нас: primary уже nil
@@ -2191,6 +2434,24 @@ func (t *Tunnel) DialCamera(remotePort int) (net.Conn, error) {
 // В TCP-relay режиме realm — TOU-сессия, открытая SYN-фреймом.
 // На UDP-пути предпочтение пребинженному realm из пула: без ожидания BIND.
 func (t *Tunnel) handleBind(ac acceptConn) {
+	if ac.remotePort == 80 && t.IsRelay() {
+		t.logf("Port 80 rejected: relay data path drops port 80 (camera sends EOF)")
+		ac.conn.Close()
+		return
+	}
+
+	// HTTP accelerator: для соединений на порт 80 Range-запросы ускоряют отдачу
+	// тяжелых веб-ресурсов камеры в несколько параллельных потоков.
+	if ac.remotePort == 80 && !t.useTCPPath {
+		res := t.httpAccelHandler(ac.conn)
+		if res.handled {
+			return
+		}
+		if res.replacement != nil {
+			ac.conn = res.replacement
+		}
+	}
+
 	if !t.useTCPPath {
 		if realmID, ok := t.popRealm(ac.remotePort); ok {
 			t.logf("Realm pool: hit realm=%#010x port=%d", realmID, ac.remotePort)
@@ -2225,8 +2486,6 @@ func (t *Tunnel) handleBind(ac acceptConn) {
 	wait := make(chan struct{})
 	t.setBindWait(realmID, wait)
 
-	t.addClient(realmID, ac.conn, ac.remotePort)
-
 	bindPkt := make([]byte, 20)
 	bindPkt[0] = 0x11
 	binary.BigEndian.PutUint32(bindPkt[4:8], realmID)
@@ -2240,7 +2499,6 @@ func (t *Tunnel) handleBind(ac acceptConn) {
 		// туннель умер между accept и BIND — прибираемся
 		t.bindReqMu.Unlock()
 		t.takeBindWait(realmID)
-		t.delClient(realmID)
 		ac.conn.Close()
 		return
 	}
@@ -2248,17 +2506,33 @@ func (t *Tunnel) handleBind(ac acceptConn) {
 	time.Sleep(10 * time.Millisecond)
 	t.bindReqMu.Unlock()
 
-	select {
-	case <-wait:
-		t.logf("Bind OK realm=%#010x in %v", realmID, time.Since(bindStart))
-	case <-time.After(BIND_TIMEOUT):
-		t.logf("Bind FAILED realm=%#010x port=%d", realmID, ac.remotePort)
-		t.delClient(realmID)
-		ac.conn.Close()
-		t.takeBindWait(realmID)
-	case <-t.done:
-		t.takeBindWait(realmID)
-		ac.conn.Close()
+	bindTicker := time.NewTicker(400 * time.Millisecond)
+	defer bindTicker.Stop()
+	bindTimer := time.NewTimer(BIND_TIMEOUT)
+	defer bindTimer.Stop()
+
+	for {
+		select {
+		case <-wait:
+			t.logf("Bind OK realm=%#010x in %v", realmID, time.Since(bindStart))
+			t.addClient(realmID, ac.conn, ac.remotePort)
+			return
+		case <-bindTicker.C:
+			t.bindReqMu.Lock()
+			if p := t.getPrimary(); p != nil {
+				p.RequestPTCP(bindPkt)
+			}
+			t.bindReqMu.Unlock()
+		case <-bindTimer.C:
+			t.logf("Bind FAILED realm=%#010x port=%d", realmID, ac.remotePort)
+			ac.conn.Close()
+			t.takeBindWait(realmID)
+			return
+		case <-t.done:
+			t.takeBindWait(realmID)
+			ac.conn.Close()
+			return
+		}
 	}
 }
 
@@ -2283,6 +2557,7 @@ func (t *Tunnel) addClient(realmID uint32, conn net.Conn, remotePort int) {
 		lastKeepalive: time.Now(),
 		cseq:          t.cseqCounter,
 		remotePort:    remotePort,
+		created:       time.Now(),
 	}
 	t.cseqCounter += CSEQ_STEP
 	t.clientsMu.Unlock()
@@ -2297,8 +2572,12 @@ func (t *Tunnel) getClient(realmID uint32) *Client {
 
 func (t *Tunnel) delClient(realmID uint32) {
 	t.clientsMu.Lock()
+	c := t.clients[realmID]
 	delete(t.clients, realmID)
 	t.clientsMu.Unlock()
+	if c != nil {
+		c.flushNow()
+	}
 }
 
 // dataSegmentMax повторяет сегментацию самого устройства из капчура
@@ -2351,6 +2630,9 @@ func (t *Tunnel) clientReader(conn net.Conn, realmID uint32) {
 			t.delClient(realmID)
 			return
 		}
+		if c := t.getClient(realmID); c != nil {
+			atomic.AddUint64(&c.dataUp, uint64(n))
+		}
 		t.writeRealmData(realmID, buf[:n])
 	}
 }
@@ -2365,9 +2647,16 @@ func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 	src.ScheduleAck()
 
 	switch p.Body[0] {
+	case 0x00:
+		// SYNC frame (0x00 0x03 0x01 0x00) — acknowledge immediately
+		src.RequestPTCP(nil)
+		return
 	case 0x10:
 		pl, err := ParsePTCPPayload(p.Body)
 		if err != nil {
+			return
+		}
+		if t.dispatchScanData(pl.Realm, pl.Payload) {
 			return
 		}
 		if c := t.getClient(pl.Realm); c != nil && len(pl.Payload) > 0 {
@@ -2380,13 +2669,17 @@ func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 			return
 		}
 		realm := binary.BigEndian.Uint32(p.Body[4:8])
+		isDisc := len(p.Body) >= 16 && string(p.Body[12:16]) == "DISC"
+		if t.dispatchScan12(realm, isDisc) {
+			return
+		}
 		if ch := t.takeBindWait(realm); ch != nil {
 			close(ch)
 			return
 		}
 		t.dropRealm(realm) // устройство скинуло пребинженный realm
 		if c := t.getClient(realm); c != nil {
-			c.conn.Close()
+			c.close()
 			t.delClient(realm)
 			t.logf("DVR DISC realm=%#010x", realm)
 		}
@@ -2447,7 +2740,10 @@ func runWithRetries(t *Tunnel, onExhausted func(err error)) {
 		if t.isStopped() {
 			return
 		}
-		if errors.Is(err, errDeviceNotFound) || attempt > RETRY_ATTEMPTS {
+		terminal := errors.Is(err, errDeviceNotFound) ||
+			isAuthError(err) ||
+			strings.Contains(err.Error(), "no listeners available")
+		if terminal || attempt > RETRY_ATTEMPTS {
 			if onExhausted != nil {
 				onExhausted(err)
 			}
@@ -2457,3 +2753,137 @@ func runWithRetries(t *Tunnel, onExhausted func(err error)) {
 		t.reset()
 	}
 }
+
+type scanOutcome int
+
+const (
+	scanOutcomeConn scanOutcome = iota
+	scanOutcomeDisc
+)
+
+func (t *Tunnel) dispatchScanData(realm uint32, payload []byte) bool {
+	t.scanMu.Lock()
+	ch := t.scanResults[realm]
+	t.scanMu.Unlock()
+	if ch != nil {
+		cp := make([]byte, len(payload))
+		copy(cp, payload)
+		select {
+		case ch <- cp:
+		default:
+		}
+		return true
+	}
+	return false
+}
+
+func (t *Tunnel) dispatchScan12(realm uint32, isDisc bool) bool {
+	t.scanMu.Lock()
+	ch := t.scanWait[realm]
+	dataCh := t.scanResults[realm]
+	if isDisc && dataCh != nil {
+		select {
+		case dataCh <- nil:
+		default:
+		}
+	}
+	t.scanMu.Unlock()
+	if ch != nil {
+		outcome := scanOutcomeConn
+		if isDisc {
+			outcome = scanOutcomeDisc
+		}
+		select {
+		case ch <- outcome:
+		default:
+		}
+		return true
+	}
+	return false
+}
+
+// DeviceInfo содержит информацию об устройстве, полученную из облака Dahua P2P.
+type DeviceInfo struct {
+	Serial        string            `json:"serial"`
+	DevP2PVersion string            `json:"devP2PVersion"`
+	DevVersion    string            `json:"devVersion"`
+	Info          map[string]string `json:"info"`
+}
+
+// QueryDeviceInfo запрашивает /info/device/<SN> у P2P-сервера и расшифровывает Info-блоб.
+func QueryDeviceInfo(serial string, prof *appProfile, debug bool) (*DeviceInfo, error) {
+	if prof == nil {
+		prof = activeProfile
+	}
+	targetSerial := serial
+	if i := strings.Index(serial, ",profile="); i >= 0 {
+		pName := strings.TrimSpace(serial[i+len(",profile="):])
+		targetSerial = strings.TrimSpace(serial[:i])
+		if p, err := profileByName(pName); err == nil {
+			prof = p
+		}
+	}
+
+	u := NewUDP(prof.mainServer, prof.mainPort, debug, prof)
+	defer u.Close()
+	if u.initErr != nil {
+		return nil, fmt.Errorf("main socket: %w", u.initErr)
+	}
+	u.RequestEx(prof.warmupPath, "", prof.warmupAuth, true, reqOpts{warmup: true})
+	res, _ := u.Request(fmt.Sprintf("/online/p2psrv/%s", targetSerial), "", true, true)
+	if res == nil || res.Code >= 400 || res.Body["body/US"] == "" {
+		// Попытка фоллбэка на альтернативный профиль
+		fallbackName := "dmss"
+		if prof.name == "dmss" {
+			fallbackName = "smartpss"
+		}
+		if !strings.Contains(serial, ",profile=") {
+			if altProf, err := profileByName(fallbackName); err == nil {
+				return QueryDeviceInfo(serial+",profile="+fallbackName, altProf, debug)
+			}
+		}
+		return nil, fmt.Errorf("device %s not found on p2psrv", targetSerial)
+	}
+
+	us := strings.SplitN(res.Body["body/US"], ":", 2)
+	if len(us) < 2 {
+		return nil, fmt.Errorf("malformed US address %q", res.Body["body/US"])
+	}
+	usPort, _ := strconv.Atoi(us[1])
+
+	v := NewUDP(us[0], usPort, debug, prof)
+	defer v.Close()
+	if v.initErr != nil {
+		return nil, fmt.Errorf("device socket: %w", v.initErr)
+	}
+	v.Request(fmt.Sprintf("/probe/device/%s", targetSerial), "", true, true)
+	v.Request(fmt.Sprintf("/info/device/%s", targetSerial), "", true, false)
+
+	data, err := v.Recv(65536, RELAY_READ_TIMEOUT)
+	if err != nil {
+		return nil, fmt.Errorf("info read: %w", err)
+	}
+
+	fields, err := infoFields(strings.TrimSpace(string(data)))
+	if err != nil {
+		return nil, fmt.Errorf("parse info: %w", err)
+	}
+
+	di := &DeviceInfo{
+		Serial:        targetSerial,
+		DevP2PVersion: fields["devp2pver"],
+		DevVersion:    fields["DevVersion"],
+		Info:          make(map[string]string),
+	}
+
+	info := fields["Info"]
+	if info != "" {
+		if plain, err := decryptDevInfoInfo(info); err == nil {
+			if inner, err := decodeInfoJSON(plain); err == nil {
+				di.Info = inner
+			}
+		}
+	}
+	return di, nil
+}
+

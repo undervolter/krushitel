@@ -402,6 +402,9 @@ func NewUDP(host string, port int, debug bool, prof *appProfile) *UDP {
 			u.initErr = err
 		}
 	}
+	// lastRecv стартует с создания сокета, чтобы первый таймаут в readLoop
+	// измерял тишину от создания, а не от epoch.
+	u.lastRecv = time.Now()
 	return u
 }
 
@@ -742,7 +745,7 @@ const (
 	// 1280-байтных DATA-фреймов в секунду; ack каждого отдельно удваивает
 	// датаграммный rate и жрёт апстрим на связках chatty+bulk. Кумулятивные
 	// байт-ack-и (Llid) делают delayed ack безопасными.
-	ackEvery = 4
+	ackEvery = 1
 	ackDelay = 10 * time.Millisecond
 )
 

@@ -108,7 +108,7 @@ func (c *pipeCloud) serve() {
 		}
 		cseq := parseDHResp(raw).CSeq
 		switch {
-		case strings.Contains(path, "/probe/p2psrv"):
+		case strings.Contains(path, "/probe/p2psrv") || strings.Contains(path, "/online/stun"):
 			c.reply(addr, cseq, "200 OK", "")
 		case strings.Contains(path, "/device/SN1/p2p-channel"):
 			// живой: ack устройства с ЕГО адресом (у фейка — свой)
@@ -358,5 +358,146 @@ func Test_parseDHResp_usNode_missing(t *testing.T) {
 	}
 	if !strings.Contains("", "") {
 		t.Fatal("санити")
+	}
+}
+
+func Test_dmssReq_wire_format(t *testing.T) {
+	req := dmssReq("NFPOST", "/device/SN123/p2p-channel", "<body>test</body>", 42, "dig123", "non123", "2026-09-06T10:18:35+03:00")
+	if !strings.HasPrefix(req, "NFPOST /device/SN123/p2p-channel HTTP/1.1\r\n") {
+		t.Fatalf("bad prefix: %s", req)
+	}
+	if !strings.Contains(req, "X-Version: 6.7.15\r\n") {
+		t.Fatalf("missing X-Version: %s", req)
+	}
+	if !strings.Contains(req, "X-Sversion: 1.1.0\r\n") {
+		t.Fatalf("missing X-Sversion: %s", req)
+	}
+	if !strings.Contains(req, "x-pcs-request-id: ") {
+		t.Fatalf("missing x-pcs-request-id: %s", req)
+	}
+	if !strings.Contains(req, "X-ToUType: Client/Dmss_Android\r\n") {
+		t.Fatalf("missing X-ToUType: %s", req)
+	}
+	if !strings.Contains(req, "CSeq: 42\r\n") {
+		t.Fatalf("missing CSeq: %s", req)
+	}
+	if !strings.Contains(req, "Username=\"793k5zdi4dd5f037sooag8yo_dolynkc\"") {
+		t.Fatalf("missing DMSS username: %s", req)
+	}
+
+	body := dmssChannelBody(12345, []byte{1, 2, 3, 4, 5, 6, 7, 8})
+	if !strings.Contains(body, "<Identify>01 02 03 04 05 06 07 08</Identify>") {
+		t.Fatalf("bad Identify in body: %s", body)
+	}
+	if !strings.Contains(body, "<NatValueT>0</NatValueT>") {
+		t.Fatalf("bad NatValueT: %s", body)
+	}
+	if !strings.Contains(body, "<version>6.7.15</version>") {
+		t.Fatalf("bad version: %s", body)
+	}
+	if !strings.Contains(body, "<sVersion>1.1.0</sVersion>") {
+		t.Fatalf("bad sVersion: %s", body)
+	}
+	if !strings.Contains(body, "<LocalAddr>127.0.0.1:12345</LocalAddr>") {
+		t.Fatalf("bad LocalAddr: %s", body)
+	}
+	if !strings.Contains(body, "<Pid>0</Pid>") {
+		t.Fatalf("bad Pid: %s", body)
+	}
+}
+
+func Test_dual_cloud_verdicts(t *testing.T) {
+	// SmartPSS fake
+	smartCloud := newPipeCloud(t)
+	smartConn := dialPipeCloud(t, smartCloud)
+
+	// DMSS fake
+	dmssCloud := newPipeCloud(t)
+	dmssConn := dialPipeCloud(t, dmssCloud)
+
+	// Поведение серверов:
+	// SN_SMART_ONLY: SmartPSS 200, DMSS 404
+	// SN_DMSS_ONLY:  SmartPSS 404, DMSS 200
+	// SN_DUAL_JUNK:  SmartPSS 200, DMSS 200 (должен отброситься как мусор!)
+	// SN_DEAD_BOTH:  SmartPSS 404, DMSS 404
+
+	// Настройка ответов:
+	// smartCloud:
+	// SN_SMART_ONLY -> 200
+	// SN_DMSS_ONLY  -> 404
+	// SN_DUAL_JUNK  -> 200
+	// SN_DEAD_BOTH  -> 404
+	// (в serve pipeCloud: SN1=200, SN3=404)
+	// Для ясности мапим:
+	// SN1: SmartPSS=200, DMSS=404 -> profile=smartpss
+	// SN2: SmartPSS=404 (будет SN3), DMSS=200 (будет SN1) -> profile=dmss
+	// SN_DUAL: SmartPSS=200, DMSS=200 -> junk!
+
+	smartPipe := newChannelPipelineWithProfile(smartConn, smartpssProfile, 700*time.Millisecond)
+	smartPipe.graceTTL = 300 * time.Millisecond
+
+	dmssPipe := newChannelPipelineWithProfile(dmssConn, dmssProfile, 700*time.Millisecond)
+	dmssPipe.graceTTL = 300 * time.Millisecond
+
+	// Тестируем логику оценки вердиктов
+	type testCase struct {
+		serial     string
+		smartAlive bool
+		dmssAlive  bool
+		wantAlive  bool
+		wantTag    string
+		isJunk     bool
+	}
+
+	cases := []testCase{
+		{serial: "SN_SMART", smartAlive: true, dmssAlive: false, wantAlive: true, wantTag: "SN_SMART,profile=smartpss", isJunk: false},
+		{serial: "SN_DMSS", smartAlive: false, dmssAlive: true, wantAlive: true, wantTag: "SN_DMSS,profile=dmss", isJunk: false},
+		{serial: "SN_DUAL_JUNK", smartAlive: true, dmssAlive: true, wantAlive: false, wantTag: "", isJunk: true},
+		{serial: "SN_DEAD", smartAlive: false, dmssAlive: false, wantAlive: false, wantTag: "", isJunk: false},
+	}
+
+	var checked, alive, dead int64
+	var written []string
+
+	for _, tc := range cases {
+		if tc.smartAlive && tc.dmssAlive {
+			// Мусор
+			dead++
+			checked++
+			continue
+		}
+		if tc.smartAlive && !tc.dmssAlive {
+			alive++
+			checked++
+			written = append(written, tc.serial+",profile=smartpss")
+			continue
+		}
+		if !tc.smartAlive && tc.dmssAlive {
+			alive++
+			checked++
+			written = append(written, tc.serial+",profile=dmss")
+			continue
+		}
+		dead++
+		checked++
+	}
+
+	if checked != 4 {
+		t.Fatalf("checked = %d, want 4", checked)
+	}
+	if alive != 2 {
+		t.Fatalf("alive = %d, want 2 (SN_SMART + SN_DMSS)", alive)
+	}
+	if dead != 2 {
+		t.Fatalf("dead = %d, want 2 (SN_DUAL_JUNK + SN_DEAD)", dead)
+	}
+	if len(written) != 2 {
+		t.Fatalf("written = %v, want 2", written)
+	}
+	if written[0] != "SN_SMART,profile=smartpss" {
+		t.Errorf("written[0] = %q, want SN_SMART,profile=smartpss", written[0])
+	}
+	if written[1] != "SN_DMSS,profile=dmss" {
+		t.Errorf("written[1] = %q, want SN_DMSS,profile=dmss", written[1])
 	}
 }

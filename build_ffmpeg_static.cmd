@@ -13,7 +13,7 @@ rem ============================================================
 setlocal
 set "MSYS64=C:\Users\tradefall\msys64"
 set "FFSRC=C:\Users\tradefall\ffmpeg-src\ffmpeg-8.0.1"
-set "FFPREFIX=C:\Users\tradefall\ffmpeg-min-win64-static"
+if "%FFPREFIX%"=="" set "FFPREFIX=%~dp0deps\ffmpeg-win64-static"
 set "FFBUILD=C:\Users\tradefall\ffmpeg-src\build-win64-static"
 
 if not exist "%MSYS64%\usr\bin\bash.exe" goto :nomsys

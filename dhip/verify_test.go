@@ -68,3 +68,48 @@ func Test_VerifyLogin_username_hash(t *testing.T) {
 		t.Fatal("VerifyLogin(admin) прошёл — username-хеш не проверяется!")
 	}
 }
+
+// Test_VerifyLogin_rejects_loopback_bypass — проверка, что уязвимость
+// CVE-2021-33045 (loopback bypass) не даёт ложноположительной верификации
+// неверного пароля.
+func Test_VerifyLogin_rejects_loopback_bypass(t *testing.T) {
+	const (
+		realm  = "Login to TestCam"
+		random = "12345678"
+	)
+
+	srv := newFakeDhipServer(t, func(method string, params map[string]any, id int) (bool, map[string]any) {
+		if method != "global.login" {
+			return false, nil
+		}
+		clientType, _ := params["clientType"].(string)
+		loginType, _ := params["loginType"].(string)
+
+		switch clientType {
+		case "Web3.0":
+			if params["password"] == "" {
+				return false, map[string]any{
+					"session": float64(10), "realm": realm, "random": random,
+				}
+			}
+			return false, nil
+		case "Console":
+			// Хеш-логин намеренно реджектится (пароль неверный)
+			return false, nil
+		case "Local":
+			// Loopback bypass уязвимость камеры: принимает любой пароль!
+			if loginType == "Loopback" {
+				return true, map[string]any{"session": float64(10)}
+			}
+			return false, nil
+		}
+		return false, nil
+	})
+
+	// VerifyLogin обязан упасть, так как настоящий хеш-логин не подошёл,
+	// а loopback bypass не должен использоваться при верификации.
+	if err := VerifyLogin(srv.addr(), "admin", "wrong_password", 3*time.Second); err == nil {
+		t.Fatal("VerifyLogin вернул успех на wrong_password из-за loopback bypass!")
+	}
+}
+

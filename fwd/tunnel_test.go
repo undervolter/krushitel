@@ -1,4 +1,4 @@
-﻿package fwd
+package fwd
 
 import (
 	"encoding/binary"
@@ -52,10 +52,10 @@ func Test_virtPipe(t *testing.T) {
 // DialCamera РЅР° С‚СѓРЅРЅРµР»Рµ Р±РµР· СЃРѕРµРґРёРЅРµРЅРёСЏ С‡РµСЃС‚РЅРѕ РїР°РґР°РµС‚ (bind РЅРµ РїРѕРґС‚РІРµСЂРґРёС‚СЃСЏ).
 func Test_DialCamera_dead_tunnel(t *testing.T) {
 	tun := newTunnel("5H016B4PAG001EF", 0, "", "", "", false, false, 0, specGroup{})
-	tun.Run() // СЃСЂР°Р·Сѓ С„РµР№Р»РёС‚СЃСЏ вЂ” handshake РЅРµРІРѕР·РјРѕР¶РµРЅ, РЅРѕ done Р·Р°РєСЂРѕРµС‚СЃСЏ
+	tun.close()
 
 	if _, err := tun.DialCamera(80); err == nil {
-		t.Fatal("DialCamera РЅР° РјС‘СЂС‚РІРѕРј С‚СѓРЅРЅРµР»Рµ РїСЂРѕС€С‘Р»")
+		t.Fatal("DialCamera на мёртвом туннеле прошёл")
 	}
 }
 
@@ -156,5 +156,54 @@ func Test_routePTCP_short_0x12_no_panic(t *testing.T) {
 
 	tun.routePTCP(&PTCP{Body: []byte{0x12, 0x00, 0x00, 0x00}}, u)
 	tun.routePTCP(&PTCP{Body: []byte{0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD}}, u)
-	// РґРѕР¶РёР»Рё вЂ” РїР°РЅРёРєРё РЅРµС‚
+	// дожили — паники нет
+}
+
+func Test_newTunnel_profile_parsing(t *testing.T) {
+	t1 := newTunnel("5H016B4PAG001EF,profile=dmss", 0, "", "", "", false, false, 0, specGroup{})
+	defer t1.Terminate()
+	if t1.serial != "5H016B4PAG001EF" {
+		t.Fatalf("serial = %q, want 5H016B4PAG001EF", t1.serial)
+	}
+	if t1.profile != dmssProfile {
+		t.Fatalf("profile = %v, want dmssProfile", t1.profile)
+	}
+
+	t2 := newTunnel("5H016B4PAG001EF,profile=smartpss", 0, "", "", "", false, false, 0, specGroup{})
+	defer t2.Terminate()
+	if t2.serial != "5H016B4PAG001EF" {
+		t.Fatalf("serial = %q, want 5H016B4PAG001EF", t2.serial)
+	}
+	if t2.profile != smartpssProfile {
+		t.Fatalf("profile = %v, want smartpssProfile", t2.profile)
+	}
+
+	t3 := newTunnel("5H016B4PAG001EF", 0, "", "", "", false, false, 0, specGroup{})
+	defer t3.Terminate()
+	if t3.serial != "5H016B4PAG001EF" {
+		t.Fatalf("serial = %q, want 5H016B4PAG001EF", t3.serial)
+	}
+	if t3.profile != activeProfile {
+		t.Fatalf("profile = %v, want activeProfile", t3.profile)
+	}
+}
+
+func Test_Tunnel_IsRelay_And_Port80(t *testing.T) {
+	tun := newTunnel("5H016B4PAG001EF", 0, "", "", "", false, false, 0, specGroup{})
+	defer tun.Terminate()
+
+	if tun.IsRelay() {
+		t.Fatal("new tunnel should not be relay")
+	}
+
+	tun.socksMu.Lock()
+	tun.useTCPPath = true
+	tun.socksMu.Unlock()
+	if !tun.IsRelay() {
+		t.Fatal("tunnel with useTCPPath should be relay")
+	}
+
+	if _, err := tun.DialCamera(80); err == nil {
+		t.Fatal("DialCamera(80) on relay tunnel should fail immediately")
+	}
 }

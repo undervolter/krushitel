@@ -46,9 +46,9 @@ func tryExtractCredsDial(dial Dialer, timeout time.Duration) ([]DhipUser, error)
 	return tryExtractCredsConn(conn)
 }
 
-// VerifyLoginDial — проверка кредов полноценным challenge-логином с
-// clientType Console (полные права). Для верификации dummy-юзера из
-// CVE-2024-39943 важно передавать именно имя созданного юзера.
+// VerifyLoginDial — строгая проверка кредов полноценным challenge-логином.
+// Не использует loopback/NetKeyboard байпассы (CVE-2021-33045), чтобы исключить
+// ложные срабатывания на неверных паролях.
 func VerifyLoginDial(dial Dialer, user, password string, timeout time.Duration) error {
 	conn, err := dial()
 	if err != nil {
@@ -56,9 +56,9 @@ func VerifyLoginDial(dial Dialer, user, password string, timeout time.Duration) 
 	}
 	defer conn.Close()
 
-	time.Sleep(2 * time.Second)
+	time.Sleep(200 * time.Millisecond)
 
-	if _, err := dhipLoginAs(conn, nil, user, password); err != nil {
+	if _, err := dhipLoginStrict(conn, nil, user, password); err != nil {
 		return err
 	}
 	return nil

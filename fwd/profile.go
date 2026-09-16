@@ -93,6 +93,7 @@ var smartpssProfile = &appProfile{
 	createdNow: func() string { return nowUTC().Format("2006-01-02T15:04:05Z") },
 	warmupPath: "/probe/p2psrv",
 	warmupAuth: true,
+	channelRetransmit: true,
 }
 
 var dmssProfile = &appProfile{

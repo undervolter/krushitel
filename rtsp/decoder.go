@@ -1,188 +1,196 @@
-// decoder.go — декодирование H264/H265 и кодирование в JPEG через libavcodec
-// (cgo, go-astiav, ffmpeg n8.0). Работает поверх доступ-юнитов из gortsplib:
-// депакетизатор отдаёт NAL-юниты, мы собираем Annex-B и скармливаем
-// декодеру напрямую, без демуксеров и файлов.
+// decoder.go — декодирование H.264 и H.265 (HEVC) в JPEG на чистом Go (без CGO / libavcodec).
+// Используются библиотеки github.com/Eyevinn/hi264 и github.com/gen2brain/h265.
+// Работает поверх доступ-юнитов (AU) из gortsplib: депакетизатор отдаёт NAL-юниты,
+// мы собираем Annex-B и скармливаем декодеру. Полученный кадр сжимается стандартным image/jpeg.
 
 package rtsp
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
-	"sync/atomic"
+	"image"
+	"image/jpeg"
+	"sync"
 
-	"github.com/asticode/go-astiav"
+	"github.com/Eyevinn/hi264/pkg/decoder"
+	"github.com/Eyevinn/hi264/pkg/frame"
+	"github.com/gen2brain/h265/hevc"
 )
 
-func init() {
-	// libav-log НЕ должен попадать в stderr: TUI живёт на altscreen, и
-	// любая строка от av_log ("no frame!", "invalid NAL unit" и т.п.)
-	// сдвигает консоль и рвёт кадр bubbletea в клочья. QUIET + пустой
-	// колбэк = ноль вывода из libav, ошибки декодирования мы и так
-	// проглатываем сами.
-	astiav.SetLogLevel(astiav.LogLevelQuiet)
-	astiav.SetLogCallback(func(astiav.Classer, astiav.LogLevel, string, string) {})
-}
-
-// jpegDecoder — H264/HEVC → пиксели → YUVJ420P → MJPEG (JPEG-байты).
-// Кодировщик и sws инициализируются лениво — когда известны размеры кадра.
+// jpegDecoder — H.264 / HEVC → YCbCr → JPEG на чистом Go.
 type jpegDecoder struct {
-	decCC    *astiav.CodecContext
-	decFrame *astiav.Frame
-	pkt      *astiav.Packet
-
-	encCC  *astiav.CodecContext
-	encPkt *astiav.Packet
-	dst    *astiav.Frame
-	sws    *astiav.SoftwareScaleContext
-
-	// closed — guard против гонки с RTP-горутиной: после close() любые
-	// вызовы feed/encode не трогают cgo-объекты
-	closed atomic.Bool
+	mu      sync.Mutex
+	codec   string
+	h264Dec *decoder.Decoder
+	hevcDec *hevc.Decoder
+	closed  bool
 }
 
 func newJPEGDecoder(codec string) (*jpegDecoder, error) {
-	c := astiav.FindDecoderByName(codec)
-	if c == nil {
-		return nil, fmt.Errorf("astiav: декодер %q не найден в libavcodec", codec)
+	switch codec {
+	case "h264":
+		return &jpegDecoder{
+			codec:   codec,
+			h264Dec: decoder.New(),
+		}, nil
+	case "hevc":
+		dec := &hevc.Decoder{}
+		dec.Threads(1)
+		return &jpegDecoder{
+			codec:   codec,
+			hevcDec: dec,
+		}, nil
+	default:
+		return nil, fmt.Errorf("rtsp: неподдерживаемый кодек %q", codec)
 	}
-	d := &jpegDecoder{
-		decCC:    astiav.AllocCodecContext(c),
-		decFrame: astiav.AllocFrame(),
-		pkt:      astiav.AllocPacket(),
-	}
-	if d.decCC == nil || d.decFrame == nil || d.pkt == nil {
-		d.close()
-		return nil, errors.New("astiav: аллокация codec context вернула nil")
-	}
-	// один тред на декодер: для снапа (один кадр) многопоточность не даёт
-	// ничего, а референс-буферы тредов раздували RAM в ~10 раз — при 30
-	// параллельных декодерах это гигабайты впустую
-	d.decCC.SetThreadCount(1)
-	if err := d.decCC.Open(c, nil); err != nil {
-		d.close()
-		return nil, fmt.Errorf("astiav: open %s decoder: %w", codec, err)
-	}
-	return d, nil
 }
 
 func (d *jpegDecoder) close() {
-	d.closed.Store(true)
-	if d.pkt != nil {
-		d.pkt.Free()
-		d.pkt = nil
-	}
-	if d.decFrame != nil {
-		d.decFrame.Free()
-		d.decFrame = nil
-	}
-	if d.decCC != nil {
-		d.decCC.Free()
-		d.decCC = nil
-	}
-	if d.encPkt != nil {
-		d.encPkt.Free()
-		d.encPkt = nil
-	}
-	if d.dst != nil {
-		d.dst.Free()
-		d.dst = nil
-	}
-	if d.sws != nil {
-		d.sws.Free()
-		d.sws = nil
-	}
-	if d.encCC != nil {
-		d.encCC.Free()
-		d.encCC = nil
-	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.closed = true
+	d.h264Dec = nil
+	d.hevcDec = nil
 }
 
-// feed — один доступ-юнит в Annex-B. Возвращает JPEG, когда кадр декодирован.
-// До первого ключевого кадра декодер держит EAGAIN — возвращаем nil, nil.
-// Ошибка на отдельном AU не фатальна для снапа — ждём следующий.
+// feed — один доступ-юнит в формате Annex-B.
+// Возвращает готовые байты JPEG, когда кадр успешно декодирован.
+// До первого ключевого кадра (IDR) или при неполном NAL возвращает nil, nil.
 func (d *jpegDecoder) feed(au []byte) ([]byte, error) {
-	if d.closed.Load() || d.pkt == nil {
-		return nil, nil
-	}
-	if len(au) == 0 {
-		return nil, nil
-	}
-	if err := d.pkt.FromData(au); err != nil {
-		return nil, fmt.Errorf("astiav: packet: %w", err)
-	}
-	if err := d.decCC.SendPacket(d.pkt); err != nil {
-		d.pkt.Unref()
-		return nil, nil
-	}
-	d.pkt.Unref()
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
-	for {
-		err := d.decCC.ReceiveFrame(d.decFrame)
-		if err != nil {
-			return nil, nil
-		}
-		jpeg, err := d.encode(d.decFrame)
-		d.decFrame.Unref()
-		if err != nil || jpeg != nil {
-			return jpeg, err
-		}
+	if d.closed || len(au) == 0 {
+		return nil, nil
+	}
+
+	switch d.codec {
+	case "h264":
+		return d.feedH264(au)
+	case "hevc":
+		return d.feedHEVC(au)
+	default:
+		return nil, errors.New("rtsp: неизвестный кодек декодера")
 	}
 }
 
-// encode — конвертация кадра в YUVJ420P (sws) и сжатие mjpeg-энкодером.
-func (d *jpegDecoder) encode(f *astiav.Frame) ([]byte, error) {
-	if f.Width() <= 0 || f.Height() <= 0 {
+func (d *jpegDecoder) feedH264(au []byte) ([]byte, error) {
+	if d.h264Dec == nil {
 		return nil, nil
 	}
-	if d.encCC == nil {
-		if err := d.initEncoder(f); err != nil {
-			return nil, err
-		}
-	}
-	if err := d.sws.ScaleFrame(f, d.dst); err != nil {
-		return nil, fmt.Errorf("astiav: sws_scale_frame: %w", err)
-	}
-	d.dst.SetPts(f.Pts())
-	if err := d.encCC.SendFrame(d.dst); err != nil {
-		return nil, fmt.Errorf("astiav: encoder send: %w", err)
-	}
-	for {
-		err := d.encCC.ReceivePacket(d.encPkt)
-		if err != nil {
-			return nil, nil
-		}
-		out := make([]byte, d.encPkt.Size())
-		copy(out, d.encPkt.Data())
-		d.encPkt.Unref()
-		if len(out) > 0 {
-			return out, nil
-		}
-	}
-}
-
-func (d *jpegDecoder) initEncoder(f *astiav.Frame) error {
-	c := astiav.FindEncoder(astiav.CodecIDMjpeg)
-	if c == nil {
-		return errors.New("astiav: mjpeg-энкодер не найден в libavcodec")
-	}
-	d.encCC = astiav.AllocCodecContext(c)
-	d.encCC.SetPixelFormat(astiav.PixelFormatYuvj420P)
-	d.encCC.SetWidth(f.Width())
-	d.encCC.SetHeight(f.Height())
-	d.encCC.SetTimeBase(astiav.NewRational(1, 1))
-	if err := d.encCC.Open(c, nil); err != nil {
-		return fmt.Errorf("astiav: open mjpeg encoder: %w", err)
-	}
-	var err error
-	d.sws, err = astiav.CreateSoftwareScaleContext(
-		f.Width(), f.Height(), f.PixelFormat(),
-		f.Width(), f.Height(), astiav.PixelFormatYuvj420P,
-		astiav.NewSoftwareScaleContextFlags(astiav.SoftwareScaleContextFlagBicubic),
-	)
+	// DecodeIDRAnnexB парсит SPS/PPS и декодирует IDR-кадры,
+	// пропуская P-кадры до первого ключевого
+	frames, err := d.h264Dec.DecodeIDRAnnexB(au)
 	if err != nil {
-		return fmt.Errorf("astiav: sws: %w", err)
+		// Ошибка на промежуточном/неполном NALU — не фатально, ждём следующий AU
+		return nil, nil
 	}
-	d.dst = astiav.AllocFrame()
-	d.encPkt = astiav.AllocPacket()
-	return nil
+	if len(frames) == 0 {
+		return nil, nil
+	}
+	return encodeH264(frames[0])
+}
+
+func encodeH264(f *frame.Frame) ([]byte, error) {
+	if f == nil || f.Width <= 0 || f.Height <= 0 {
+		return nil, nil
+	}
+	img := &image.YCbCr{
+		Y:              f.Y,
+		Cb:             f.Cb,
+		Cr:             f.Cr,
+		YStride:        f.StrideY,
+		CStride:        f.StrideC,
+		SubsampleRatio: image.YCbCrSubsampleRatio420,
+		Rect:           image.Rect(0, 0, f.Width, f.Height),
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85}); err != nil {
+		return nil, fmt.Errorf("rtsp: encode h264 jpeg: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+func (d *jpegDecoder) feedHEVC(au []byte) ([]byte, error) {
+	if d.hevcDec == nil {
+		return nil, nil
+	}
+	nals := hevc.SplitAnnexB(au)
+	for _, nal := range nals {
+		pics, err := d.hevcDec.DecodeNAL(nal)
+		if err != nil {
+			continue
+		}
+		for i, pic := range pics {
+			if i == 0 {
+				jpegBytes, encErr := encodeHEVC(pic)
+				pic.Release()
+				if encErr == nil && len(jpegBytes) > 0 {
+					for _, rest := range pics[1:] {
+						rest.Release()
+					}
+					return jpegBytes, nil
+				}
+			} else {
+				pic.Release()
+			}
+		}
+	}
+	return nil, nil
+}
+
+func encodeHEVC(pic *hevc.Picture) ([]byte, error) {
+	if pic == nil || pic.Width <= 0 || pic.Height <= 0 {
+		return nil, nil
+	}
+	var y, cb, cr []uint8
+	yStride, cStride := pic.StrideY, pic.StrideC
+
+	if len(pic.Y) > 0 {
+		y = pic.Y
+		cb = pic.Cb
+		cr = pic.Cr
+	} else if len(pic.Y16) > 0 {
+		shift := uint(pic.BitDepth - 8)
+		if shift > 8 {
+			shift = 2
+		}
+		y = make([]uint8, len(pic.Y16))
+		for i, v := range pic.Y16 {
+			y[i] = uint8(v >> shift)
+		}
+		cb = make([]uint8, len(pic.Cb16))
+		for i, v := range pic.Cb16 {
+			cb[i] = uint8(v >> shift)
+		}
+		cr = make([]uint8, len(pic.Cr16))
+		for i, v := range pic.Cr16 {
+			cr[i] = uint8(v >> shift)
+		}
+	} else {
+		return nil, nil
+	}
+
+	img := &image.YCbCr{
+		Y:              y,
+		Cb:             cb,
+		Cr:             cr,
+		YStride:        yStride,
+		CStride:        cStride,
+		SubsampleRatio: image.YCbCrSubsampleRatio420,
+		Rect:           image.Rect(0, 0, pic.Width, pic.Height),
+	}
+
+	var src image.Image = img
+	if pic.CropW > 0 && pic.CropH > 0 &&
+		pic.CropX+pic.CropW <= pic.Width && pic.CropY+pic.CropH <= pic.Height {
+		src = img.SubImage(image.Rect(pic.CropX, pic.CropY, pic.CropX+pic.CropW, pic.CropY+pic.CropH))
+	}
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, src, &jpeg.Options{Quality: 85}); err != nil {
+		return nil, fmt.Errorf("rtsp: encode hevc jpeg: %w", err)
+	}
+	return buf.Bytes(), nil
 }

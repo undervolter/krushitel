@@ -3,19 +3,20 @@ module krushitel
 go 1.26.5
 
 require (
-	github.com/asticode/go-astiav v0.42.0
+	github.com/Eyevinn/hi264 v0.10.0
 	github.com/bluenviron/gortsplib/v5 v5.6.5
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/ansi v0.11.6
+	github.com/gen2brain/h265 v0.2.2
 	github.com/pion/rtp v1.10.5
 	golang.org/x/crypto v0.55.0
 	golang.org/x/sys v0.47.0
 )
 
 require (
-	github.com/asticode/go-astikit v0.42.0 // indirect
+	github.com/Eyevinn/mp4ff v0.50.0 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/bluenviron/mediacommon/v2 v2.9.4 // indirect

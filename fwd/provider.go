@@ -43,14 +43,20 @@ type TunnelHandle interface {
 	Dial(port int) (net.Conn, error)
 	// Alive — туннель ещё жив (умерший выдаст false: воркер фейлит строку).
 	Alive() bool
+	// IsRelay — подключение идёт через промежуточный релей-сервер (порт 80 недоступен).
+	IsRelay() bool
 	// Close — погасить туннель. Идемпотентно.
 	Close()
 }
 
 // Binding — готовый к работе серийник с туннелем.
 type Binding struct {
-	Serial string
-	Tunnel TunnelHandle
+	Serial  string
+	Tunnel  TunnelHandle
+	Login   string
+	Pass    string
+	Dtype   int
+	IsRelay bool
 }
 
 // Provider — источник биндингов. Один на прогон.
@@ -206,7 +212,15 @@ func (p *InProcessProvider) Acquire(ctx context.Context) (Binding, error) {
 			}
 			continue
 		}
-		return Binding{Serial: serial, Tunnel: fwdTunnel{f: f}}, nil
+		isRelay := f.IsRelay()
+		return Binding{
+			Serial:  serial,
+			Tunnel:  fwdTunnel{f: f},
+			Login:   f.User,
+			Pass:    f.Pass,
+			Dtype:   f.Dtype,
+			IsRelay: isRelay,
+		}, nil
 	}
 }
 
@@ -245,8 +259,9 @@ func (w fwdTunnel) Local(port int) string { return w.f.Local(port) }
 // Dial — виртуальный коннект через движковый туннель (без листенера).
 func (w fwdTunnel) Dial(port int) (net.Conn, error) { return w.f.DialCamera(port) }
 
-func (w fwdTunnel) Alive() bool { return w.f.Alive() }
-func (w fwdTunnel) Close()      { w.f.Stop() }
+func (w fwdTunnel) Alive() bool   { return w.f.Alive() }
+func (w fwdTunnel) IsRelay() bool { return w.f.IsRelay() }
+func (w fwdTunnel) Close()        { w.f.Stop() }
 
 // ── DhFwdServiceProvider ─────────────────────────────────────────────
 
@@ -286,11 +301,12 @@ func parseDhEvent(line string) *dhEvent {
 }
 
 type dhTunnel struct {
-	svc    *DhFwdService
-	mu     sync.Mutex
-	serial string
-	ports  map[int]int
-	alive  bool
+	svc     *DhFwdService
+	mu      sync.Mutex
+	serial  string
+	ports   map[int]int
+	alive   bool
+	isRelay bool
 }
 
 func (t *dhTunnel) Local(port int) string {
@@ -319,6 +335,12 @@ func (t *dhTunnel) Alive() bool {
 	return t.alive
 }
 
+func (t *dhTunnel) IsRelay() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.isRelay
+}
+
 func (t *dhTunnel) Close() {
 	t.svc.closeSerial(t.serial)
 	t.mu.Lock()
@@ -345,6 +367,7 @@ type DhFwdService struct {
 	resolved    map[string]bool
 	taken       map[string]*dhTunnel
 	dead        []string
+	relay       map[string]bool
 	exhausted   bool
 	shutdown    bool
 	bindBuf     []Binding
@@ -364,6 +387,7 @@ func NewDhFwdService(exePath string, serials []string, batchSize int, onLog func
 		batch:     map[string]bool{},
 		resolved:  map[string]bool{},
 		taken:     map[string]*dhTunnel{},
+		relay:     map[string]bool{},
 	}
 	if err := s.spawn(); err != nil {
 		return nil, err
@@ -528,15 +552,21 @@ func (s *DhFwdService) handleEvent(ev *dhEvent) {
 		s.logf("%s — установление (%s)", ev.Serial, "туннель")
 	case "fwdPhase":
 		s.logf("[dbg] %s: %s — %s", ev.Serial, ev.Phase, ev.Detail)
+		if strings.Contains(strings.ToLower(ev.Phase), "relay") || strings.Contains(strings.ToLower(ev.Detail), "relay") {
+			s.mu.Lock()
+			s.relay[ev.Serial] = true
+			s.mu.Unlock()
+		}
 	case "fwdPortsOpened":
 		ports := map[int]int{}
 		for _, p := range ev.Ports {
 			ports[p.Remote] = p.Local
 		}
 		s.mu.Lock()
+		isRelay := s.relay[ev.Serial]
 		_, wasTaken := s.taken[ev.Serial]
 		unresolved := s.batch[ev.Serial] && !s.resolved[ev.Serial]
-		tun := &dhTunnel{svc: s, serial: ev.Serial, ports: ports, alive: true}
+		tun := &dhTunnel{svc: s, serial: ev.Serial, ports: ports, alive: true, isRelay: isRelay}
 		if !wasTaken && unresolved {
 			s.taken[ev.Serial] = tun
 		}
@@ -549,7 +579,7 @@ func (s *DhFwdService) handleEvent(ev *dhEvent) {
 		if !unresolved {
 			return
 		}
-		s.pushBinding(Binding{Serial: ev.Serial, Tunnel: tun})
+		s.pushBinding(Binding{Serial: ev.Serial, Tunnel: tun, IsRelay: isRelay})
 	case "fwdError":
 		s.mu.Lock()
 		s.dead = append(s.dead, ev.Serial)

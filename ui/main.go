@@ -7,6 +7,7 @@ package ui
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -30,8 +31,9 @@ const (
 	stMsg
 	stSettings
 	stTitleEdit
-	stDummyEdit // редактор dummy-кредов (login:passwd)
-	stGreet     // приветствие: выбор языка при первом запуске
+	stDummyEdit     // редактор dummy-кредов (login:passwd)
+	stPasswordsEdit // редактор пути к словарю паролей (passwords.txt)
+	stGreet         // приветствие: выбор языка при первом запуске
 )
 
 type tickMsg time.Time
@@ -56,6 +58,9 @@ type model struct {
 
 	dummyInput textinput.Model
 	dummyErr   string
+
+	passwordsInput textinput.Model
+	passwordsErr   string
 }
 
 func Run() {
@@ -76,7 +81,11 @@ func initialModel() model {
 	di.Placeholder = "login:passwd"
 	di.CharLimit = 65 // логин 32 + ':' + пароль 32
 	di.Width = 50
-	m := model{state: stMenu, titleInput: ti, dummyInput: di}
+	pi := textinput.New()
+	pi.Placeholder = "passwords.txt"
+	pi.CharLimit = 256
+	pi.Width = 60
+	m := model{state: stMenu, titleInput: ti, dummyInput: di, passwordsInput: pi}
 	if cfg.IsActivated {
 		// уже активированы — сразу в меню на сохранённом языке
 		i18n.SetLang(cfg.Lang)
@@ -135,6 +144,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateTitleEdit(msg)
 		case stDummyEdit:
 			return m.updateDummyEdit(msg)
+		case stPasswordsEdit:
+			return m.updatePasswordsEdit(msg)
 		}
 	}
 	return m, nil
@@ -396,6 +407,7 @@ const (
 	rowEditCT2   // OSD слот 3
 	rowEditCT3   // OSD слот 4
 	rowDummy     // dummy-креды: ввод login:passwd одной строкой
+	rowPasswords // словарь паролей (passwords.txt)
 	rowDebug     // лог-режим: дампы протокола облака в ленту логов
 	rowProfile   // профиль облака: smartpss (дефолт) | dmss (камеры из DMSS)
 	rowLang        // язык: «язык: русский» / «language: english»
@@ -425,8 +437,13 @@ func (m model) settingsRows() []settingsRow {
 	if cfg.Lang == "en" {
 		langLabel = "language: english"
 	}
+	passLabel := fmt.Sprintf(tr("словарь паролей: дефолт (%d шт.)"), len(cfg.DefaultPasswords))
+	if cfg.PasswordsFile != "" {
+		passLabel = fmt.Sprintf(tr("словарь паролей: %s (%d шт.)"), filepath.Base(cfg.PasswordsFile), len(cfg.DefaultPasswords))
+	}
 	rows = append(rows,
 		settingsRow{tr("добавить нового юзера"), rowDummy},
+		settingsRow{passLabel, rowPasswords},
 		settingsRow{fmt.Sprintf(tr("лог-режим (%s)"), onOff(cfg.Debug)), rowDebug},
 		settingsRow{fmt.Sprintf(tr("профиль облака: %s"), cfg.Profile), rowProfile},
 		settingsRow{langLabel, rowLang},
@@ -481,6 +498,9 @@ func (m model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		case rowDummy:
 			m.openDummyEdit()
+			return m, textinput.Blink
+		case rowPasswords:
+			m.openPasswordsEdit()
 			return m, textinput.Blink
 		case rowDebug:
 			cfg.Debug = !cfg.Debug
@@ -543,6 +563,8 @@ func (m model) View() string {
 		content, help = m.titleEditView(), tr("enter — сохранить  ·  esc — назад  ·  ctrl+c — выход")
 	case stDummyEdit:
 		content, help = m.dummyEditView(), tr("enter — сохранить  ·  esc — назад  ·  ctrl+c — выход")
+	case stPasswordsEdit:
+		content, help = m.passwordsEditView(), tr("enter — сохранить  ·  esc — назад  ·  ctrl+c — выход")
 	}
 	return withBottom(content, help, m.h)
 }
@@ -741,6 +763,71 @@ func (m model) dummyEditView() string {
 	sb.WriteString("\n" + centerLine(dim(tr("по дефолту/by default: krushitel:TancuiPantera1337"))) + "\n")
 	if m.dummyErr != "" {
 		sb.WriteString("\n" + centerLine(red("↑ "+m.dummyErr)) + "\n")
+	}
+	return sb.String()
+}
+
+// openPasswordsEdit — редактор пути к словарю паролей (passwords.txt / creds.txt).
+func (m *model) openPasswordsEdit() {
+	m.passwordsInput.SetValue(cfg.PasswordsFile)
+	m.passwordsErr = ""
+	m.passwordsInput.Focus()
+	m.state = stPasswordsEdit
+}
+
+func (m model) updatePasswordsEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.passwordsErr = ""
+		m.state = stSettings
+		return m, nil
+	case tea.KeyEnter:
+		val := strings.TrimSpace(m.passwordsInput.Value())
+		val = strings.ReplaceAll(val, "\r", "")
+		val = strings.ReplaceAll(val, "\n", "")
+		if val == "" {
+			cfg.PasswordsFile = ""
+			cfg.DefaultPasswords = []string{
+				"admin", "admin123", "123456", "password", "tlJwpbo6", "admin777", "888888", "dahua",
+			}
+			fwd.SetDefaultCreds(cfg.DefaultLogin, cfg.DefaultPasswords)
+			saveSettings()
+			m.passwordsErr = ""
+			m.state = stSettings
+			return m, nil
+		}
+		if !fileExists(val) {
+			m.passwordsErr = tr("такого файла нет!")
+			return m, nil
+		}
+		list, err := fwd.LoadPasswordsFromFile(val)
+		if err != nil || len(list) == 0 {
+			m.passwordsErr = tr("файл пуст или ошибка чтения")
+			return m, nil
+		}
+		cfg.PasswordsFile = val
+		cfg.DefaultPasswords = list
+		fwd.SetDefaultCreds(cfg.DefaultLogin, cfg.DefaultPasswords)
+		saveSettings()
+		m.passwordsErr = ""
+		m.state = stSettings
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.passwordsInput, cmd = m.passwordsInput.Update(msg)
+	return m, cmd
+}
+
+func (m model) passwordsEditView() string {
+	var sb strings.Builder
+	sb.WriteString(bannerBlock())
+	sb.WriteString(strings.Repeat("\n", 4))
+	sb.WriteString(panelS(tr("словарь паролей")) + "\n\n")
+	sb.WriteString(centerLine(cyan(tr("путь к файлу со словарём (passwords.txt / creds.txt):"))) + "\n")
+	sb.WriteString(centerLine(m.passwordsInput.View()) + "\n")
+	sb.WriteString("\n" + centerLine(dim(tr("формат: по одному паролю на строку, либо user:pass. пусто = дефолт"))) + "\n")
+	if m.passwordsErr != "" {
+		sb.WriteString("\n" + centerLine(red("↑ "+m.passwordsErr)) + "\n")
 	}
 	return sb.String()
 }

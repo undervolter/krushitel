@@ -22,6 +22,9 @@ func Lang() string { return lang }
 var en = map[string]string{
 	// ── баннер ──
 	"крушитель v1": "krushitel v1",
+	"крушитель v1.3 (beta)": "krushitel v1.3 (beta)",
+	"krushitel v1.3 (beta)": "krushitel v1.3 (beta)",
+	"Это beta версия софта - работать может нестабильно.": "This is a beta version - it can work unstably.",
 
 	// ── меню + выход ──
 	"что сегодня делаем?": "what are we doing today?",
@@ -136,6 +139,7 @@ var en = map[string]string{
 	"ошибка открытия входного файла: ":    "input file open error: ",
 	"ошибка создания выходного файла: ":   "output file creation error: ",
 	"ошибка открытия results.txt: ":       "results.txt open error: ",
+	"ошибка открытия results.csv: ":       "results.csv open error: ",
 	"ошибка открытия done.txt: ":          "done.txt open error: ",
 	"ошибка открытия nostun.txt: ":        "nostun.txt open error: ",
 	"ошибка создания папки результатов: ": "results folder creation error: ",

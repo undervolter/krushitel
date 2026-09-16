@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"krushitel/fwd"
 )
 
 // chdirTemp — тесты пишут config.json только во временную папку.
@@ -354,5 +355,79 @@ func TestSettingsMigration(t *testing.T) {
 	}
 	if cfg.Text != "" {
 		t.Fatalf("legacy Text не очищен: %q", cfg.Text)
+	}
+}
+
+func TestPasswordsSettingsEdit(t *testing.T) {
+	chdirTemp(t)
+	m := initialModel()
+	m.state = stSettings
+	m.setCur = 0
+
+	for i, r := range m.settingsRows() {
+		if r.kind == rowPasswords {
+			m.setCur = i
+			break
+		}
+	}
+
+	enter := tea.KeyMsg{Type: tea.KeyEnter}
+	nm, _ := m.updateSettings(enter)
+	m = nm.(model)
+
+	if m.state != stPasswordsEdit {
+		t.Fatalf("state = %v, want stPasswordsEdit", m.state)
+	}
+
+	// 1. Проверка несуществующего файла
+	m.passwordsInput.SetValue("nonexistent_passwords.txt")
+	nm, _ = m.updatePasswordsEdit(enter)
+	m = nm.(model)
+	if m.passwordsErr == "" {
+		t.Fatal("ожидалась ошибка для несуществующего файла")
+	}
+	if m.state != stPasswordsEdit {
+		t.Fatalf("state = %v, want stPasswordsEdit on error", m.state)
+	}
+
+	// 2. Создаём валидный файл словаря
+	passFile := "custom_passwords.txt"
+	content := "# comment\n\npass123\nadmin:custom456\nroot:toor\n"
+	if err := os.WriteFile(passFile, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m.passwordsInput.SetValue(passFile)
+	nm, _ = m.updatePasswordsEdit(enter)
+	m = nm.(model)
+
+	if m.state != stSettings {
+		t.Fatalf("state = %v, want stSettings after save", m.state)
+	}
+	if cfg.PasswordsFile != passFile {
+		t.Fatalf("cfg.PasswordsFile = %q, want %q", cfg.PasswordsFile, passFile)
+	}
+	if len(cfg.DefaultPasswords) != 3 {
+		t.Fatalf("len(cfg.DefaultPasswords) = %d, want 3", len(cfg.DefaultPasswords))
+	}
+	_, fwdPass := fwd.GetDefaultCreds()
+	if len(fwdPass) != 3 {
+		t.Fatalf("len(fwdPass) = %d, want 3", len(fwdPass))
+	}
+
+	// 3. Пустой ввод — сброс на дефолт
+	m.openPasswordsEdit()
+	m.passwordsInput.SetValue("")
+	nm, _ = m.updatePasswordsEdit(enter)
+	m = nm.(model)
+
+	if m.state != stSettings {
+		t.Fatalf("state = %v, want stSettings after reset", m.state)
+	}
+	if cfg.PasswordsFile != "" {
+		t.Fatalf("cfg.PasswordsFile = %q, want empty after reset", cfg.PasswordsFile)
+	}
+	if len(cfg.DefaultPasswords) != 8 {
+		t.Fatalf("len(cfg.DefaultPasswords) = %d, want 8 default passwords", len(cfg.DefaultPasswords))
 	}
 }

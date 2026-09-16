@@ -100,21 +100,21 @@ func snapshotSub(u *base.URL, timeout time.Duration) ([]byte, error) {
 			case *format.H264:
 				media, rtpFmt, codec = m, ff, "h264"
 				if ff.SPS != nil {
-					params = append(params, annexb(ff.SPS))
+					params = append(params, ff.SPS)
 				}
 				if ff.PPS != nil {
-					params = append(params, annexb(ff.PPS))
+					params = append(params, ff.PPS)
 				}
 			case *format.H265:
 				media, rtpFmt, codec = m, ff, "hevc"
 				if ff.VPS != nil {
-					params = append(params, annexb(ff.VPS))
+					params = append(params, ff.VPS)
 				}
 				if ff.SPS != nil {
-					params = append(params, annexb(ff.SPS))
+					params = append(params, ff.SPS)
 				}
 				if ff.PPS != nil {
-					params = append(params, annexb(ff.PPS))
+					params = append(params, ff.PPS)
 				}
 			}
 			if media != nil {
