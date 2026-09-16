@@ -43,7 +43,7 @@ go build .
 <h2>Compiled binaries are available in Releases.</h2>
 
 ### Bugs
-- Not found yet
+- Dohuya
 
 <h2>Found a bug? Please report it in the issues!</h2>
 
