@@ -100,3 +100,18 @@ func TestBetaNoticeI18n(t *testing.T) {
 		t.Fatalf("EN banner should contain krushitel v1.3 (beta), got: %s", enBanner)
 	}
 }
+
+func TestBannerBlockCRLF(t *testing.T) {
+	orig := bannerArt
+	defer func() { bannerArt = orig }()
+
+	// Симулируем CRLF от Windows checkout
+	bannerArt = "          /\\\r\n         (  )\r\n      .--.\\/.--.\r\n"
+	out := bannerBlock()
+	if strings.Contains(out, "\r") {
+		t.Fatalf("bannerBlock output contains \\r carriage return")
+	}
+	if !strings.Contains(out, "/\\") || !strings.Contains(out, "(  )") {
+		t.Fatalf("bannerBlock lost ASCII art with CRLF input:\n%s", out)
+	}
+}

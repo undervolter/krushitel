@@ -29,6 +29,8 @@ func init() {
 		log.SetFlags(0)
 		_ = log.Output(2, "banner.txt: "+err.Error()) // не фатально
 	}
+	bannerArt = strings.ReplaceAll(bannerArt, "\r\n", "\n")
+	bannerArt = strings.ReplaceAll(bannerArt, "\r", "\n")
 }
 
 var (
@@ -60,7 +62,9 @@ var termWidth int
 // на все строки арта — иначе ёлка разваливается), остальные строки экрана
 // центрируются centerLine'ом по отдельности.
 func bannerBlock() string {
-	art := strings.Split(strings.TrimRight(bannerArt, "\n"), "\n")
+	clean := strings.ReplaceAll(bannerArt, "\r\n", "\n")
+	clean = strings.ReplaceAll(clean, "\r", "\n")
+	art := strings.Split(strings.TrimRight(clean, "\n"), "\n")
 	info := []string{
 		"",
 		styleCyan.Bold(true).Render(tr("крушитель v1.3 (beta)")),
@@ -75,6 +79,7 @@ func bannerBlock() string {
 	// константа: арт меняется без правки кода
 	artWidth := 0
 	for _, ln := range art {
+		ln = strings.TrimRight(ln, "\r")
 		if n := len([]rune(ln)); n > artWidth {
 			artWidth = n
 		}
@@ -83,6 +88,7 @@ func bannerBlock() string {
 	var lines []string
 	widths := make([]int, 0, len(art))
 	for i, ln := range art {
+		ln = strings.TrimRight(ln, "\r")
 		runes := []rune(ln)
 		pad := artWidth - len(runes)
 		if pad < 0 {
