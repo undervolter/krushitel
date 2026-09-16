@@ -325,17 +325,11 @@ func tryConnect(ctx context.Context, addr string, probe []byte, timeout time.Dur
 		return res
 	}
 
-	// модель по 0x0b (DeviceType), фоллбэк на 0x0c (DeviceName), прошивка по 0x08 (dahua-info.py)
+	// модель по 0x0b, прошивка по 0x08 (dahua-info.py)
 	if res.Model == "" {
 		conn.SetDeadline(time.Now().Add(timeout))
 		if raw := dvripCmd(conn, 0x0b); len(raw) > 0 {
 			res.Model = extractModelFromRaw(raw)
-		}
-		if res.Model == "" {
-			conn.SetDeadline(time.Now().Add(timeout))
-			if raw := dvripCmd(conn, 0x0c); len(raw) > 0 {
-				res.Model = extractModelFromRaw(raw)
-			}
 		}
 	}
 	if res.Firmware == "" {
@@ -357,12 +351,6 @@ func tryConnect(ctx context.Context, addr string, probe []byte, timeout time.Dur
 			freshConn.SetDeadline(time.Now().Add(timeout))
 			if raw := dvripCmd(freshConn, 0x0b); len(raw) > 0 {
 				res.Model = extractModelFromRaw(raw)
-			}
-			if res.Model == "" {
-				freshConn.SetDeadline(time.Now().Add(timeout))
-				if raw := dvripCmd(freshConn, 0x0c); len(raw) > 0 {
-					res.Model = extractModelFromRaw(raw)
-				}
 			}
 			if res.Firmware == "" {
 				if raw := dvripCmd(freshConn, 0x08); len(raw) > 0 {
