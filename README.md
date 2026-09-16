@@ -32,18 +32,12 @@
  - Позволяет вытащить креды с камеры
  - и многое другое...
 
-### Сборка на Windows
-  ```sh
+### Сборка
+```sh
 git clone github.com/undervolter/krushitel
 cd krushitel
-build_all.cmd
-  ```
-### Сборка на Linux
-  ```sh
-git clone github.com/undervolter/krushitel
-cd krushitel
-build.sh
-  ```
+go build .
+```
 <h2>Скомпилированные бинарники доступны в Releases.</h2>
 
 ### Баги
