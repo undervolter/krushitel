@@ -6,6 +6,7 @@ package dhip
 
 import (
 	"fmt"
+	"krushitel/proxy"
 	"net"
 	"time"
 )
@@ -13,9 +14,9 @@ import (
 // Dialer — открывает соединение с портом камеры (5000/80/37777).
 type Dialer func() (net.Conn, error)
 
-// AddrDialer — классический TCP-дайл на адрес (для Local()-форвардов).
+// AddrDialer — классический TCP-дайл на адрес (для Local()-форвардов или прямого подключения через прокси).
 func AddrDialer(addr string, timeout time.Duration) Dialer {
-	return func() (net.Conn, error) { return net.DialTimeout("tcp", addr, timeout) }
+	return func() (net.Conn, error) { return proxy.DialTimeout("tcp", addr, timeout) }
 }
 
 // ExtractCredsDial — логин + console + OnvifUser -u → список пользователей.

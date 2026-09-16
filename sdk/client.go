@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"krushitel/proxy"
 	"net"
 	"strconv"
 	"strings"
@@ -186,7 +187,7 @@ func (c *Client) login(timeout time.Duration) (net.Conn, error) {
 	conn := c.conn
 	if conn == nil {
 		var err error
-		conn, err = net.DialTimeout("tcp", c.addr, timeout)
+		conn, err = proxy.DialTimeout("tcp", c.addr, timeout)
 		if err != nil {
 			return nil, fmt.Errorf("dial %s: %w", c.addr, err)
 		}

@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"krushitel/proxy"
 	"math/rand"
 	"net"
 	"strconv"
@@ -54,7 +55,7 @@ func dialTCPRelay(prof *appProfile, agentHost string, agentPort int, token strin
 	}
 	addr := net.JoinHostPort(agentHost, strconv.Itoa(agentPort))
 	logf("tcp-relay: dialing agent %s", addr)
-	conn, err := net.DialTimeout("tcp", addr, tcpRelayDialTimeout)
+	conn, err := proxy.DialTimeout("tcp", addr, tcpRelayDialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("agent tcp dial: %v", err)
 	}

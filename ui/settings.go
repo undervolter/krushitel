@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"krushitel/fwd"
+	"krushitel/proxy"
 )
 
 // Settings — как в krushitel (config.json), но без dummy-полей: тут только
@@ -37,6 +38,11 @@ type Settings struct {
 	DefaultLogin     string   `json:"default_login"`     // логин по умолчанию (например, "admin")
 	DefaultPasswords []string `json:"default_passwords"` // список паролей для автоматической проверки
 	PasswordsFile    string   `json:"passwords_file"`    // путь к файлу со словарём паролей (passwords.txt / creds.txt)
+
+	// Прокси (http(s) / socks5): одиночный адрес или ротация из файла
+	ProxyEnabled bool   `json:"proxy_enabled"` // включен ли прокси
+	ProxyURL     string `json:"proxy_url"`     // http(s)://... или socks5://...
+	ProxyFile    string `json:"proxy_file"`    // путь к файлу со списком прокси (proxies.txt)
 }
 
 const configFile = "config.json"
@@ -100,6 +106,16 @@ func loadSettings() {
 	}
 	_ = fwd.SetProfile(cfg.Profile)
 	fwd.SetDefaultCreds(cfg.DefaultLogin, cfg.DefaultPasswords)
+
+	// Настройка прокси подсистемы
+	proxy.SetEnabled(cfg.ProxyEnabled)
+	if cfg.ProxyURL != "" {
+		_ = proxy.SetSingle(cfg.ProxyURL)
+	}
+	if cfg.ProxyFile != "" {
+		_, _ = proxy.LoadFile(cfg.ProxyFile)
+	}
+
 	// Миграция старого единого текста: уходит в канал + слот 1, поле чистим.
 	if cfg.ChannelText == "" && cfg.Text != "" {
 		cfg.ChannelText = cfg.Text

@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"krushitel/proxy"
 	"net"
 	"os"
 	"regexp"
@@ -250,8 +251,9 @@ func probeDevice(ctx context.Context, target string, port int, timeout time.Dura
 }
 
 func tryConnect(ctx context.Context, addr string, probe []byte, timeout time.Duration) Result {
-	d := net.Dialer{Timeout: timeout}
-	conn, err := d.DialContext(ctx, "tcp", addr)
+	ctxTimeout, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := proxy.DialContext(ctxTimeout, "tcp", addr)
 	if err != nil {
 		if strings.Contains(err.Error(), "connection refused") {
 			return Result{Err: "refused"}
@@ -346,7 +348,9 @@ func tryConnect(ctx context.Context, addr string, probe []byte, timeout time.Dur
 	// Если сокет первого проба закрылся или упал в EOF до/во время 0x0b,
 	// поднимаем свежее короткое соединение чисто для опроса метаданных:
 	if res.Model == "" && ctx.Err() == nil {
-		freshConn, err := d.DialContext(ctx, "tcp", addr)
+		ctxFresh, cancelFresh := context.WithTimeout(ctx, timeout)
+		freshConn, err := proxy.DialContext(ctxFresh, "tcp", addr)
+		cancelFresh()
 		if err == nil {
 			freshConn.SetDeadline(time.Now().Add(timeout))
 			if raw := dvripCmd(freshConn, 0x0b); len(raw) > 0 {

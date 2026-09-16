@@ -10,6 +10,7 @@ package dhip
 import (
 	"encoding/json"
 	"fmt"
+	"krushitel/proxy"
 	"net"
 	"time"
 )
@@ -17,7 +18,7 @@ import (
 // DumpConfig — getConfig(name) → pretty-JSON таблицы. Для инспекции
 // конфигов (ChannelTitle/VideoWidget/что угодно) в тестовых тулзах.
 func DumpConfig(addr, password, name string, timeout time.Duration) (string, error) {
-	conn, err := net.DialTimeout("tcp", addr, timeout)
+	conn, err := proxy.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return "", fmt.Errorf("connect: %w", err)
 	}

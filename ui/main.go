@@ -16,6 +16,7 @@ import (
 	"krushitel/exploit"
 	"krushitel/fwd"
 	"krushitel/i18n"
+	"krushitel/proxy"
 )
 
 // tr — обёртка локализации: ru = ключ как есть, en = перевод из словаря.
@@ -33,6 +34,8 @@ const (
 	stTitleEdit
 	stDummyEdit     // редактор dummy-кредов (login:passwd)
 	stPasswordsEdit // редактор пути к словарю паролей (passwords.txt)
+	stProxyEdit     // редактор одиночного прокси
+	stProxyFileEdit // редактор пути к пулу прокси (proxies.txt)
 	stGreet         // приветствие: выбор языка при первом запуске
 )
 
@@ -61,6 +64,12 @@ type model struct {
 
 	passwordsInput textinput.Model
 	passwordsErr   string
+
+	proxyInput textinput.Model
+	proxyErr   string
+
+	proxyFileInput textinput.Model
+	proxyFileErr   string
 }
 
 func Run() {
@@ -85,7 +94,25 @@ func initialModel() model {
 	pi.Placeholder = "passwords.txt"
 	pi.CharLimit = 256
 	pi.Width = 60
-	m := model{state: stMenu, titleInput: ti, dummyInput: di, passwordsInput: pi}
+
+	proxi := textinput.New()
+	proxi.Placeholder = "socks5://127.0.0.1:1080 или http://user:pass@1.2.3.4:8080"
+	proxi.CharLimit = 256
+	proxi.Width = 60
+
+	proxfi := textinput.New()
+	proxfi.Placeholder = "proxies.txt"
+	proxfi.CharLimit = 256
+	proxfi.Width = 60
+
+	m := model{
+		state:          stMenu,
+		titleInput:     ti,
+		dummyInput:     di,
+		passwordsInput: pi,
+		proxyInput:     proxi,
+		proxyFileInput: proxfi,
+	}
 	if cfg.IsActivated {
 		// уже активированы — сразу в меню на сохранённом языке
 		i18n.SetLang(cfg.Lang)
@@ -146,6 +173,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateDummyEdit(msg)
 		case stPasswordsEdit:
 			return m.updatePasswordsEdit(msg)
+		case stProxyEdit:
+			return m.updateProxyEdit(msg)
+		case stProxyFileEdit:
+			return m.updateProxyFileEdit(msg)
 		}
 	}
 	return m, nil
@@ -408,6 +439,9 @@ const (
 	rowEditCT3   // OSD слот 4
 	rowDummy     // dummy-креды: ввод login:passwd одной строкой
 	rowPasswords // словарь паролей (passwords.txt)
+	rowProxyToggle // прокси: вкл / выкл
+	rowProxySingle // одиночный прокси (http/socks5://...)
+	rowProxyFile   // пул прокси из файла (proxies.txt)
 	rowDebug     // лог-режим: дампы протокола облака в ленту логов
 	rowProfile   // профиль облака: smartpss (дефолт) | dmss (камеры из DMSS)
 	rowLang        // язык: «язык: русский» / «language: english»
@@ -441,9 +475,32 @@ func (m model) settingsRows() []settingsRow {
 	if cfg.PasswordsFile != "" {
 		passLabel = fmt.Sprintf(tr("словарь паролей: %s (%d шт.)"), filepath.Base(cfg.PasswordsFile), len(cfg.DefaultPasswords))
 	}
+	proxyStatus := tr("выкл")
+	if cfg.ProxyEnabled {
+		proxyStatus = proxy.Status()
+	}
 	rows = append(rows,
 		settingsRow{tr("добавить нового юзера"), rowDummy},
 		settingsRow{passLabel, rowPasswords},
+		settingsRow{fmt.Sprintf(tr("прокси (%s)"), proxyStatus), rowProxyToggle},
+	)
+	if cfg.ProxyEnabled {
+		singleVal := cfg.ProxyURL
+		if singleVal == "" {
+			singleVal = tr("(пусто)")
+		}
+		fileVal := cfg.ProxyFile
+		if fileVal == "" {
+			fileVal = tr("(пусто)")
+		} else {
+			fileVal = filepath.Base(fileVal)
+		}
+		rows = append(rows,
+			settingsRow{fmt.Sprintf(tr("   └ адрес прокси: %s"), singleVal), rowProxySingle},
+			settingsRow{fmt.Sprintf(tr("   └ пул прокси: %s"), fileVal), rowProxyFile},
+		)
+	}
+	rows = append(rows,
 		settingsRow{fmt.Sprintf(tr("лог-режим (%s)"), onOff(cfg.Debug)), rowDebug},
 		settingsRow{fmt.Sprintf(tr("профиль облака: %s"), cfg.Profile), rowProfile},
 		settingsRow{langLabel, rowLang},
@@ -501,6 +558,16 @@ func (m model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		case rowPasswords:
 			m.openPasswordsEdit()
+			return m, textinput.Blink
+		case rowProxyToggle:
+			cfg.ProxyEnabled = !cfg.ProxyEnabled
+			proxy.SetEnabled(cfg.ProxyEnabled)
+			saveSettings()
+		case rowProxySingle:
+			m.openProxyEdit()
+			return m, textinput.Blink
+		case rowProxyFile:
+			m.openProxyFileEdit()
 			return m, textinput.Blink
 		case rowDebug:
 			cfg.Debug = !cfg.Debug
@@ -565,6 +632,10 @@ func (m model) View() string {
 		content, help = m.dummyEditView(), tr("enter — сохранить  ·  esc — назад  ·  ctrl+c — выход")
 	case stPasswordsEdit:
 		content, help = m.passwordsEditView(), tr("enter — сохранить  ·  esc — назад  ·  ctrl+c — выход")
+	case stProxyEdit:
+		content, help = m.proxyEditView(), tr("enter — сохранить  ·  esc — назад  ·  ctrl+c — выход")
+	case stProxyFileEdit:
+		content, help = m.proxyFileEditView(), tr("enter — сохранить  ·  esc — назад  ·  ctrl+c — выход")
 	}
 	return withBottom(content, help, m.h)
 }
@@ -828,6 +899,117 @@ func (m model) passwordsEditView() string {
 	sb.WriteString("\n" + centerLine(dim(tr("формат: по одному паролю на строку, либо user:pass. пусто = дефолт"))) + "\n")
 	if m.passwordsErr != "" {
 		sb.WriteString("\n" + centerLine(red("↑ "+m.passwordsErr)) + "\n")
+	}
+	return sb.String()
+}
+
+// ── редакторы прокси ─────────────────────────────────────────────────
+
+func (m *model) openProxyEdit() {
+	m.proxyInput.SetValue(cfg.ProxyURL)
+	m.proxyErr = ""
+	m.proxyInput.Focus()
+	m.state = stProxyEdit
+}
+
+func (m model) updateProxyEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.proxyErr = ""
+		m.state = stSettings
+		return m, nil
+	case tea.KeyEnter:
+		val := strings.TrimSpace(m.proxyInput.Value())
+		val = strings.ReplaceAll(val, "\r", "")
+		val = strings.ReplaceAll(val, "\n", "")
+		if val != "" {
+			if err := proxy.SetSingle(val); err != nil {
+				m.proxyErr = tr("неверный формат прокси (http/https/socks5://host:port)")
+				return m, nil
+			}
+		} else {
+			_ = proxy.SetSingle("")
+		}
+		cfg.ProxyURL = val
+		saveSettings()
+		m.proxyErr = ""
+		m.state = stSettings
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.proxyInput, cmd = m.proxyInput.Update(msg)
+	return m, cmd
+}
+
+func (m model) proxyEditView() string {
+	var sb strings.Builder
+	sb.WriteString(bannerBlock())
+	sb.WriteString(strings.Repeat("\n", 4))
+	sb.WriteString(panelS(tr("одиночный прокси")) + "\n\n")
+	sb.WriteString(centerLine(cyan(tr("введи адрес прокси (http/https/socks5):"))) + "\n")
+	sb.WriteString(centerLine(m.proxyInput.View()) + "\n")
+	sb.WriteString("\n" + centerLine(dim(tr("пример: socks5://127.0.0.1:1080 или http://user:pass@1.2.3.4:8080. пусто = очистить"))) + "\n")
+	if m.proxyErr != "" {
+		sb.WriteString("\n" + centerLine(red("↑ "+m.proxyErr)) + "\n")
+	}
+	return sb.String()
+}
+
+func (m *model) openProxyFileEdit() {
+	m.proxyFileInput.SetValue(cfg.ProxyFile)
+	m.proxyFileErr = ""
+	m.proxyFileInput.Focus()
+	m.state = stProxyFileEdit
+}
+
+func (m model) updateProxyFileEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.proxyFileErr = ""
+		m.state = stSettings
+		return m, nil
+	case tea.KeyEnter:
+		val := strings.TrimSpace(m.proxyFileInput.Value())
+		val = strings.ReplaceAll(val, "\r", "")
+		val = strings.ReplaceAll(val, "\n", "")
+		if val == "" {
+			cfg.ProxyFile = ""
+			_, _ = proxy.LoadFile("")
+			saveSettings()
+			m.proxyFileErr = ""
+			m.state = stSettings
+			return m, nil
+		}
+		if !fileExists(val) {
+			m.proxyFileErr = tr("такого файла нет!")
+			return m, nil
+		}
+		count, err := proxy.LoadFile(val)
+		if err != nil || count == 0 {
+			m.proxyFileErr = tr("файл пуст или ошибка чтения")
+			return m, nil
+		}
+		cfg.ProxyFile = val
+		saveSettings()
+		m.proxyFileErr = ""
+		m.state = stSettings
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.proxyFileInput, cmd = m.proxyFileInput.Update(msg)
+	return m, cmd
+}
+
+func (m model) proxyFileEditView() string {
+	var sb strings.Builder
+	sb.WriteString(bannerBlock())
+	sb.WriteString(strings.Repeat("\n", 4))
+	sb.WriteString(panelS(tr("пул прокси из файла")) + "\n\n")
+	sb.WriteString(centerLine(cyan(tr("путь к файлу со списком прокси (proxies.txt):"))) + "\n")
+	sb.WriteString(centerLine(m.proxyFileInput.View()) + "\n")
+	sb.WriteString("\n" + centerLine(dim(tr("формат: по одному адресу на строку. ротация round-robin. пусто = очистить"))) + "\n")
+	if m.proxyFileErr != "" {
+		sb.WriteString("\n" + centerLine(red("↑ "+m.proxyFileErr)) + "\n")
 	}
 	return sb.String()
 }
