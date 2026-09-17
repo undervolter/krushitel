@@ -67,12 +67,33 @@ func bannerBlock() string {
 	art := strings.Split(strings.TrimRight(clean, "\n"), "\n")
 	info := []string{
 		"",
-		styleCyan.Bold(true).Render(tr("крушитель v1.3 (beta)")),
+		styleCyan.Bold(true).Render(tr("крушитель v1.3")),
 		styleDim.Render("exploit-based dahua sn scanner"),
 		"",
 		styleDim.Render("t.me/kkrushitel"),
 		styleDim.Render("github.com/undervolter/krushitel"),
 		"",
+	}
+
+	// Находим минимальный отступ слева у всех непустых строк арта и срезаем его
+	minIndent := -1
+	for _, ln := range art {
+		trimmed := strings.TrimRight(ln, "\r")
+		if strings.TrimSpace(trimmed) == "" {
+			continue
+		}
+		spaces := len(trimmed) - len(strings.TrimLeft(trimmed, " "))
+		if minIndent == -1 || spaces < minIndent {
+			minIndent = spaces
+		}
+	}
+	if minIndent > 0 {
+		for i, ln := range art {
+			trimmed := strings.TrimRight(ln, "\r")
+			if len(trimmed) >= minIndent {
+				art[i] = trimmed[minIndent:]
+			}
+		}
 	}
 
 	// ширина арта — по самой длинной строке (уши/крылья), а не магическая
@@ -117,17 +138,12 @@ func bannerBlock() string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString(rightLine(betaNotice()) + "\n")
+	sb.WriteString("\n")
 	padStr := strings.Repeat(" ", leftPad)
 	for _, line := range lines {
 		sb.WriteString(fitWidth(padStr+line) + "\n")
 	}
 	return sb.String()
-}
-
-// betaNotice — постоянный текст beta-версии в углу.
-func betaNotice() string {
-	return styleYellow.Render(tr("Это beta версия софта - работать может нестабильно."))
 }
 
 // rightLine — прижимает строку к правому краю терминала (2 пробела от правого края).

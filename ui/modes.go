@@ -507,7 +507,10 @@ func prefixForm() *formState {
 	f.addInt(tr("потоков"), 500)
 	f.addStr(tr("выходной файл (база, без расширения)"), true, false)
 	f.addInt(tr("фильтр: 1=динамики (spkonly.txt), 2=все, 3=свой файл"), 2)
-	f.addStr(tr("файл со своим фильтром (для варианта 3)"), false, false)
+	f.addStrCond(tr("файл со своим фильтром (для варианта 3)"), true, true, func(st *formState) bool {
+		return len(st.fields) > 4 && st.fields[4].intVal == 3
+	})
+	f.addBool(tr("записывать в файл только префиксы моделей которые удалось определить?"), false)
 	return f
 }
 
@@ -518,6 +521,7 @@ func startPrefixRun(m *model) {
 	outBase := m.form.fields[3].strVal
 	filterChoice := m.form.fields[4].intVal
 	customFilterFile := m.form.fields[5].strVal
+	onlyKnown := m.form.fields[6].boolVal
 
 	var filterPatterns []string
 	if filterChoice == 1 {
@@ -537,7 +541,7 @@ func startPrefixRun(m *model) {
 			if data, err := os.ReadFile(customFilterFile); err == nil {
 				for _, line := range strings.Split(string(data), "\n") {
 					line = strings.TrimSpace(line)
-				if line != "" && !strings.HasPrefix(line, "#") {
+					if line != "" && !strings.HasPrefix(line, "#") {
 						filterPatterns = append(filterPatterns, strings.ToUpper(line))
 					}
 				}
@@ -546,11 +550,11 @@ func startPrefixRun(m *model) {
 	}
 
 	matchesFilter := func(model string) bool {
-		if len(filterPatterns) == 0 {
-			return true // вариант 2 (без фильтра)
-		}
 		if model == "" {
-			return false
+			return !onlyKnown
+		}
+		if len(filterPatterns) == 0 {
+			return true // вариант 2 (все)
 		}
 		up := strings.ToUpper(model)
 		for _, pat := range filterPatterns {
@@ -579,7 +583,7 @@ func startPrefixRun(m *model) {
 
 	r := newRunState(runPrefix, tr("префиксы"))
 	r.preTotal = len(targets)
-	// лог — рядом с базой: base_prefix.txt / base_serials.txt / base_log.txt
+	// лог — рядом с базой: base_prefix.txt / base_log.txt
 	r.openLog(outBase + "_log.txt")
 	// Отмена по esc: ctx пробивает пробы (ironscan.Run ctx-aware).
 	ctx, cancel := context.WithCancel(context.Background())
@@ -611,7 +615,7 @@ func startPrefixRun(m *model) {
 			atomic.AddInt64(&r.preScanned, 1)
 			sn := ironscan.SanitizeSerial(res.Serial)
 			if sn != "" {
-				if len(filterPatterns) > 0 && !matchesFilter(res.Model) {
+				if !matchesFilter(res.Model) {
 					return
 				}
 				atomic.AddInt64(&r.preFound, 1)
@@ -653,31 +657,22 @@ func startPrefixRun(m *model) {
 		mu.Unlock()
 		var prefixes []string
 		seenP := make(map[string]struct{})
-		lines := make([]string, 0, len(uniq))
 		for _, e := range uniq {
-			if len(filterPatterns) > 0 && !matchesFilter(e.model) {
+			if !matchesFilter(e.model) {
 				continue
-			}
-			if e.model != "" {
-				lines = append(lines, e.sn+";"+e.model)
-			} else {
-				lines = append(lines, e.sn)
 			}
 			if len(e.sn) >= 10 {
 				p := e.sn[:10]
-			if _, ok := seenP[p]; !ok {
+				if _, ok := seenP[p]; !ok {
 					seenP[p] = struct{}{}
 					prefixes = append(prefixes, p)
 				}
 			}
 		}
-		if len(lines) > 0 {
-			_ = os.WriteFile(outBase+"_serials.txt", []byte(strings.Join(lines, "\n")+"\n"), 0644)
-		}
 		if len(prefixes) > 0 {
 			_ = os.WriteFile(outBase+"_prefix.txt", []byte(strings.Join(prefixes, "\n")+"\n"), 0644)
 			select {
-			case r.eventsCh <- fmt.Sprintf(tr("[+] серийников: %d, префиксов: %d"), len(lines), len(prefixes)):
+			case r.eventsCh <- fmt.Sprintf(tr("[+] префиксов: %d"), len(prefixes)):
 			default:
 			}
 		}

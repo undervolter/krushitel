@@ -1,15 +1,5 @@
 package ui
 
-// real.go — оболочка экрана прогона для РЕАЛЬНЫХ движков krushitel
-// (exploit/scanner/cloud/xmlde/ironscan через go.mod replace).
-//
-// Режим exploit показывает ЖИВЫЕ СТРОКИ СЕССИЙ (Stats.SetRow): у каждого
-// серийника одна строка, обновляющаяся на месте по стадиям
-// (пречек → туннель → exploit… → PWNED!/ADDED/FAIL/OFFLINE).
-// Остальные режимы — лента событий, размер которой подстраивается
-// под высоту терминала. Help-строку здесь НЕ рисуем — её прижимает
-// к низу withBottom (иначе дубль).
-
 import (
 	"context"
 	"fmt"
@@ -447,7 +437,7 @@ func (r *runState) checkView() string {
 			sb.WriteString(centerLine(fmt.Sprintf("%s %.1f%%", bar(readLines, readTotal, 30), pct)) + "\n")
 			sb.WriteString(centerLine(fmt.Sprintf(tr("%d/%d строк"), readLines, readTotal)+
 				" | "+fmt.Sprintf(tr("серийников: %s"), green(fmt.Sprint(valid)))+
-				" | "+r.elapsed())+"\n\n")
+				" | "+r.elapsed()) + "\n\n")
 		} else {
 			sb.WriteString(centerLine(yellow(tr("читаю файл…"))) + "\n\n")
 		}

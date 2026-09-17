@@ -246,11 +246,11 @@ func (m model) greetView() string {
 
 var mainMenuOptions = []string{
 	"крушим)",
-	"OSDChanger",
+	"меняем текст на камерах",
 	"генерируем SN с списка префиксов",
-	"сканим серийники",
-	"расшифровываем .xml от smartpss",
-	"ищем префиксы",
+	"чекаем список SN на валид",
+	"че то делаем с .xml от smartpss",
+	"ищем префиксы по списку IP",
 	"настройки",
 }
 
@@ -441,9 +441,8 @@ const (
 	rowPasswords // словарь паролей (passwords.txt)
 	rowProxyToggle // прокси: вкл / выкл
 	rowProxySingle // одиночный прокси (http/socks5://...)
-	rowProxyFile   // пул прокси из файла (proxies.txt)
+	rowProxyFile   // список прокси из файла (proxies.txt)
 	rowDebug     // лог-режим: дампы протокола облака в ленту логов
-	rowProfile   // профиль облака: smartpss (дефолт) | dmss (камеры из DMSS)
 	rowLang        // язык: «язык: русский» / «language: english»
 	rowBack
 )
@@ -452,9 +451,9 @@ const (
 // только когда автозамена включена.
 func (m model) settingsRows() []settingsRow {
 	rows := []settingsRow{
-		{fmt.Sprintf(tr("снапы (%s)"), onOff(cfg.Snaps)), rowSnaps},
-		{fmt.Sprintf(tr("autogen .xml (%s)"), onOff(cfg.XML)), rowXML},
-		{fmt.Sprintf(tr("настройки OSDChanger (%s)"), onOff(cfg.Titles)), rowTitles},
+		{fmt.Sprintf(tr("всегда делать снапы (%s)"), onOff(cfg.Snaps)), rowSnaps},
+		{fmt.Sprintf(tr("всегда генерировать .xml (%s)"), onOff(cfg.XML)), rowXML},
+		{fmt.Sprintf(tr("OSDChanger (%s)"), onOff(cfg.Titles)), rowTitles},
 	}
 	if cfg.Titles {
 		rows = append(rows,
@@ -477,7 +476,11 @@ func (m model) settingsRows() []settingsRow {
 	}
 	proxyStatus := tr("выкл")
 	if cfg.ProxyEnabled {
-		proxyStatus = proxy.Status()
+		if cfg.ProxyURL == "" && cfg.ProxyFile == "" {
+			proxyStatus = tr("не настроен")
+		} else {
+			proxyStatus = tr("вкл")
+		}
 	}
 	rows = append(rows,
 		settingsRow{tr("добавить нового юзера"), rowDummy},
@@ -497,12 +500,11 @@ func (m model) settingsRows() []settingsRow {
 		}
 		rows = append(rows,
 			settingsRow{fmt.Sprintf(tr("   └ адрес прокси: %s"), singleVal), rowProxySingle},
-			settingsRow{fmt.Sprintf(tr("   └ пул прокси: %s"), fileVal), rowProxyFile},
+			settingsRow{fmt.Sprintf(tr("   └ файл с списком прокси: %s"), fileVal), rowProxyFile},
 		)
 	}
 	rows = append(rows,
 		settingsRow{fmt.Sprintf(tr("лог-режим (%s)"), onOff(cfg.Debug)), rowDebug},
-		settingsRow{fmt.Sprintf(tr("профиль облака: %s"), cfg.Profile), rowProfile},
 		settingsRow{langLabel, rowLang},
 		settingsRow{tr("назад"), rowBack},
 	)
@@ -571,17 +573,6 @@ func (m model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		case rowDebug:
 			cfg.Debug = !cfg.Debug
-			saveSettings()
-		case rowProfile:
-			if cfg.Profile == "dmss" {
-				cfg.Profile = "smartpss"
-			} else {
-				cfg.Profile = "dmss"
-			}
-			if err := fwd.SetProfile(cfg.Profile); err != nil {
-				cfg.Profile = "smartpss"
-				_ = fwd.SetProfile(cfg.Profile)
-			}
 			saveSettings()
 		case rowLang:
 			if cfg.Lang == "en" {
@@ -927,10 +918,17 @@ func (m model) updateProxyEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.proxyErr = tr("неверный формат прокси (http/https/socks5://host:port)")
 				return m, nil
 			}
+			cfg.ProxyURL = val
+			cfg.ProxyEnabled = true
+			proxy.SetEnabled(true)
 		} else {
 			_ = proxy.SetSingle("")
+			cfg.ProxyURL = ""
+			if cfg.ProxyFile == "" {
+				cfg.ProxyEnabled = false
+				proxy.SetEnabled(false)
+			}
 		}
-		cfg.ProxyURL = val
 		saveSettings()
 		m.proxyErr = ""
 		m.state = stSettings
@@ -975,6 +973,10 @@ func (m model) updateProxyFileEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if val == "" {
 			cfg.ProxyFile = ""
 			_, _ = proxy.LoadFile("")
+			if cfg.ProxyURL == "" {
+				cfg.ProxyEnabled = false
+				proxy.SetEnabled(false)
+			}
 			saveSettings()
 			m.proxyFileErr = ""
 			m.state = stSettings
@@ -990,6 +992,8 @@ func (m model) updateProxyFileEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		cfg.ProxyFile = val
+		cfg.ProxyEnabled = true
+		proxy.SetEnabled(true)
 		saveSettings()
 		m.proxyFileErr = ""
 		m.state = stSettings
@@ -1004,7 +1008,7 @@ func (m model) proxyFileEditView() string {
 	var sb strings.Builder
 	sb.WriteString(bannerBlock())
 	sb.WriteString(strings.Repeat("\n", 4))
-	sb.WriteString(panelS(tr("пул прокси из файла")) + "\n\n")
+	sb.WriteString(panelS(tr("файл с списком прокси")) + "\n\n")
 	sb.WriteString(centerLine(cyan(tr("путь к файлу со списком прокси (proxies.txt):"))) + "\n")
 	sb.WriteString(centerLine(m.proxyFileInput.View()) + "\n")
 	sb.WriteString("\n" + centerLine(dim(tr("формат: по одному адресу на строку. ротация round-robin. пусто = очистить"))) + "\n")

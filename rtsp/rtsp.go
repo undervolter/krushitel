@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/bluenviron/gortsplib/v5"
@@ -46,6 +47,104 @@ func SnapshotChannel(addr, user, pass string, channel int, timeout time.Duration
 		lastErr = errors.New("rtsp: не удалось")
 	}
 	return nil, lastErr
+}
+
+// ProbeChannel проверяет активность видеопотока на канале (RTSP DESCRIBE).
+// Возвращает true, если в SDP описан валидный H264/H265 видео-трек.
+func ProbeChannel(addr, user, pass string, channel int, timeout time.Duration) bool {
+	if channel <= 0 {
+		channel = 1
+	}
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	u, err := base.ParseURL(fmt.Sprintf("rtsp://%s/cam/realmonitor?channel=%d&subtype=0", addr, channel))
+	if err != nil {
+		return false
+	}
+	u.User = url.UserPassword(user, pass)
+
+	proto := gortsplib.ProtocolTCP
+	c := &gortsplib.Client{
+		Scheme:        u.Scheme,
+		Host:          u.Host,
+		ReadTimeout:   timeout,
+		WriteTimeout:  timeout,
+		Protocol:      &proto,
+		OnPacketsLost: func(uint64) {},
+	}
+	if err := c.Start(); err != nil {
+		return false
+	}
+	defer c.Close()
+
+	session, _, err := c.Describe(u)
+	if err != nil {
+		return false
+	}
+	for _, m := range session.Medias {
+		for _, f := range m.Formats {
+			switch f.(type) {
+			case *format.H264, *format.H265:
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// FindActiveChannels опрашивает каналы 1..totalChannels и возвращает срез только активных каналов.
+// Опрос выполняется параллельно пулом воркеров (до 4 параллельных проверок) с таймаутом timeout на канал.
+func FindActiveChannels(addr, user, pass string, totalChannels int, timeout time.Duration) []int {
+	if totalChannels <= 1 {
+		return []int{1}
+	}
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+
+	type probeRes struct {
+		ch int
+		ok bool
+	}
+	resCh := make(chan probeRes, totalChannels)
+	sem := make(chan struct{}, 4)
+
+	var wg sync.WaitGroup
+	for ch := 1; ch <= totalChannels; ch++ {
+		wg.Add(1)
+		go func(c int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			ok := ProbeChannel(addr, user, pass, c, timeout)
+			<-sem
+			resCh <- probeRes{ch: c, ok: ok}
+		}(ch)
+	}
+
+	wg.Wait()
+	close(resCh)
+
+	activeMap := make(map[int]bool)
+	for r := range resCh {
+		if r.ok {
+			activeMap[r.ch] = true
+		}
+	}
+
+	var active []int
+	for ch := 1; ch <= totalChannels; ch++ {
+		if activeMap[ch] {
+			active = append(active, ch)
+		}
+	}
+
+	// Если ни один канал не ответил (например, строгий фаервол или RTSP требует нестандартных прав),
+	// чтобы не потерять снап, пробуем канал 1 по умолчанию.
+	if len(active) == 0 {
+		return []int{1}
+	}
+	return active
 }
 
 // rtpADecoder — общий интерфейс RTP-депакетизаторов H264/HEVC: Decode

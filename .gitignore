@@ -26,3 +26,6 @@ xml/
 exp.txt
 vuln.txt
 alive.txt
+
+# тесты
+*_test.go

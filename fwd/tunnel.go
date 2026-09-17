@@ -67,7 +67,9 @@ func isAuthError(err error) bool {
 		errors.Is(err, ErrAuthRequired) ||
 		strings.Contains(err.Error(), "device requires authentication") ||
 		strings.Contains(err.Error(), "device authentication failed") ||
-		strings.Contains(err.Error(), "code=403")
+		strings.Contains(err.Error(), "code=403") ||
+		strings.Contains(err.Error(), "code=401") ||
+		strings.Contains(err.Error(), "401 Unauthorized")
 }
 
 // errCloudStall возвращается при отсутствии ответа облака в хендшейке.
@@ -87,6 +89,20 @@ var StunFailHook func(serial string)
 
 // ForceAppRelay форсирует апп-диалект на релее.
 var ForceAppRelay = false
+
+// isModernAppRelayVersion проверяет, использует ли устройство/агент апп-диалект
+// (версии 5.x+, 6.x+, 7.x+). Такие агенты не поддерживают 0x17/0x19 PTCP auth,
+// а попытка запросить токен инвалидирует и травит дата-канал.
+func isModernAppRelayVersion(v string) bool {
+	if v == "" {
+		return false
+	}
+	parts := strings.SplitN(v, ".", 2)
+	if n, err := strconv.Atoi(parts[0]); err == nil && n >= 5 {
+		return true
+	}
+	return false
+}
 
 var (
 	initOnce sync.Once
@@ -749,21 +765,21 @@ func (t *Tunnel) establish() error {
 		if res.Code == 404 {
 			return errDeviceNotFound
 		}
-		if t.dtype == 0 && res.Code == 403 {
+		if t.dtype == 0 && (res.Code == 403 || res.Code == 401) {
 			return errDeviceRequireAuth
 		}
-		if t.dtype > 0 && res.Code == 403 {
+		if t.dtype > 0 && (res.Code == 403 || res.Code == 401) {
 			return errAuthFailed
 		}
 		return fmt.Errorf("device response: code=%d %s", res.Code, res.Status)
 	}
 
-	if v := res.Body["body/version"]; strings.HasPrefix(v, "6.") || strings.HasPrefix(v, "7.") {
+	if v := res.Body["body/version"]; isModernAppRelayVersion(v) {
 		t.forceAppRelay = true
 		if t.poolExplicit {
-			t.logf("device version %s (2024+) detected — enabling app relay dialect, keeping explicit pool=%d", v, t.poolTarget)
+			t.logf("device version %s detected — enabling app relay dialect, keeping explicit pool=%d", v, t.poolTarget)
 		} else {
-			t.logf("device version %s (2024+) detected — disabling realm pool and enabling app relay dialect", v)
+			t.logf("device version %s detected — disabling realm pool and enabling app relay dialect", v)
 			t.poolTarget = 0
 		}
 	}
@@ -1075,12 +1091,12 @@ func (t *Tunnel) waitRelayChannelAck(mainRemote *UDP, agentHost string, agentPor
 	for attempt := 0; attempt < relayChannelMaxRetransmits; attempt++ {
 		if res, err := mainRemote.Read(true, interval); err == nil {
 			t.logf("relay-channel ack received from agent")
-			if v := res.Body["body/version"]; strings.HasPrefix(v, "6.") || strings.HasPrefix(v, "7.") {
+			if v := res.Body["body/version"]; isModernAppRelayVersion(v) {
 				t.forceAppRelay = true
 				if t.poolExplicit {
-					t.logf("device version %s (2024+) detected — enabling app relay dialect, keeping explicit pool=%d", v, t.poolTarget)
+					t.logf("device version %s detected — enabling app relay dialect, keeping explicit pool=%d", v, t.poolTarget)
 				} else {
-					t.logf("device version %s (2024+) detected — disabling realm pool and enabling app relay dialect", v)
+					t.logf("device version %s detected — disabling realm pool and enabling app relay dialect", v)
 					t.poolTarget = 0
 				}
 			}
