@@ -19,6 +19,7 @@ import (
 	"krushitel/exploit"
 	"krushitel/fwd"
 	"krushitel/ironscan"
+	"krushitel/proxy"
 	"krushitel/scanner"
 	"krushitel/smartpss"
 	"krushitel/xmlde"
@@ -214,7 +215,17 @@ func launchExploitRun(m *model, inFile, outDir string, threads int, serials []st
 		Resume:      resume,
 	}
 
-	go exploit.RunExploit(ctx, serials, outDir, threads, opts, stats, r.eventsCh)
+	go func() {
+		if proxy.IsEnabled() {
+			removed, remaining := proxy.CheckSession(ctx, func(format string, a ...any) {
+				r.logf(format, a...)
+			})
+			if removed > 0 {
+				r.logf("вырезано прокси с неверной авторизацией: %d (осталось: %d)", removed, remaining)
+			}
+		}
+		exploit.RunExploit(ctx, serials, outDir, threads, opts, stats, r.eventsCh)
+	}()
 }
 
 // ── режим 2: титры по списку ─────────────────────────────────────────
@@ -272,7 +283,17 @@ func launchTitlesRun(m *model, inFile string, threads int, cams []exploit.CamCre
 		CustomTexts: cfg.CustomTexts[:],
 	}
 
-	go exploit.RunTitles(ctx, cams, threads, opts, stats, r.eventsCh)
+	go func() {
+		if proxy.IsEnabled() {
+			removed, remaining := proxy.CheckSession(ctx, func(format string, a ...any) {
+				r.logf(format, a...)
+			})
+			if removed > 0 {
+				r.logf("вырезано прокси с неверной авторизацией: %d (осталось: %d)", removed, remaining)
+			}
+		}
+		exploit.RunTitles(ctx, cams, threads, opts, stats, r.eventsCh)
+	}()
 }
 
 func generateForm() *formState {
@@ -572,6 +593,14 @@ func startPrefixRun(m *model) {
 	var mu sync.Mutex
 	var found []snModel
 	go func() {
+		if proxy.IsEnabled() {
+			removed, remaining := proxy.CheckSession(ctx, func(format string, a ...any) {
+				r.logf(format, a...)
+			})
+			if removed > 0 {
+				r.logf("вырезано прокси с неверной авторизацией: %d (осталось: %d)", removed, remaining)
+			}
+		}
 		err := ironscan.Run(ctx, ironscan.Options{
 			Targets:     targets,
 			Port:        port,

@@ -426,6 +426,12 @@ func Run(ctx context.Context, opts Options, onResult func(Result)) error {
 	if len(opts.Targets) == 0 {
 		return fmt.Errorf("no targets")
 	}
+
+	// Сессионная проверка прокси (ровно один раз за сессию, без повторов)
+	if proxy.IsEnabled() {
+		proxy.CheckSession(ctx, nil)
+	}
+
 	if opts.Port == 0 {
 		opts.Port = 37777
 	}

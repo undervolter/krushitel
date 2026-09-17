@@ -129,6 +129,18 @@ func (r *runState) writeLog(line string) {
 	r.logMu.Unlock()
 }
 
+// logf форматирует строку и пишет в лог-файл и в ленту событий UI.
+func (r *runState) logf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	r.writeLog(msg)
+	if r.eventsCh != nil {
+		select {
+		case r.eventsCh <- msg:
+		default:
+		}
+	}
+}
+
 // closeLog — флуш и закрытие (выход из прогона).
 func (r *runState) closeLog() {
 	if r.logFile != nil {

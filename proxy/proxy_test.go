@@ -253,3 +253,78 @@ func TestManagerPoolAndRotation(t *testing.T) {
 		t.Fatalf("expected IsEnabled() = false after reset")
 	}
 }
+
+func TestAuthErrorDetectionAndPruning(t *testing.T) {
+	// 1. Target echo server
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer echoLn.Close()
+
+	go func() {
+		for {
+			c, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	// 2. Start mock HTTP proxy expecting "gooduser:goodpass"
+	proxyAddr, stopProxy := startMockHttpProxy(t, "gooduser:goodpass")
+	defer stopProxy()
+
+	badProxyURL := fmt.Sprintf("http://baduser:wrongpass@%s", proxyAddr)
+	goodProxyURL := fmt.Sprintf("http://gooduser:goodpass@%s", proxyAddr)
+
+	// Write temp proxy file with bad proxy first, then good proxy
+	content := fmt.Sprintf("%s\n%s\n", badProxyURL, goodProxyURL)
+	tmpFile, err := os.CreateTemp("", "proxies-auth-*.txt")
+	if err != nil {
+		t.Fatalf("temp: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.WriteString(content)
+	tmpFile.Close()
+
+	_, err = LoadFile(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	SetEnabled(true)
+	defer func() {
+		SetEnabled(false)
+		LoadFile("")
+		SetSingle("")
+	}()
+
+	// 3. Run CheckSession
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	removed, remaining := CheckSession(ctx, nil)
+	if removed != 1 {
+		t.Errorf("expected 1 bad proxy removed, got %d", removed)
+	}
+	if remaining != 1 {
+		t.Errorf("expected 1 remaining proxy, got %d", remaining)
+	}
+
+	// 4. Verify second call does NOT re-check (once per session)
+	removed2, _ := CheckSession(ctx, nil)
+	if removed2 != 0 {
+		t.Errorf("expected 0 removed on second CheckSession in same session, got %d", removed2)
+	}
+
+	// 5. Connect through DialContext: should succeed using the remaining good proxy
+	conn, err := DialTimeout("tcp", echoLn.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("DialTimeout via remaining good proxy failed: %v", err)
+	}
+	conn.Close()
+}

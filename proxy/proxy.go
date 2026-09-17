@@ -18,6 +18,25 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+// ErrProxyAuthFailed сигнализирует о неверных логине/пароле прокси (HTTP 407 или SOCKS5 auth reject).
+var ErrProxyAuthFailed = errors.New("proxy authentication failed (407 / auth rejected)")
+
+// IsAuthError проверяет, вызвана ли ошибка отказом аутентификации на прокси.
+func IsAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrProxyAuthFailed) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "407") ||
+		strings.Contains(msg, "proxy authentication") ||
+		strings.Contains(msg, "auth failed") ||
+		strings.Contains(msg, "authentication failed") ||
+		strings.Contains(msg, "user/password")
+}
+
 // Dialer — интерфейс сетевого дозвона с поддержкой контекста.
 type Dialer interface {
 	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
@@ -93,31 +112,38 @@ func (p *ProxyDialer) DialContext(ctx context.Context, network, addr string) (ne
 	}
 
 	if p.socks != nil {
+		var conn net.Conn
+		var err error
 		if cdm, ok := p.socks.(proxy.ContextDialer); ok {
-			return cdm.DialContext(ctx, network, addr)
-		}
-		// Fallback с отменой через горутину
-		type dialRes struct {
-			c   net.Conn
-			err error
-		}
-		ch := make(chan dialRes, 1)
-		go func() {
-			c, err := p.socks.Dial(network, addr)
-			ch <- dialRes{c, err}
-		}()
-		select {
-		case <-ctx.Done():
+			conn, err = cdm.DialContext(ctx, network, addr)
+		} else {
+			// Fallback с отменой через горутину
+			type dialRes struct {
+				c   net.Conn
+				err error
+			}
+			ch := make(chan dialRes, 1)
 			go func() {
-				res := <-ch
-				if res.c != nil {
-					res.c.Close()
-				}
+				c, err := p.socks.Dial(network, addr)
+				ch <- dialRes{c, err}
 			}()
-			return nil, ctx.Err()
-		case res := <-ch:
-			return res.c, res.err
+			select {
+			case <-ctx.Done():
+				go func() {
+					res := <-ch
+					if res.c != nil {
+						res.c.Close()
+					}
+				}()
+				return nil, ctx.Err()
+			case res := <-ch:
+				conn, err = res.c, res.err
+			}
 		}
+		if err != nil && IsAuthError(err) {
+			return nil, fmt.Errorf("%w: %v", ErrProxyAuthFailed, err)
+		}
+		return conn, err
 	}
 
 	// HTTP CONNECT туннелирование
@@ -168,7 +194,11 @@ func (p *ProxyDialer) DialContext(ctx context.Context, network, addr string) (ne
 
 	if !strings.Contains(statusLine, " 200") {
 		conn.Close()
-		return nil, fmt.Errorf("proxy CONNECT failed: %s", strings.TrimSpace(statusLine))
+		trimStatus := strings.TrimSpace(statusLine)
+		if strings.Contains(trimStatus, "407") || strings.Contains(strings.ToLower(trimStatus), "proxy authentication") {
+			return nil, fmt.Errorf("%w: %s", ErrProxyAuthFailed, trimStatus)
+		}
+		return nil, fmt.Errorf("proxy CONNECT failed: %s", trimStatus)
 	}
 
 	// Вычитываем заголовки ответа до пустой строки
@@ -207,12 +237,13 @@ func (b *bufferedConn) Read(p []byte) (int, error) {
 // ─── Глобальный менеджер и ротация пула ────────────────────────────
 
 type Manager struct {
-	mu       sync.RWMutex
-	enabled  bool
-	single   *ProxyDialer
-	pool     []*ProxyDialer
-	filePath string
-	rrIndex  uint64
+	mu             sync.RWMutex
+	enabled        bool
+	single         *ProxyDialer
+	pool           []*ProxyDialer
+	filePath       string
+	rrIndex        uint64
+	sessionChecked bool
 }
 
 var globalManager = &Manager{}
@@ -222,6 +253,7 @@ func SetEnabled(enabled bool) {
 	globalManager.mu.Lock()
 	defer globalManager.mu.Unlock()
 	globalManager.enabled = enabled
+	globalManager.sessionChecked = false
 }
 
 // IsEnabled проверяет, включен ли прокси.
@@ -231,12 +263,20 @@ func IsEnabled() bool {
 	return globalManager.enabled && (globalManager.single != nil || len(globalManager.pool) > 0)
 }
 
+// ResetSessionCheck сбрасывает статус сессионной проверки.
+func ResetSessionCheck() {
+	globalManager.mu.Lock()
+	defer globalManager.mu.Unlock()
+	globalManager.sessionChecked = false
+}
+
 // SetSingle задаёт единственный глобальный прокси.
 func SetSingle(proxyStr string) error {
 	globalManager.mu.Lock()
 	defer globalManager.mu.Unlock()
 
 	proxyStr = strings.TrimSpace(proxyStr)
+	globalManager.sessionChecked = false
 	if proxyStr == "" {
 		globalManager.single = nil
 		return nil
@@ -257,6 +297,7 @@ func LoadFile(path string) (int, error) {
 		globalManager.mu.Lock()
 		globalManager.pool = nil
 		globalManager.filePath = ""
+		globalManager.sessionChecked = false
 		globalManager.mu.Unlock()
 		return 0, nil
 	}
@@ -287,9 +328,122 @@ func LoadFile(path string) (int, error) {
 	globalManager.mu.Lock()
 	globalManager.pool = dialers
 	globalManager.filePath = path
+	globalManager.sessionChecked = false
 	globalManager.mu.Unlock()
 
 	return len(dialers), nil
+}
+
+// RemoveDialer навсегда вырезает указанный прокси из пула (например, если аутентификация не прошла).
+func RemoveDialer(rawURL string) bool {
+	globalManager.mu.Lock()
+	defer globalManager.mu.Unlock()
+
+	removed := false
+	if globalManager.single != nil && globalManager.single.rawURL == rawURL {
+		globalManager.single = nil
+		removed = true
+	}
+
+	var newPool []*ProxyDialer
+	for _, p := range globalManager.pool {
+		if p.rawURL == rawURL {
+			removed = true
+		} else {
+			newPool = append(newPool, p)
+		}
+	}
+	globalManager.pool = newPool
+	return removed
+}
+
+// CheckSession проверяет список прокси ровно ОДИН РАЗ за сессию перед запуском сканирования.
+// Если прокси возвращает ошибку аутентификации (407 или отказ логина/пароля в SOCKS5),
+// он тупо и навсегда вырезается из пула без каких-либо повторов.
+// На последующие сканы в этой же сессии повторная проверка не запускается.
+func CheckSession(ctx context.Context, logf func(string, ...any)) (removed int, remaining int) {
+	globalManager.mu.Lock()
+	if !globalManager.enabled || globalManager.sessionChecked {
+		n := len(globalManager.pool)
+		if globalManager.single != nil {
+			n = 1
+		}
+		globalManager.mu.Unlock()
+		return 0, n
+	}
+	globalManager.sessionChecked = true
+
+	poolCopy := make([]*ProxyDialer, len(globalManager.pool))
+	copy(poolCopy, globalManager.pool)
+	single := globalManager.single
+	globalManager.mu.Unlock()
+
+	var targets []*ProxyDialer
+	targets = append(targets, poolCopy...)
+	if single != nil {
+		targets = append(targets, single)
+	}
+
+	if len(targets) == 0 {
+		return 0, 0
+	}
+
+	if logf != nil {
+		logf("proxy: сессионная проверка авторизации прокси...")
+	}
+
+	var badMu sync.Mutex
+	badURLs := make(map[string]bool)
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 16)
+
+	for _, pd := range targets {
+		wg.Add(1)
+		go func(p *ProxyDialer) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			chkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+
+			// Пробное соединение: проверяет хендшейк и авторизацию прокси
+			conn, err := p.DialContext(chkCtx, "tcp", "1.1.1.1:443")
+			if conn != nil {
+				conn.Close()
+			}
+			if err != nil && IsAuthError(err) {
+				badMu.Lock()
+				badURLs[p.rawURL] = true
+				badMu.Unlock()
+				if logf != nil {
+					logf("proxy: неверная аутентификация, вырезан: %s", p.rawURL)
+				}
+			}
+		}(pd)
+	}
+	wg.Wait()
+
+	if len(badURLs) > 0 {
+		for u := range badURLs {
+			if RemoveDialer(u) {
+				removed++
+			}
+		}
+	}
+
+	globalManager.mu.RLock()
+	remaining = len(globalManager.pool)
+	if globalManager.single != nil {
+		remaining = 1
+	}
+	globalManager.mu.RUnlock()
+
+	if logf != nil && removed > 0 {
+		logf("proxy: вырезано битых прокси: %d (осталось: %d)", removed, remaining)
+	}
+	return removed, remaining
 }
 
 // Status возвращает текстовый статус работы подсистемы прокси.
@@ -344,15 +498,31 @@ func isLoopback(addr string) bool {
 
 // DialContext осуществляет дозвон: через выбранный прокси, если включено, иначе напрямую через net.Dialer.
 // Адреса loopback (127.0.0.1, localhost) всегда идут напрямую в обход прокси.
+// Если выбранный прокси возвращает ошибку аутентификации (407 / auth rejected), он немедленно вырезается
+// из пула без повторов, а запрос повторяется через следующий доступный прокси.
 func DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	if isLoopback(addr) {
 		var d net.Dialer
 		return d.DialContext(ctx, network, addr)
 	}
-	pd := pickDialer()
-	if pd != nil {
-		return pd.DialContext(ctx, network, addr)
+
+	for attempts := 0; attempts < 3; attempts++ {
+		pd := pickDialer()
+		if pd == nil {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		}
+
+		conn, err := pd.DialContext(ctx, network, addr)
+		if err != nil && IsAuthError(err) {
+			// Вырезаем прокси с неверной авторизацией намертво
+			RemoveDialer(pd.rawURL)
+			// Пробуем следующий доступный прокси из пула
+			continue
+		}
+		return conn, err
 	}
+
 	var d net.Dialer
 	return d.DialContext(ctx, network, addr)
 }
