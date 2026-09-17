@@ -1,10 +1,4 @@
-// title.go — замена Channel Title (имя канала) и CustomTitle (OSD-оверлей)
-// через DHIP RPC2 (порт 5000). Логика osd.py: ChannelTitle и CustomTitle —
-// независимые конфиги, каждый на свежем коннекте; после setConfig камера
-// рестартит OSD и рвёт TCP без ответа — обрыв после записи = «отправлено,
-// не подтверждено», не ошибка. CustomTitle — слотовый: texts[i] → слот i,
-// лишние слоты скрываются. Паттерн: configManager.getConfig → правка
-// table → setConfig, фоллбэк — flat-формат для камер без таблицы.
+// Package dhip реализует работу с Dahua JSON-RPC (порт 5000): ChannelTitle и CustomTitle OSD.
 package dhip
 
 import (
@@ -219,14 +213,7 @@ func configGetTable(conn net.Conn, sess, id int, name string) ([]any, error) {
 	return table, nil
 }
 
-// configSetTable — configManager.setConfig {"name": name, "table": table}.
-// Нюанс: камера после применения крупного конфига (особенно OSD/VideoWidget)
-// часто рвёт TCP, НЕ отправляя ответ — уходит перезапускать OSD/энкодеры
-// (внешне: i/o timeout/EOF, туннель отваливается по heartbeat и
-// переподнимается). Конфиг при этом применяется — поэтому retryable-обрыв
-// после отправки трактуем как успех; факт подтверждается повторным getConfig.
-// возвращает applied=true, если камера ОТВЕТИЛА result=true; applied=false,
-// nil — обрыв после записи (конфиг отправлен, факт НЕ подтверждён).
+// configSetTable применяет таблицу конфига через configManager.setConfig.
 func configSetTable(conn net.Conn, sess, id int, name string, table any) (bool, error) {
 	r, err := dhipCallCollectT(conn, "configManager.setConfig", map[string]any{
 		"name":  name,
@@ -234,7 +221,7 @@ func configSetTable(conn net.Conn, sess, id int, name string, table any) (bool, 
 	}, sess, id, nil, nil, nil, nil, CallTimeout)
 	if err != nil {
 		if isRetryableConnErr(err) {
-			return false, nil // обрыв после записи — норма, но не подтверждено
+			return false, nil // устройство может разорвать TCP при перезапуске сервиса OSD
 		}
 		return false, fmt.Errorf("setConfig %s: %w", name, err)
 	}
@@ -243,3 +230,38 @@ func configSetTable(conn net.Conn, sess, id int, name string, table any) (bool, 
 	}
 	return true, nil
 }
+
+// GetChannelCountDial опрашивает количество каналов устройства (ChannelTitle или getSystemInfo).
+func GetChannelCountDial(dial Dialer, user, password string) int {
+	conn, err := dial()
+	if err != nil {
+		return 1
+	}
+	defer conn.Close()
+
+	sess, err := dhipLoginAs(conn, nil, user, password)
+	if err != nil {
+		return 1
+	}
+
+	table, err := configGetTable(conn, sess, 20, "ChannelTitle")
+	if err == nil && len(table) > 1 {
+		return len(table)
+	}
+
+	info, err := dhipCallCollectT(conn, "magicBox.getSystemInfo", nil, sess, 21, nil, nil, nil, nil, 3*time.Second)
+	if err == nil {
+		if params, ok := info["params"].(map[string]any); ok {
+			if ch, ok := params["videoInputChannels"].(float64); ok && ch > 1 {
+				return int(ch)
+			}
+		}
+		if result, ok := info["result"].(map[string]any); ok {
+			if ch, ok := result["videoInputChannels"].(float64); ok && ch > 1 {
+				return int(ch)
+			}
+		}
+	}
+	return 1
+}
+

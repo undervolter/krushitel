@@ -18,16 +18,19 @@ var (
 	ErrTimeout      = errors.New("rtsp: таймаут ожидания декодированного кадра")
 )
 
-// Snapshot — RTSP-снап: перебираем сабстримы (1 → 0), ищем H264/H265-трек,
-// читаем RTP через gortsplib, декодируем первый кадр libavcodec'ом (cgo)
-// и кодируем в JPEG.
+// Snapshot получает JPEG-кадр с канала 1.
 func Snapshot(addr, user, pass string, timeout time.Duration) ([]byte, error) {
+	return SnapshotChannel(addr, user, pass, 1, timeout)
+}
+
+// SnapshotChannel получает JPEG-кадр с указанного канала через RTSP.
+func SnapshotChannel(addr, user, pass string, channel int, timeout time.Duration) ([]byte, error) {
+	if channel <= 0 {
+		channel = 1
+	}
 	var lastErr error
 	for _, subtype := range []int{1, 0} {
-		// креды НИКОГДА не конкатенируем в строку URL: пароль с '?'/@/':
-		// ломает парсер (первый '?' отрезается как query ещё до authority).
-		// url.UserPassword экранирует userinfo как положено.
-		u, err := base.ParseURL(fmt.Sprintf("rtsp://%s/cam/realmonitor?channel=1&subtype=%d", addr, subtype))
+		u, err := base.ParseURL(fmt.Sprintf("rtsp://%s/cam/realmonitor?channel=%d&subtype=%d", addr, channel, subtype))
 		if err != nil {
 			return nil, err
 		}

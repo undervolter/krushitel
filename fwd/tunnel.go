@@ -1,9 +1,6 @@
 package fwd
 
-// tunnel.go — сетевая часть из dh-fwd v2.0.0 (рекод), портирована в
-// библиотечный пакет fwd: без CLI/UI/PortRegistry, с krushitel-хвостами
-// (Ready/LocalPorts/Terminate) и хардендинг-гардами из старого fwd
-// (короткие STUN-дейтаграммы, 0x17-фрейм <= 12 байт).
+// Package fwd реализует сетевой стек P2P и relay туннелей к камерам Dahua.
 
 import (
 	"encoding/binary"
@@ -34,10 +31,7 @@ var (
 	RELAY_READ_TIMEOUT = 15 * time.Second
 )
 
-// Бюджет восстановления на месте (in-place recovery, паритет SmartPSS): после
-// HEARTBEAT_TIMEOUT тишины readLoop повторно пробивает сохранённый STUN init
-// (с троттлингом rePunchEvery); туннель объявляется упавшим (и пересобирается
-// runWithRetries) только после silenceGiveUp непрерывной тишины.
+// rePunchEvery и silenceGiveUp задают интервалы восстановления STUN.
 var (
 	rePunchEvery  = 4 * time.Second
 	silenceGiveUp = 30 * time.Second
@@ -47,15 +41,12 @@ var (
 	relayLookupTimeout = 3 * time.Second
 	relayAgentTimeout  = 3 * time.Second
 
-	// Первый повтор уходит быстро (700 мс): ack агента обычно идёт 200-400 мс.
-	// Последующие повторы отступают на relayChannelRetransInterval (1200 мс).
 	relayChannelFirstInterval   = 700 * time.Millisecond
 	relayChannelRetransInterval = 1200 * time.Millisecond
 	relayChannelMaxRetransmits  = 3
 )
 
-// readLoopIdleTimeout — потолок одного ReadPTCP в readLoop. Var, чтобы
-// тесты могли сжимать.
+// readLoopIdleTimeout — таймаут ожидания пакета в readLoop.
 var readLoopIdleTimeout = 5 * time.Second
 
 var (
@@ -64,9 +55,7 @@ var (
 	errAuthFailed        = errors.New("device authentication failed: check credentials or salt (code=403 Forbidden)")
 )
 
-// ErrAuthRequired — устройство требует Type-1 auth на p2p-channel
-// (403 при dtype 0). Терминальный вердикт: туннель без известных кредов
-// не поднимется, рестарты попыток и ре-очередь бессмысленны.
+// ErrAuthRequired — устройство требует Type-1 аутентификацию (403).
 var ErrAuthRequired = errDeviceRequireAuth
 
 func isAuthError(err error) bool {
@@ -81,39 +70,22 @@ func isAuthError(err error) bool {
 		strings.Contains(err.Error(), "code=403")
 }
 
-// errCloudStall — облако/девайс молчит в хендшейке (любят глотать пакеты).
-// Такой срыв НЕ тратит внешние попытки: Run() быстро рестартует попытку
-// со свежими сокетами.
+// errCloudStall возвращается при отсутствии ответа облака в хендшейке.
 var errCloudStall = errors.New("cloud stall")
 
-// Debug — глобальный тумблер протокольного дампа всех туннелей
-// (probe/lookup/p2p-channel/STUN/realm — весь обмен с облаком).
+// Debug — тумблер протокольного логирования.
 var Debug bool
 
-// LogHook — куда льют debug-строки (nil = fmt.Println на stderr).
+// LogHook — кастомный логгер (nil = fmt.Println на stderr).
 var LogHook func(string)
 
-// InitLimit — лимит одновременных P2P-инициализаций (handshake-фаз).
-// Сотни туннелей, бьющие в облачный диспетчер одновременно, душат сами
-// себя: датаграммы роняются, туннели ловят cloud stall (live 2026-09-08:
-// 60 параллельных хендшейков с одного IP = пустые ack'и от облака на все
-// 100%, одиночный туннель в ту же минуту — идеальный ack). Дефолт 16 —
-// эмпирически безопасный потолок на один адрес.
+// InitLimit — лимит одновременных P2P-инициализаций.
 var InitLimit = 16
 
-// StunFailHook вызывается один раз на попытку туннеля, когда STUN punch
-// не пробился и data path откатывается на relay (медленный путь).
-// nil = никто не слушает. Ставится драйвером (запись в nostun.txt).
+// StunFailHook вызывается при откате со STUN на relay.
 var StunFailHook func(serial string)
 
-// ForceAppRelay — экспериментальный тумблер дев-диагностики: пропускать
-// 0x17/0x19 auth на data-пути ДАЖЕ при smartpss-профиле и аллоцированном
-// агенте (апп-диалект на релее). Для камер поколения 2024+, чьи сервисы
-// молчат после классической 0x17/0x19 аутентификации: эта пара на
-// data-сокете инвалидирует канал — BIND'ы получают relay-фабрикованные
-// 0x12 ack'и, но DATA никогда не роутится (live 2026-09-08,
-// 5E07490PAJ5E366: curl через upstream dh-fwd на релее — 0 байт при
-// живых BIND-ack'ах пула).
+// ForceAppRelay форсирует апп-диалект на релее.
 var ForceAppRelay = false
 
 var (
@@ -172,15 +144,10 @@ type Client struct {
 	cseq          int
 	remotePort    int
 
-	// Счётчики живости дата-паса (zombieWatchdog): dataUp — байты от клиента
-	// в сторону камеры; dataDown — байты DATA от камеры к клиенту.
 	created  time.Time
 	dataUp   uint64
 	dataDown uint64
 
-	// Downstream coalescing: устройство стримит DATA-фреймы по 1280 байт;
-	// запись каждого отдельным TCP-сегментом душит HTTP, объёмное видео
-	// терпит. Батчим.
 	flushMu    sync.Mutex
 	pending    []byte
 	flushTimer *time.Timer
@@ -191,8 +158,7 @@ const (
 	coalesceMax   = 16 * 1024
 )
 
-// writeAll дренирует буфер в conn целиком: net.Conn.Write может принять
-// меньше байт, чем передано, и молча потерянный хвост корраптит поток.
+// writeAll записывает буфер в сокет целиком.
 func writeAll(conn net.Conn, b []byte) {
 	for len(b) > 0 {
 		n, err := conn.Write(b)
@@ -203,8 +169,7 @@ func writeAll(conn net.Conn, b []byte) {
 	}
 }
 
-// writeData буферизует даунстрим-фрагмент; сброс в сокет — по заполнению
-// батча или через coalesceDelay.
+// writeData буферизует и сбрасывает данные в сокет.
 func (c *Client) writeData(b []byte) {
 	if len(b) > 0 {
 		atomic.AddUint64(&c.dataDown, uint64(len(b)))
@@ -228,7 +193,7 @@ func (c *Client) writeData(b []byte) {
 	c.flushMu.Unlock()
 }
 
-// flushNow дренирует батч (колбек таймера или форсированный).
+// flushNow сбрасывает буфер в сокет.
 func (c *Client) flushNow() {
 	c.flushMu.Lock()
 	out := c.pending
@@ -243,7 +208,7 @@ func (c *Client) flushNow() {
 	}
 }
 
-// close дренирует буфер перед закрытием клиентского сокета.
+// close закрывает клиентское соединение после сброса буфера.
 func (c *Client) close() {
 	c.flushNow()
 	c.conn.Close()
@@ -259,25 +224,23 @@ type specGroup struct {
 	specs []PortSpec
 }
 
-// Tunnel владеет одним циклом соединения с устройством: облачный handshake,
-// NAT-punch, PTCP-сессия и локальные TCP-листенеры, мультиплексированные
-// поверх неё.
+// Tunnel представляет активную сессию подключения к устройству.
 type Tunnel struct {
 	serial, username, password, randsalt string
-	chanKey                              []byte // Type-1 channel key, для post-establishment local-channel шага
+	chanKey                              []byte
 	dtype                                int
 	profile                              *appProfile
 	debug                                bool
-	useTCP                               bool // форс TCP-relay data path
-	forceAppRelay                        bool // data path на апп-диалекте (SYNC only, без 0x17/0x19), sticky across reset()
+	useTCP                               bool
+	forceAppRelay                        bool
 
 	specs   []PortSpec
 	specIdx []int
 
 	deviceRemote *UDP
 	mainRemote   *UDP
-	primary      *UDP // data path: deviceRemote (direct) или mainRemote (relay)
-	useTCPPath   bool // активный data path — TCP-relay канал
+	primary      *UDP
+	useTCPPath   bool
 	tou          *touChannel
 	listeners    []net.Listener
 	clients      map[uint32]*Client
@@ -286,21 +249,18 @@ type Tunnel struct {
 	done         chan struct{}
 	cseqCounter  int
 
-	ready      chan struct{} // закрывается, когда листенеры подняты
-	localPorts map[int]int   // порт камеры → локальный порт
+	ready      chan struct{}
+	localPorts map[int]int
 
-	// lastStage — фаза, на которой handshake прямо сейчас (текст для
-	// диагностики «tunnel ready timeout»: без debug-дампов видно, где
-	// туннель застрял). Под stageMu.
 	stageMu   sync.Mutex
 	lastStage string
 
-	readerWG  sync.WaitGroup // readLoop/heartbeat/zombie/poolKeeper горутины
+	readerWG  sync.WaitGroup
 	bindMu    sync.Mutex
 	bindWait  map[uint32]chan struct{}
-	bindReqMu sync.Mutex // сериализует BIND-запросы
-	socksMu   sync.Mutex // защищает сокеты/localPorts от конкурентного close
-	stopped   bool       // Terminate(): не поднимать туннель заново
+	bindReqMu sync.Mutex
+	socksMu   sync.Mutex
+	stopped   bool
 	errMu     sync.Mutex
 	failErr   error
 
@@ -308,8 +268,6 @@ type Tunnel struct {
 	scanWait    map[uint32]chan scanOutcome
 	scanResults map[uint32]chan []byte
 
-	// In-place data-path recovery (паритет SmartPSS): сохранённый STUN init
-	// для повторного пробития прямого пути без облака при замирании канала.
 	rePunchMu       sync.Mutex
 	rePunchPacket   []byte
 	rePunchLaddr    *net.UDPAddr
@@ -317,29 +275,17 @@ type Tunnel struct {
 	lastRePunch     time.Time
 	rePunchAttempts int
 
-	// Пул realm'ов: пребинженные realm'ы на каждый форвард-порт. Веб-сервер
-	// камеры рвёт HTTP-коннекты, браузер реконнектится на каждый запрос;
-	// пребинженный realm убирает BIND round-trip из критического пути.
-	// Кипер-горутина держит фиксированный уровень, in-flight бинды
-	// учитываются, чтобы рефилл не проскакивал.
 	poolMu       sync.Mutex
 	pools        map[int]*poolState
 	poolTarget   int
 	poolExplicit bool
 }
 
-// poolState — пул одного порта. Все поля под poolMu.
 type poolState struct {
 	queue    []uint32
 	inflight int
 }
 
-// setPrimary/getPrimary — единственные точки записи/чтения primary, все
-// под socksMu. primary перезаписывается reset()'ом нового поколения, пока
-// клиентские ридеры/хендшейки прошлого поколения ещё его читают
-// (live 2026-09-08, 200 потоков: clientReader ловил nil-панику на DISC —
-// close() рвал клиентские коннекты, ридер просыпался, а primary уже был
-// обнулён).
 func (t *Tunnel) setPrimary(u *UDP) {
 	t.socksMu.Lock()
 	t.primary = u
@@ -368,11 +314,6 @@ func newTunnelWithProfile(serial string, prof *appProfile, dtype int, username, 
 		}
 	}
 
-	// Апп-релейный диалект биндит каждый realm СВЕЖИМ, за секунды до
-	// использования (захват: BIND → 0x12 CONN → DATA, ~6 мс друг от
-	// друга). Пре-бинженные realm'ы протухают на стороне устройства и их
-	// DATA отбрасывается, поэтому пулинг отключён для noRelayAuth
-	// профилей независимо от --pool.
 	poolSizeAdj := poolSize
 	if prof.noRelayAuth && poolSizeAdj > 0 && !poolExplicit {
 		poolSizeAdj = 0
@@ -396,12 +337,8 @@ func newTunnelWithProfile(serial string, prof *appProfile, dtype int, username, 
 	return t
 }
 
-// reset готовит новое поколение. readerWG.Wait() дренирует зомби-ридеров
-// прошлой попытки, чтобы они не отравили новое состояние.
+// reset подготавливает состояние перед новым запуском.
 func (t *Tunnel) reset() {
-	// Дренаж горутин прошлой попытки: без этого зомби readLoop проснётся
-	// после reset и отравит свежую попытку, а зомби-heartbeat нас-PTCP-ит
-	// в новые сокеты.
 	t.readerWG.Wait()
 	t.listeners = nil
 	t.clients = make(map[uint32]*Client)
@@ -631,28 +568,18 @@ func (t *Tunnel) Failure() error {
 	return t.failErr
 }
 
-// handshake — полный 4-фазный коннект: облачный discovery, аллокация
-// relay-агента, Server Nat Info, inverted STUN punch и PTCP-неготиация.
-// На успехе STUN t.primary = deviceRemote (direct), иначе mainRemote
-// (relay agent).
+// handshake выполняет discovery, аллокацию relay-агента, STUN punch и PTCP-сессию.
 func (t *Tunnel) handshake() error {
-	// Ядро протокола — эталонный dh-fwd v2.1 (см. establish).
 	if err := t.establish(); err != nil {
 		return err
 	}
-	// App-parity шаг (dmss): GET /device/<SN>/local-channel после полного
-	// establishment'а. Отдельная горутина с ограниченным чтением —
-	// establishment никогда не тормозится этим шагом.
 	if t.profile != nil && t.profile.localChannel {
 		go t.sendLocalChannel(t.localChannelStep())
 	}
 	return nil
 }
-// establish — ядро протокола, эталонный dh-fwd v2.1: облачный discovery
-// (warmup + online lookup), device probe + AutoSalt, relay-диспетчер,
-// p2p-channel с фиксированной идентичностью запроса (channelSender),
-// relay-агент, Server Nat Info, inverted STUN punch и PTCP-неготиация.
-// Облачная тишина оборачивается errCloudStall (быстрый рестарт попытки).
+
+// establish реализует основной протокол подключения к облаку и устройству.
 func (t *Tunnel) establish() error {
 	prof := t.profile
 	if prof == nil {
@@ -664,8 +591,7 @@ func (t *Tunnel) establish() error {
 		return err
 	}
 
-	// Phase 1: облачный discovery. Warmup-проба всегда уходит (wire-паритет
-	// с апстримом), затем /online/p2psrv/<SN>.
+	// Phase 1: discovery на облачном сервере
 	mainRemote.RequestEx(prof.warmupPath, "", prof.warmupAuth, true, reqOpts{warmup: true})
 	res, err := mainRemote.RequestEx(fmt.Sprintf("/online/p2psrv/%s", t.serial), "", true, true, reqOpts{})
 	if err != nil {
@@ -683,10 +609,7 @@ func (t *Tunnel) establish() error {
 	}
 	p2psrvPort, _ := strconv.Atoi(p2psrv[1])
 
-	// Warm-up пробы на P2P-сервере устройства (US). Пробы уходят всегда
-	// (wire-паритет); AutoSalt-профили (dmss, Type 1, без --randsalt)
-	// дополнительно восстанавливают RandSalt из зашифрованного Info-блоба
-	// здесь, до вывода auth-ключа channel-запросом.
+	// Пробы на P2P-сервере устройства (US)
 	t.setStage("device probe")
 	p2psrvRemote := NewUDP(p2psrv[0], p2psrvPort, t.debug, prof)
 	p2psrvRemote.debugLog = t.logf
@@ -695,22 +618,16 @@ func (t *Tunnel) establish() error {
 			probeDeviceInfo(p2psrvRemote, t.serial), t.logf)
 		p2psrvRemote.Close()
 		if err != nil {
-			// AutoSalt обязателен (dmss, type 1, без --randsalt), блоб
-			// непригоден — фейлим попытку вместо подписи пустой солью.
 			return fmt.Errorf("autosalt: %v", err)
 		}
 		t.randsalt = salt
 	} else {
-		// fire-and-forget: ответы (/info — часто пустое Info, /probe — шум)
-		// ничего не решают, а блокирующее чтение на 15с под нагрузкой
-		// съедает две трети хендшейка.
 		p2psrvRemote.Request(fmt.Sprintf("/probe/device/%s", t.serial), "", true, false)
 		p2psrvRemote.Request(fmt.Sprintf("/info/device/%s", t.serial), "", true, false)
 		p2psrvRemote.Close()
 	}
 
-	// Phase 2: lookup relay-диспетчера. Для relayAgentOptional-профилей
-	// (dmss) — best-effort с коротким ограниченным чтением.
+	// Phase 2: поиск relay-диспетчера
 	t.setStage("relay lookup")
 	t.logf("phase: relay lookup…")
 	var relayHost string
@@ -719,12 +636,12 @@ func (t *Tunnel) establish() error {
 		mainRemote.RequestEx("/online/relay", "", true, false, reqOpts{})
 		res, err := mainRemote.Read(false, relayLookupTimeout)
 		if err != nil {
-			t.logf("relay dispatcher lookup failed (%v) — продолжаем без TCP relay-агента (app-parity: DMSS его не использует)", err)
+			t.logf("relay dispatcher lookup failed (%v)", err)
 		} else if parts := strings.SplitN(res.Body["body/Address"], ":", 2); len(parts) == 2 && parts[0] != "" {
 			relayHost = parts[0]
 			relayPort, _ = strconv.Atoi(parts[1])
 		} else {
-			t.logf("relay dispatcher lookup вернул пустой адрес — продолжаем без TCP relay-агента (app-parity)")
+			t.logf("relay dispatcher lookup returned empty address")
 		}
 	} else {
 		res, err = mainRemote.Request("/online/relay", "", true, true)
@@ -740,7 +657,6 @@ func (t *Tunnel) establish() error {
 		relayDispatch.remember(res.Body["body/Address"])
 	}
 
-	// Data-сокет для стороны устройства, пробитый через главный облачный хост.
 	deviceRemote := NewUDP(prof.mainServer, prof.mainPort, t.debug, prof)
 	deviceRemote.debugLog = t.logf
 	t.socksMu.Lock()
@@ -754,12 +670,7 @@ func (t *Tunnel) establish() error {
 		return fmt.Errorf("username and password required for type > 0")
 	}
 
-	// Phase 3: p2p-channel. Идентичность запроса (CSeq, x-pcs-request-id,
-	// Identify, CreateDate, ClientId, RandSalt) фиксируется при
-	// конструировании channelSender'а; каждый (ре)send обновляет крипто
-	// поля — Nonce, DevAuth, зашифрованный LocalAddr. DevAuth подписывает
-	// ЗАШИФРОВАННЫЙ LocalAddr — dh-p2p PR#29/#33, сверено по захватам
-	// на fw 6.7.30 (подпись plaintext'а была Type-1 багом dh-fwd).
+	// Phase 3: p2p-channel запрос
 	t.setStage("p2p-channel")
 	aid := make([]byte, 8)
 	rand.Read(aid)
@@ -770,20 +681,14 @@ func (t *Tunnel) establish() error {
 	xchg := newChannelSender(deviceRemote, t.serial, prof, t.dtype, t.username, t.password,
 		t.randsalt, deviceRemote.lport, fwdPort, aid)
 	xchg.send(false)
-	t.chanKey = xchg.req.key // переиспользуется local-channel шагом после establishment'а
+	t.chanKey = xchg.req.key
 
-	// App-style ретрансмит (dmss): та же идентичность, свежая крипто, пока
-	// запрос в полёте (~550 мс / ~1.1 с в захвате). smartpss держит
-	// single-send и собственный 2-try цикл чтения ack'а ниже.
 	var early *DHResponse
 	if prof.channelRetransmit {
 		early = waitChannelEarlyAck(deviceRemote, xchg, t.logf, channelAckWindow)
 	}
 
-	// Аллокация relay-агента — на ДИСПЕТЧЕР релея (адрес из /online/relay).
-	// Обязательна для smartpss (семантика апстрима байт-в-байт);
-	// BEST-EFFORT для relayAgentOptional (dmss): короткое ограниченное
-	// чтение, тишина диспетчера = продолжаем без агента.
+	// Аллокация relay-агента
 	t.setStage("relay agent alloc")
 	t.logf("phase: relay agent alloc…")
 	var agentHost string
@@ -795,7 +700,7 @@ func (t *Tunnel) establish() error {
 			mainRemote.RequestEx("/relay/agent", "", true, false, reqOpts{})
 			res, err = mainRemote.Read(false, relayAgentTimeout)
 			if err != nil {
-				t.logf("relay dispatcher недоступен — продолжаем без TCP relay-агента (app-parity: DMSS его не использует)")
+				t.logf("relay dispatcher silent")
 			} else {
 				agentToken = res.Body["body/Token"]
 				agent := strings.SplitN(res.Body["body/Agent"], ":", 2)
@@ -803,8 +708,6 @@ func (t *Tunnel) establish() error {
 				agentPort, _ = strconv.Atoi(agent[1])
 			}
 		} else {
-			// Глобальный семафор + per-host backoff + перебор кэшированных
-			// диспетчеров (easy4ip роняет до 70% alloc-запросов под нагрузкой).
 			var ok bool
 			agentHost, agentPort, agentToken, ok = t.allocRelayAgent(mainRemote, fmt.Sprintf("%s:%d", relayHost, relayPort))
 			if !ok {
@@ -817,10 +720,7 @@ func (t *Tunnel) establish() error {
 		t.startRelayAgent(mainRemote, agentHost, agentPort, agentToken)
 	}
 
-	// Phase 4: Server Nat Info от устройства (через cloud/US). Облако и
-	// девайс любят молчать: короткий таймаут + один повтор запроса (та же
-	// идентичность, свежая крипто), тишина = errCloudStall (быстрый
-	// рестарт попытки, не 15с ожидания).
+	// Phase 4: ожидание ответа от устройства (Server Nat Info)
 	t.setStage("device ack wait")
 	t.logf("phase: p2p-channel sent, waiting device ack…")
 	if early == nil {
@@ -1062,8 +962,6 @@ func (t *Tunnel) establish() error {
 
 	if stunResponse == nil {
 		if !agentOK {
-			// Релея нет (dmss best-effort) — без пробитого канала
-			// data-пути нет вообще.
 			return fmt.Errorf("STUN punch failed and no relay agent available — no data path")
 		}
 		t.logf("STUN failed — using relay agent as the data path")
@@ -1075,7 +973,7 @@ func (t *Tunnel) establish() error {
 		return nil
 	}
 
-	// Подтверждение прямого канала бурстом из 5 Binding Confirm.
+	// Подтверждение прямого канала
 	confirm := []byte{0xFE, 0xFE, 0xFF, 0xF3}
 	confirm = append(confirm, cookie...)
 	confirm = append(confirm, transID...)
@@ -1098,21 +996,12 @@ func (t *Tunnel) establish() error {
 	}
 	deviceRemote.SetTimeout(0)
 
-	// Direct-путь: полный PTCP auth-handshake с sign-токеном. Попытка
-	// forceAppRelay (зомби-вотчдог) тоже идёт по ветке апп-паритета:
-	// предыдущий обмен 0x17/0x19 — вероятная причина, по которой камера
-	// перестала роутить DATA.
+	// Direct-путь: PTCP handshake
 	if prof.noRelayAuth || t.forceAppRelay || ForceAppRelay {
-		// Апп-релейный диалект (захват 2026-09-06): после STUN-обмена
-		// клиент шлёт ровно ОДИН PTCP SYNC и затем BIND/DATA — никогда
-		// 0x17 token-запрос и 0x19 auth. Устройство отвечает на 0x19
-		// телом 0x00 на этом поколении, и 0x17/0x19 трафик на data-сокете
-		// инвалидирует канал: BIND'ы получают relay-фабрикованные 0x12
-		// CONN ack'и, но DATA никогда не роутится.
-		t.logf("app-parity data path: SYNC only, no 0x17/0x19 auth (dmss relay dialect)")
+		t.logf("app-parity data path: SYNC only, no 0x17/0x19 auth")
 		deviceRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
 		if _, err := deviceRemote.ReadPTCP(3 * time.Second); err != nil {
-			t.logf("app-parity sync: %v (продолжаем на пробитом канале)", err)
+			t.logf("app-parity sync: %v", err)
 		}
 		t.setStage("ready (direct)")
 		t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
@@ -1120,26 +1009,17 @@ func (t *Tunnel) establish() error {
 		return nil
 	}
 	if err := ptcpHandshake(deviceRemote, sign); err != nil {
-		// Пост-2024 поколение: устройство отвергает 0x19-auth телом 0x00,
-		// но data-путь живёт в апп-релейном диалекте (STUN → SYNC →
-		// BIND/DATA). Переключаемся на него прямо на пробитом канале —
-		// релей для таких устройств DATA не роутит (live 2026-09-06,
-		// Picoo F1 4G: каждый punch завершается, каждая auth отвечает
-		// телом 0x00). Диалект data-пути — свойство ПОКОЛЕНИЯ устройства,
-		// а не облачной идентичности, поэтому ветка не гейтится профилем.
 		if strings.Contains(err.Error(), "auth mismatch: got 0x00") {
-			t.logf("ptcp auth 0x00 — устройство говорит апп-диалектом: SYNC only → BIND/DATA на прямом канале")
+			t.logf("ptcp auth 0x00 — устройство использует апп-диалект")
 			deviceRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
 			if _, perr := deviceRemote.ReadPTCP(3 * time.Second); perr != nil {
-				t.logf("app-parity sync: %v (продолжаем на пробитом канале)", perr)
+				t.logf("app-parity sync: %v", perr)
 			}
 			t.setStage("ready (direct, app dialect)")
 			t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
 			t.setPrimary(deviceRemote)
 			return nil
 		}
-		// Иная ошибка хендшейка — деградируем на relay-агента (обычный
-		// путь: релей отдаёт видео нормально).
 		t.logf("ptcp device handshake failed (%v) — using relay agent as the data path", err)
 		if agentOK {
 			t.setStage("ready (relay)")

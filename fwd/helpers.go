@@ -1,8 +1,6 @@
 package fwd
 
-// helpers.go — крипто (Type 1 auth), PTCP wire format, DH HTTP parsing и
-// UDP-обёртка из dh-fwd v2.0.0: глубокие кольца приёма/отправки,
-// кумулятивные ack-и, окно приёма 64KB вместо счётчика.
+// helpers.go содержит вспомогательные функции Dahua P2P протокола (криптография, PTCP wire format, UDP сокеты).
 
 import (
 	"context"
