@@ -28,6 +28,13 @@ func ParseCreds(data []byte) ([]Cred, int) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		// хвост " | модель | метод" из results.txt (exploit/dhip пишут
+		// "SN,login:pass | MODEL | METHOD") — в пароль не входит.
+		// Режем строку ДО разбора, как в exploit/titles.go: пароли Dahua
+		// " | " не содержат, а пробелы внутри пароля сохраняются.
+		if i := strings.Index(line, " | "); i >= 0 {
+			line = strings.TrimSpace(line[:i])
+		}
 		var user, pass, dom string
 		if i := strings.IndexByte(line, '@'); i >= 0 {
 			// login:pass@SN[:port]
@@ -57,6 +64,11 @@ func ParseCreds(data []byte) ([]Cred, int) {
 			}
 		}
 		dom = ironscan.SanitizeSerial(dom)
+		// защитный рез: хвост "|модель|метод", слепленный без пробелов
+		// (пароли Dahua "|" не содержат) — как в exploit/titles.go.
+		if i := strings.IndexByte(pass, '|'); i >= 0 {
+			pass = strings.TrimSpace(pass[:i])
+		}
 		if dom == "" || user == "" || pass == "" {
 			skipped++
 			continue
