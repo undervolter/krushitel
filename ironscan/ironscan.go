@@ -13,7 +13,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"krushitel/proxy"
 	"net"
 	"os"
 	"regexp"
@@ -33,8 +32,7 @@ var (
 	// reHexJunk — md5-подобный мусор из Realm (32 lowercase hex), бывает
 	// склеен с настоящим серийником: e3597da4…94K0043FPBQ0635A.
 	reHexJunk = regexp.MustCompile(`^[0-9a-f]{16,}|[0-9a-f]{16,}$`)
-	reModel   = regexp.MustCompile(`(?i)\b(?:DHI-|DH-)?(?:IPC-[A-Z0-9\-]+|IPC[0-9A-Z\-]+|HAC-[A-Z0-9\-]+|NVR[A-Z0-9\-]+|XVR[A-Z0-9\-]+|HCVR[A-Z0-9\-]+|DVR[A-Z0-9\-]+|SD[A-Z0-9\-]+|PTZ[A-Z0-9\-]+|ITC[A-Z0-9\-]+|ASI[A-Z0-9\-]+|ASC[A-Z0-9\-]+|VTO[A-Z0-9\-]+|VTH[A-Z0-9\-]+|IP[0-9]M-[A-Z0-9\-]+|NV[0-9][A-Z0-9\-]+|Hero[A-Z0-9\-_]+|Cruiser[A-Z0-9\-_]*|Ranger[A-Z0-9\-_]*|Bullet[A-Z0-9\-_]*|Cue[A-Z0-9\-_]*|Rex[A-Z0-9\-_]*|Versa[A-Z0-9\-_]*|RVi-[A-Z0-9\-]+|LTV-[A-Z0-9\-]+)\b`)
-	reFW      = regexp.MustCompile(`(?i)\b(?:V)?(\d+\.\d{3}\.[0-9A-Z\.]+)\b`)
+	reModel   = regexp.MustCompile(`(?:IPC|NVR|HCVR|DH)-[A-Z0-9\-]+`)
 )
 
 // pickSerial — вытаскивает первый структурно валидный серийник из строки.
@@ -57,20 +55,7 @@ func pickSerial(s string) string {
 // структуру. Пустая строка — это не серийник.
 func SanitizeSerial(raw string) string {
 	s := strings.TrimSpace(raw)
-	if strings.HasPrefix(s, "#") {
-		return ""
-	}
-	if idx := strings.Index(strings.ToUpper(s), "S/N:"); idx >= 0 {
-		sub := s[idx+4:]
-		if i := strings.IndexAny(sub, "|;,"); i >= 0 {
-			sub = sub[:i]
-		}
-		sub = strings.TrimSpace(sub)
-		if sn := pickSerial(sub); sn != "" {
-			return sn
-		}
-	}
-	if i := strings.IndexAny(s, ";,"); i >= 0 {
+	if i := strings.IndexByte(s, ';'); i >= 0 {
 		s = strings.TrimSpace(s[:i])
 	}
 	s = reHexJunk.ReplaceAllString(s, "")
@@ -140,69 +125,6 @@ func dvripCmd(conn net.Conn, code uint32) []byte {
 	return payload
 }
 
-func cleanModel(s string) string {
-	s = strings.TrimSpace(s)
-	if len(s) < 3 || len(s) > 64 {
-		return ""
-	}
-	// Отсекаем мусорные заглушки регистраторов (нули, repeating dummy, unknown)
-	if strings.Count(s, "0") == len(s) || strings.Contains(s, "00000000") || strings.EqualFold(s, "unknown") || strings.EqualFold(s, "null") {
-		return ""
-	}
-	hasAlpha := false
-	hasLetter := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c < 0x20 || c > 0x7e {
-			return ""
-		}
-		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
-			hasLetter = true
-			hasAlpha = true
-		} else if c >= '0' && c <= '9' {
-			hasAlpha = true
-		}
-	}
-	if !hasAlpha || !hasLetter {
-		return ""
-	}
-	return s
-}
-
-func extractModelFromRaw(raw []byte) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	// 1. Приоритет: регекс reModel по всему сырому ответу
-	if m := reModel.Find(raw); m != nil {
-		if s := cleanModel(string(m)); s != "" {
-			return s
-		}
-	}
-	// 2. Поиск первой непрерывной printable ASCII строки длиной от 4 символов
-	// (пропуская любые ведущие бинарные опкоды, нули и коды статуса)
-	var cur []byte
-	for _, b := range raw {
-		if b >= 0x20 && b <= 0x7e {
-			cur = append(cur, b)
-		} else {
-			if len(cur) >= 4 {
-				if s := cleanModel(string(cur)); s != "" {
-					return s
-				}
-			}
-			cur = cur[:0]
-		}
-	}
-	if len(cur) >= 4 {
-		if s := cleanModel(string(cur)); s != "" {
-			return s
-		}
-	}
-	// 3. Fallback на nullTerm
-	return cleanModel(nullTerm(raw))
-}
-
 func nullTerm(b []byte) string {
 	if i := indexByte(b, 0); i >= 0 {
 		b = b[:i]
@@ -251,9 +173,8 @@ func probeDevice(ctx context.Context, target string, port int, timeout time.Dura
 }
 
 func tryConnect(ctx context.Context, addr string, probe []byte, timeout time.Duration) Result {
-	ctxTimeout, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	conn, err := proxy.DialContext(ctxTimeout, "tcp", addr)
+	d := net.Dialer{Timeout: timeout}
+	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		if strings.Contains(err.Error(), "connection refused") {
 			return Result{Err: "refused"}
@@ -328,44 +249,16 @@ func tryConnect(ctx context.Context, addr string, probe []byte, timeout time.Dur
 	}
 
 	// модель по 0x0b, прошивка по 0x08 (dahua-info.py)
-	if res.Model == "" {
-		conn.SetDeadline(time.Now().Add(timeout))
-		if raw := dvripCmd(conn, 0x0b); len(raw) > 0 {
-			res.Model = extractModelFromRaw(raw)
+	conn.SetDeadline(time.Now().Add(timeout))
+	if raw := dvripCmd(conn, 0x0b); len(raw) > 0 {
+		if m := nullTerm(raw); m != "" {
+			res.Model = m
 		}
 	}
-	if res.Firmware == "" {
-		conn.SetDeadline(time.Now().Add(timeout))
-		if raw := dvripCmd(conn, 0x08); len(raw) > 0 {
-			if fw := nullTerm(raw); fw != "" {
-				res.Firmware = fw
-			} else if fw := reFW.FindStringSubmatch(string(raw)); len(fw) > 1 {
-				res.Firmware = strings.TrimSpace(fw[1])
-			}
-		}
-	}
-
-	// Если сокет первого проба закрылся или упал в EOF до/во время 0x0b,
-	// поднимаем свежее короткое соединение чисто для опроса метаданных:
-	if res.Model == "" && ctx.Err() == nil {
-		ctxFresh, cancelFresh := context.WithTimeout(ctx, timeout)
-		freshConn, err := proxy.DialContext(ctxFresh, "tcp", addr)
-		cancelFresh()
-		if err == nil {
-			freshConn.SetDeadline(time.Now().Add(timeout))
-			if raw := dvripCmd(freshConn, 0x0b); len(raw) > 0 {
-				res.Model = extractModelFromRaw(raw)
-			}
-			if res.Firmware == "" {
-				if raw := dvripCmd(freshConn, 0x08); len(raw) > 0 {
-					if fw := nullTerm(raw); fw != "" {
-						res.Firmware = fw
-					} else if fw := reFW.FindStringSubmatch(string(raw)); len(fw) > 1 {
-						res.Firmware = strings.TrimSpace(fw[1])
-					}
-				}
-			}
-			freshConn.Close()
+	conn.SetDeadline(time.Now().Add(timeout))
+	if raw := dvripCmd(conn, 0x08); len(raw) > 0 {
+		if fw := nullTerm(raw); fw != "" {
+			res.Firmware = fw
 		}
 	}
 
@@ -373,50 +266,33 @@ func tryConnect(ctx context.Context, addr string, probe []byte, timeout time.Dur
 }
 
 func parseResponse(response []byte) Result {
-	var serial, model, firmware string
+	var serial, model string
 
-	// точный источник серийника и метаданных (dahua-info.py / Shodan banner):
-	for _, rawLine := range strings.Split(string(response), "\n") {
-		line := strings.TrimSpace(strings.TrimRight(rawLine, "\r"))
-		lower := strings.ToLower(line)
-		if strings.HasPrefix(lower, "realm:login to ") {
-			serial = SanitizeSerial(line[len("realm:login to "):])
-		} else if strings.HasPrefix(lower, "machinename:") && model == "" {
-			model = cleanModel(line[len("machinename:"):])
-		} else if strings.HasPrefix(lower, "devicetype:") && model == "" {
-			model = cleanModel(line[len("devicetype:"):])
-		} else if strings.HasPrefix(lower, "model:") && model == "" {
-			model = cleanModel(line[len("model:"):])
-		} else if strings.HasPrefix(lower, "device:") && model == "" {
-			model = cleanModel(line[len("device:"):])
-		} else if strings.HasPrefix(lower, "softversion:") || strings.HasPrefix(lower, "version:") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 && firmware == "" {
-				firmware = strings.TrimSpace(parts[1])
-			}
+	// точный источник серийника (dahua-info.py): «Realm:Login to <SN>»
+	payload := response
+	if len(payload) > 32 {
+		payload = payload[32:]
+	}
+	for _, line := range strings.Split(string(payload), "\n") {
+		line = strings.TrimSpace(strings.TrimRight(line, "\r"))
+		if strings.HasPrefix(line, "Realm:Login to ") {
+			serial = SanitizeSerial(line[len("Realm:Login to "):])
+			break
 		}
 	}
 	// regex fallback по всему ответу
 	if serial == "" {
 		serial = pickSerial(string(response))
 	}
-	// модель regex'ом — если не нашлась по ключам
-	if model == "" {
-		if m := reModel.Find(response); m != nil {
-			model = cleanModel(string(m))
-		}
-	}
-	// прошивка regex fallback
-	if firmware == "" {
-		if fw := reFW.FindStringSubmatch(string(response)); len(fw) > 1 {
-			firmware = strings.TrimSpace(fw[1])
-		}
+	// модель regex'ом — только если 0x0b не даст
+	if m := reModel.Find(response); m != nil {
+		model = string(m)
 	}
 
 	if serial == "" {
 		return Result{Err: "no serial"}
 	}
-	return Result{Serial: serial, Model: model, Firmware: firmware}
+	return Result{Serial: serial, Model: model}
 }
 
 // Run исполняет скан, onResult вызывается для каждого завершённого проба
@@ -426,12 +302,6 @@ func Run(ctx context.Context, opts Options, onResult func(Result)) error {
 	if len(opts.Targets) == 0 {
 		return fmt.Errorf("no targets")
 	}
-
-	// Сессионная проверка прокси (ровно один раз за сессию, без повторов)
-	if proxy.IsEnabled() {
-		proxy.CheckSession(ctx, nil)
-	}
-
 	if opts.Port == 0 {
 		opts.Port = 37777
 	}

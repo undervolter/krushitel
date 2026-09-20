@@ -11,7 +11,6 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,60 +28,10 @@ const (
 	USERKEY     = "996103384cdf19179e19243e959bbf8b"
 	SOCKET_BUF  = 65536
 
-	DMSS_MAIN_SERVER   = "p2p.dolynkcloud.com"
-	DMSS_MAIN_PORT     = 8800
-	DMSS_USERNAME      = "793k5zdi4dd5f037sooag8yo_dolynkc"
-	DMSS_USERKEY       = "ef8hatgmcuk4qamgg4fxx19x33s9q1xy"
-)
-
-type cloudProfileType int
-
-const (
-	profileSmartPSS cloudProfileType = iota
-	profileDMSS
-)
-
-type cloudProfile struct {
-	profileType cloudProfileType
-	name        string
-	server      string
-	port        int
-	user        string
-	userKey     string
-	verbGet     string
-	verbPost    string
-}
-
-var (
-	smartpssProfile = cloudProfile{
-		profileType: profileSmartPSS,
-		name:        "smartpss",
-		server:      MAIN_SERVER,
-		port:        MAIN_PORT,
-		user:        USERNAME,
-		userKey:     USERKEY,
-		verbGet:     "DHGET",
-		verbPost:    "DHPOST",
-	}
-
-	dmssProfile = cloudProfile{
-		profileType: profileDMSS,
-		name:        "dmss",
-		server:      DMSS_MAIN_SERVER,
-		port:        DMSS_MAIN_PORT,
-		user:        DMSS_USERNAME,
-		userKey:     DMSS_USERKEY,
-		verbGet:     "NFGET",
-		verbPost:    "NFPOST",
-	}
-)
-
-const (
-
 	// пайплайн: окно p2p-channel запросов в полёте управляется governor'ом
-	// в [W_MIN..W_MAX], старт = PIPELINE_WINDOW. late-доля цикла ниже 2% —
-	// окно растёт, выше 10% — сжимается (облако молча дропает перегруз).
-	// Буфер сокета поднят до 256КБ (см. newEgress) — окно W_MAX влезает.
+	// в [W_MIN..W_MAX], старт = PIPELINE_WINDOW. доля истёкших без ответа
+	// ниже 2% — окно растёт, выше 10% — сжимается (облако молча дропает
+	// перегруз). Буфер сокета поднят до 256КБ (см. newEgress) — окно W_MAX влезает.
 	PIPELINE_WINDOW = 32
 	W_MIN           = 8
 	W_MAX           = 128
@@ -99,8 +48,17 @@ const (
 	// ACK_GRACE — опоздавший ack находит свой CSeq и выносит честный
 	// вердикт (живой ack идёт через релей до девайса и приходит позже
 	// мгновенных облачных 404/queued; без грейса живые стабильно
-	// опаздывали и серийник ошибочно писался dead+late)
+	// опаздывали и серийник ошибочно писался dead).
+	// Тишина дольше ACK_GRACE — это ретрай, а не похороны: облако молча
+	// дропает пакеты, поэтому замолчавший серийник переотправляется
+	// (см. CHANNEL_RETRIES), dead — только после исчерпания ретраев.
 	ACK_GRACE = 30 * time.Second
+
+	// CHANNEL_RETRIES — сколько раз переотправлять p2p-channel проб,
+	// если облако молчит (тишина дольше ACK_GRACE). Всего попыток =
+	// 1 + CHANNEL_RETRIES. Ретрай идёт новым CSeq — залипшие ответы
+	// прошлых попыток игнорируются.
+	CHANNEL_RETRIES = 2
 
 	// teardown-эксперимент: после живого ack шлём валидный STUN-init на
 	// LocalAddr/PubAddr из ack (прямо и через облако) и молчим — девайс
@@ -128,15 +86,7 @@ type ScanStats struct {
 	ReadLines int64 // обработано строк на фазе санитайза
 	ReadTotal int64 // всего строк (первый быстрый проход-подсчёт)
 	ReadValid int64 // найдено валидных серийников
-	Late      int64 // серийники без финального ответа к дедлайну (→ .late файл)
-	// опоздавшие ответы: финальная датаграмма пришла, но её CSeq уже истёк
-	// и запрос закрыт. OrphanAlive — среди них были ЖИВЫЕ (серийник уже
-	// записан dead+late и уйдёт в .late на перепроверку). Если orphans
-	// растут — облако медленное, дедлайн мало; если нулевые при большом
-	// late — облако молча дропает, окно надо резать.
-	OrphanAlive int64
-	OrphanDead  int64
-	AliveRate   float64 // живых в минуту за последнее окно наблюдения (обнова каждые 10с)
+	AliveRate float64 // живых в минуту за последнее окно наблюдения (обнова каждые 10с)
 }
 
 // dhResp — мини-парсер DH HTTP-over-UDP ответа облака.
@@ -211,34 +161,6 @@ func p2pChannelBody(lport int, aid []byte) string {
 		strings.Join(aidHex, " "), lport)
 }
 
-func dmssReq(method, path, body string, cseq int64, digest, nonce, curdate string) string {
-	pcsID := fmt.Sprintf("%016x%016x", rand.Uint64(), rand.Uint64())
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%s %s HTTP/1.1\r\n", method, path))
-	sb.WriteString("X-Version: 6.7.15\r\n")
-	sb.WriteString("X-Sversion: 1.1.0\r\n")
-	sb.WriteString(fmt.Sprintf("x-pcs-request-id: %s\r\n", pcsID))
-	sb.WriteString("X-ToUType: Client/Dmss_Android\r\n")
-	sb.WriteString(fmt.Sprintf("CSeq: %d\r\n", int32(cseq)))
-	sb.WriteString(fmt.Sprintf("Authorization: WSSE profile=\"UsernameToken\"\r\nX-WSSE: UsernameToken Username=\"%s\", PasswordDigest=\"%s\", Nonce=\"%s\", Created=\"%s\"\r\n",
-		DMSS_USERNAME, digest, nonce, curdate))
-	if body != "" {
-		sb.WriteString(fmt.Sprintf("Content-Type: \r\nContent-Length: %d\r\n", len(body)))
-	}
-	sb.WriteString("\r\n" + body)
-	return sb.String()
-}
-
-func dmssChannelBody(lport int, aid []byte) string {
-	aidHex := make([]string, 8)
-	for i, b := range aid {
-		aidHex[i] = fmt.Sprintf("%02x", b)
-	}
-	clientID := fmt.Sprintf("%016x%016x:80", rand.Uint64(), rand.Uint64())
-	return fmt.Sprintf("<body><Identify>%s</Identify><IpEncrpt>true</IpEncrpt><NatValueT>0</NatValueT><version>6.7.15</version><sVersion>1.1.0</sVersion><LocalAddr>127.0.0.1:%d</LocalAddr><Pid>0</Pid><ClientId>%s</ClientId></body>",
-		strings.Join(aidHex, " "), lport, clientID)
-}
-
 // channelAckAlive — критерий живости (прежний, не менялся): финальный
 // 2xx-3xx ack на p2p-channel с непустым <LocalAddr> — устройство само
 // отчиталось своим адресом. 2xx без LocalAddr — облако приняло запрос в
@@ -266,14 +188,17 @@ type inflightChannel struct {
 	aid      []byte // Identify этого запроса — нужен teardown после ack
 	deadline time.Time
 	extended bool // provisional (1xx) уже продлевал дедлайн
+	retries  int  // сколько ретраев уже потрачено на этот серийник
 }
 
 // graveEntry — запрос, чей дедлайн истёк: вердикт отложен до ACK_GRACE,
 // чтобы опоздавший ack (живой идёт через релей и всегда медленнее
-// облачных 404) всё же нашёл свой CSeq.
+// облачных 404) всё же нашёл свой CSeq. Тишина дольше грейса — ретрай
+// (см. expire), а не dead.
 type graveEntry struct {
 	serial   string
 	aid      []byte
+	retries  int
 	deadline time.Time
 }
 
@@ -287,7 +212,6 @@ type graveEntry struct {
 // так же, как раньше). RTT перестаёт складываться — скорость упирается
 // в полосу сокета и облако, а не в сумму задержек.
 type channelPipeline struct {
-	prof                      cloudProfile
 	conn                      *net.UDPConn
 	lport                     int
 	digest, nonceStr, curdate string
@@ -295,19 +219,15 @@ type channelPipeline struct {
 	graceTTL                  time.Duration // сколько истёкший запрос живёт в кладбище
 	window                    int           // текущее окно в полёте (governor)
 	sent                      int64         // отправок в текущем цикле
-	lateCycle                 int64         // истёкших без ответа в текущем цикле
+	expiredCycle              int64         // истёкших без ответа в текущем цикле
 	inflight                  map[int64]*inflightChannel
 	graveyard                 map[int64]*graveEntry
+	counted                   map[string]struct{} // серийники, уже учтённые в Checked
 	buf                       []byte
 }
 
 func newChannelPipeline(conn *net.UDPConn, timeout time.Duration) *channelPipeline {
-	return newChannelPipelineWithProfile(conn, smartpssProfile, timeout)
-}
-
-func newChannelPipelineWithProfile(conn *net.UDPConn, prof cloudProfile, timeout time.Duration) *channelPipeline {
 	p := &channelPipeline{
-		prof:      prof,
 		conn:      conn,
 		lport:     conn.LocalAddr().(*net.UDPAddr).Port,
 		timeout:   timeout,
@@ -315,53 +235,31 @@ func newChannelPipelineWithProfile(conn *net.UDPConn, prof cloudProfile, timeout
 		window:    PIPELINE_WINDOW,
 		inflight:  make(map[int64]*inflightChannel, PIPELINE_WINDOW),
 		graveyard: make(map[int64]*graveEntry, PIPELINE_WINDOW),
+		counted:   make(map[string]struct{}),
 		buf:       make([]byte, 65536),
 	}
-
+	// WSSE-блок один на сокет (как раньше): nonce/curdate фиксируются на
+	// старте, дайджест считается один раз.
 	nonce := time.Now().UnixNano()
 	p.nonceStr = fmt.Sprintf("%d", nonce)
+	p.curdate = time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	pwd := fmt.Sprintf("%d%sDHP2P:%s:%s", nonce, p.curdate, USERNAME, USERKEY)
+	hash := sha1.Sum([]byte(pwd))
+	p.digest = base64.StdEncoding.EncodeToString(hash[:])
 
-	if prof.profileType == profileDMSS {
-		p.curdate = time.Now().Format("2006-01-02T15:04:05-07:00")
-		pwd := fmt.Sprintf("%s%sDHP2P:%s:%s", p.nonceStr, p.curdate, prof.user, prof.userKey)
-		hash := sha1.Sum([]byte(pwd))
-		p.digest = base64.StdEncoding.EncodeToString(hash[:])
-
-		// warm-up для DMSS: NFGET /online/stun
-		cseq := atomic.AddInt64(&cseqCounter, 1)
-		req := fmt.Sprintf("NFGET /online/stun HTTP/1.1\r\nX-ToUType: Client/Dmss_Android\r\nCSeq: %d\r\n\r\n", cseq)
-		p.conn.SetWriteDeadline(time.Now().Add(timeout))
-		p.conn.Write([]byte(req))
-		dl := time.Now().Add(timeout)
-		for {
-			p.conn.SetReadDeadline(dl)
-			n, err := p.conn.Read(p.buf)
-			if err != nil {
-				break
-			}
-			if r := parseDHResp(p.buf[:n]); r.CSeq == cseq {
-				break
-			}
+	// warm-up облака — раз на сокет (раньше слался на каждый серийник).
+	// Ответ по контенту не проверяется — факт сессии.
+	cseq := atomic.AddInt64(&cseqCounter, 1)
+	p.write("DHGET", "/probe/p2psrv", "", cseq)
+	dl := time.Now().Add(timeout)
+	for {
+		p.conn.SetReadDeadline(dl)
+		n, err := p.conn.Read(p.buf)
+		if err != nil {
+			break
 		}
-	} else {
-		p.curdate = time.Now().UTC().Format("2006-01-02T15:04:05Z")
-		pwd := fmt.Sprintf("%d%sDHP2P:%s:%s", nonce, p.curdate, prof.user, prof.userKey)
-		hash := sha1.Sum([]byte(pwd))
-		p.digest = base64.StdEncoding.EncodeToString(hash[:])
-
-		// warm-up для SmartPSS: DHGET /probe/p2psrv
-		cseq := atomic.AddInt64(&cseqCounter, 1)
-		p.write("DHGET", "/probe/p2psrv", "", cseq)
-		dl := time.Now().Add(timeout)
-		for {
-			p.conn.SetReadDeadline(dl)
-			n, err := p.conn.Read(p.buf)
-			if err != nil {
-				break
-			}
-			if r := parseDHResp(p.buf[:n]); r.CSeq == cseq {
-				break
-			}
+		if r := parseDHResp(p.buf[:n]); r.CSeq == cseq {
+			break
 		}
 	}
 	return p
@@ -369,29 +267,32 @@ func newChannelPipelineWithProfile(conn *net.UDPConn, prof cloudProfile, timeout
 
 func (p *channelPipeline) write(method, path, body string, cseq int64) bool {
 	p.conn.SetWriteDeadline(time.Now().Add(p.timeout))
-	var data []byte
-	if p.prof.profileType == profileDMSS {
-		data = []byte(dmssReq(method, path, body, cseq, p.digest, p.nonceStr, p.curdate))
-	} else {
-		data = []byte(dhReq(method, path, body, cseq, p.digest, p.nonceStr, p.curdate))
-	}
-	_, err := p.conn.Write(data)
+	_, err := p.conn.Write([]byte(dhReq(method, path, body, cseq, p.digest, p.nonceStr, p.curdate)))
 	return err == nil
+}
+
+// markChecked — Checked считается один раз на серийник: первая отправка
+// (или её невозможность), истечение или вердикт. Ретраи молчунов счётчик
+// не двигают — иначе прогресс и суммы врали бы.
+func (p *channelPipeline) markChecked(serial string, stats *ScanStats) {
+	if _, ok := p.counted[serial]; !ok {
+		p.counted[serial] = struct{}{}
+		atomic.AddInt64(&stats.Checked, 1)
+	}
+}
+
+// sendFail — сокет умер на записи: финальный dead, ретраить нечего
+// (умрёт и следующая запись).
+func (p *channelPipeline) sendFail(serial string, stats *ScanStats) {
+	p.markChecked(serial, stats)
+	atomic.AddInt64(&stats.Dead, 1)
 }
 
 // send ставит channel-проб серийника в окно. false — сокет умер на записи.
 func (p *channelPipeline) send(serial string) bool {
 	cseq := atomic.AddInt64(&cseqCounter, 1)
 	aid := randomAID()
-	var body string
-	method := "DHPOST"
-	if p.prof.profileType == profileDMSS {
-		method = "NFPOST"
-		body = dmssChannelBody(p.lport, aid)
-	} else {
-		body = p2pChannelBody(p.lport, aid)
-	}
-	if !p.write(method, fmt.Sprintf("/device/%s/p2p-channel", serial), body, cseq) {
+	if !p.write("DHPOST", fmt.Sprintf("/device/%s/p2p-channel", serial), p2pChannelBody(p.lport, aid), cseq) {
 		return false
 	}
 	p.inflight[cseq] = &inflightChannel{serial: serial, aid: aid, deadline: time.Now().Add(p.timeout)}
@@ -426,28 +327,43 @@ func (p *channelPipeline) minDeadline() time.Time {
 }
 
 // expire: просроченные запросы окна переезжают в кладбище (вердикт
-// отложен), просроченное кладбище — финально dead+late (молчание дольше
-// ACK_GRACE честно считаем «девайса нет»).
-func (p *channelPipeline) expire(lateCh chan<- string, stats *ScanStats) {
+// отложен — ждём опоздавший ack), просроченное кладбище — РЕТРАЙ:
+// облако молча дропает пакеты, тишина дольше ACK_GRACE это повод
+// переотправить пробу, а не хоронить серийник. Dead — только после
+// исчерпания CHANNEL_RETRIES.
+func (p *channelPipeline) expire(stats *ScanStats) {
 	now := time.Now()
 	for c, ir := range p.inflight {
 		if now.After(ir.deadline) {
 			delete(p.inflight, c)
-			p.lateCycle++
-			atomic.AddInt64(&stats.Checked, 1)
-			p.graveyard[c] = &graveEntry{serial: ir.serial, aid: ir.aid, deadline: now.Add(p.graceTTL)}
+			p.expiredCycle++
+			p.markChecked(ir.serial, stats)
+			p.graveyard[c] = &graveEntry{serial: ir.serial, aid: ir.aid, retries: ir.retries, deadline: now.Add(p.graceTTL)}
 		}
 	}
 	for c, g := range p.graveyard {
 		if now.After(g.deadline) {
 			delete(p.graveyard, c)
-			atomic.AddInt64(&stats.Dead, 1)
-			atomic.AddInt64(&stats.Late, 1)
-			if lateCh != nil {
-				lateCh <- g.serial
+			if g.retries >= CHANNEL_RETRIES {
+				atomic.AddInt64(&stats.Dead, 1)
+				continue
 			}
+			p.sendRetry(g, stats)
 		}
 	}
+}
+
+// sendRetry — переотправка замолчавшего серийника новым CSeq.
+// Checked не трогаем: серийник посчитан при первой попытке.
+func (p *channelPipeline) sendRetry(g *graveEntry, stats *ScanStats) {
+	cseq := atomic.AddInt64(&cseqCounter, 1)
+	aid := randomAID()
+	if !p.write("DHPOST", fmt.Sprintf("/device/%s/p2p-channel", g.serial), p2pChannelBody(p.lport, aid), cseq) {
+		p.sendFail(g.serial, stats)
+		return
+	}
+	p.inflight[cseq] = &inflightChannel{serial: g.serial, aid: aid, retries: g.retries + 1, deadline: time.Now().Add(p.timeout)}
+	p.sent++
 }
 
 // resolve разбирает датаграмму ответа.
@@ -463,7 +379,7 @@ func (p *channelPipeline) resolve(r dhResp, aliveCh chan<- string, stats *ScanSt
 	}
 	if ir, ok := p.inflight[r.CSeq]; ok {
 		delete(p.inflight, r.CSeq)
-		atomic.AddInt64(&stats.Checked, 1)
+		p.markChecked(ir.serial, stats)
 		if channelAckAlive(r) {
 			atomic.AddInt64(&stats.Alive, 1)
 			aliveCh <- ir.serial
@@ -474,7 +390,8 @@ func (p *channelPipeline) resolve(r dhResp, aliveCh chan<- string, stats *ScanSt
 		return
 	}
 	// CSeq в окне не нашёлся: может, это опоздавший ack из кладбища —
-	// тогда он выносит честный вердикт (без dead-ошибки)
+	// тогда он выносит честный вердикт (Checked уже посчитан при первом
+	// истечении — здесь лишь раскладываем alive/dead).
 	if g, ok := p.graveyard[r.CSeq]; ok {
 		delete(p.graveyard, r.CSeq)
 		if channelAckAlive(r) {
@@ -486,12 +403,8 @@ func (p *channelPipeline) resolve(r dhResp, aliveCh chan<- string, stats *ScanSt
 		}
 		return
 	}
-	// совсем чужой CSeq (мусор/чужой сокет) — диагностика опозданий
-	if channelAckAlive(r) {
-		atomic.AddInt64(&stats.OrphanAlive, 1)
-	} else {
-		atomic.AddInt64(&stats.OrphanDead, 1)
-	}
+	// совсем чужой CSeq (залипшая датаграмма прошлой попытки/сокета) —
+	// игнорируем полностью: ни вердикта, ни статистики.
 }
 
 // teardown — эксперимент (TEARDOWN_ALIVE): после живого ack шлём
@@ -550,13 +463,13 @@ func (p *channelPipeline) teardown(aid []byte, ack dhResp) {
 	}
 }
 
-// govern — адаптивное окно: late-доля цикла ниже 2% — облако отвечает
-// нормально, окно растёт; выше 10% — облако дропает, окно сжимается.
+// govern — адаптивное окно: доля истёкших без ответа ниже 2% — облако
+// отвечает нормально, окно растёт; выше 10% — облако дропает, окно сжимается.
 func (p *channelPipeline) govern() {
 	if p.sent == 0 {
 		return
 	}
-	share := float64(p.lateCycle) / float64(p.sent)
+	share := float64(p.expiredCycle) / float64(p.sent)
 	switch {
 	case share < 0.02:
 		p.window += GOV_GROW
@@ -569,11 +482,14 @@ func (p *channelPipeline) govern() {
 			p.window = W_MIN
 		}
 	}
-	p.sent, p.lateCycle = 0, 0
+	p.sent, p.expiredCycle = 0, 0
 }
 
 // run — главный цикл воркера: наполняет окно, читает ответы, мэтчит по CSeq.
-func (p *channelPipeline) run(ctx context.Context, jobs <-chan string, aliveCh, lateCh chan<- string, stats *ScanStats) {
+// Тишина облака отрабатывается ретраями внутри expire — отдельных кругов
+// и late-файлов нет: серийник либо получает вердикт, либо умирает после
+// исчерпания CHANNEL_RETRIES.
+func (p *channelPipeline) run(ctx context.Context, jobs <-chan string, aliveCh chan<- string, stats *ScanStats) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -590,8 +506,7 @@ func (p *channelPipeline) run(ctx context.Context, jobs <-chan string, aliveCh, 
 			break // канал закрыт — дожидаемся окно и кладбище внизу
 		}
 		if !p.send(s) {
-			atomic.AddInt64(&stats.Dead, 1)
-			atomic.AddInt64(&stats.Checked, 1)
+			p.sendFail(s, stats)
 		}
 
 		// дозаполняем окно, пока есть джобы
@@ -605,8 +520,7 @@ func (p *channelPipeline) run(ctx context.Context, jobs <-chan string, aliveCh, 
 					break fill // канал закрыт — дальше только слив
 				}
 				if !p.send(s) {
-					atomic.AddInt64(&stats.Dead, 1)
-					atomic.AddInt64(&stats.Checked, 1)
+					p.sendFail(s, stats)
 				}
 				// растягиваем пачку: залп в одну микросекунду — флуд-профиль
 				select {
@@ -621,21 +535,21 @@ func (p *channelPipeline) run(ctx context.Context, jobs <-chan string, aliveCh, 
 
 		// фаза чтения: пока окно не опустело
 		for len(p.inflight) > 0 {
-			p.pump(ctx, aliveCh, lateCh, stats)
+			p.pump(ctx, aliveCh, stats)
 		}
 		p.govern()
 	}
-	// jobs закрыты: дожидаемся окно и кладбище — опоздавшие ack'и
-	// обязаны вынести свои вердикты до выхода
+	// jobs закрыты: дожидаемся окно и кладбище — ретраи внутри expire
+	// обязаны отработать до выхода (молчание ≠ вердикт).
 	for (len(p.inflight) > 0 || len(p.graveyard) > 0) && ctx.Err() == nil {
-		p.pump(ctx, aliveCh, lateCh, stats)
+		p.pump(ctx, aliveCh, stats)
 	}
 }
 
 // pump — одна итерация чтения: читает датаграмму до ближайшего дедлайна
 // (окно+кладбище), expiry — при тишине. Читаем даже за просроченным
 // дедлайном с миллисекундным окном: датаграмма могла уже лежать в буфере.
-func (p *channelPipeline) pump(ctx context.Context, aliveCh, lateCh chan<- string, stats *ScanStats) {
+func (p *channelPipeline) pump(ctx context.Context, aliveCh chan<- string, stats *ScanStats) {
 	dl := p.minDeadline()
 	now := time.Now()
 	wait := dl.Sub(now)
@@ -644,151 +558,15 @@ func (p *channelPipeline) pump(ctx context.Context, aliveCh, lateCh chan<- strin
 	}
 	r, got := p.readResp(now.Add(wait))
 	if !got {
-		p.expire(lateCh, stats)
+		p.expire(stats)
 		return
 	}
 	p.resolve(r, aliveCh, stats)
 }
 
-func scanWorker(ctx context.Context, conn *net.UDPConn, jobs <-chan string, aliveCh, lateCh chan<- string, stats *ScanStats, timeout time.Duration) {
+func scanWorker(ctx context.Context, conn *net.UDPConn, jobs <-chan string, aliveCh chan<- string, stats *ScanStats, timeout time.Duration) {
 	p := newChannelPipeline(conn, timeout)
-	p.run(ctx, jobs, aliveCh, lateCh, stats)
-}
-
-type probeVerdict struct {
-	serial string
-	alive  bool
-	late   bool
-}
-
-func (p *channelPipeline) expireVerdicts(verdictCh chan<- probeVerdict) {
-	now := time.Now()
-	for c, ir := range p.inflight {
-		if now.After(ir.deadline) {
-			delete(p.inflight, c)
-			p.lateCycle++
-			p.graveyard[c] = &graveEntry{serial: ir.serial, aid: ir.aid, deadline: now.Add(p.graceTTL)}
-		}
-	}
-	for c, g := range p.graveyard {
-		if now.After(g.deadline) {
-			delete(p.graveyard, c)
-			if verdictCh != nil {
-				verdictCh <- probeVerdict{serial: g.serial, alive: false, late: true}
-			}
-		}
-	}
-}
-
-func (p *channelPipeline) resolveVerdicts(r dhResp, verdictCh chan<- probeVerdict) {
-	if r.Code < 200 {
-		if ir, ok := p.inflight[r.CSeq]; ok && !ir.extended {
-			ir.extended = true
-			ir.deadline = time.Now().Add(p.timeout)
-		}
-		return
-	}
-	if ir, ok := p.inflight[r.CSeq]; ok {
-		delete(p.inflight, r.CSeq)
-		alive := channelAckAlive(r)
-		if alive {
-			p.teardown(ir.aid, r)
-		}
-		if verdictCh != nil {
-			verdictCh <- probeVerdict{serial: ir.serial, alive: alive, late: false}
-		}
-		return
-	}
-	if g, ok := p.graveyard[r.CSeq]; ok {
-		delete(p.graveyard, r.CSeq)
-		alive := channelAckAlive(r)
-		if alive {
-			p.teardown(g.aid, r)
-		}
-		if verdictCh != nil {
-			verdictCh <- probeVerdict{serial: g.serial, alive: alive, late: false}
-		}
-		return
-	}
-}
-
-func (p *channelPipeline) pumpVerdicts(ctx context.Context, verdictCh chan<- probeVerdict) {
-	dl := p.minDeadline()
-	now := time.Now()
-	wait := dl.Sub(now)
-	if wait < time.Millisecond {
-		wait = time.Millisecond
-	}
-	r, got := p.readResp(now.Add(wait))
-	if !got {
-		p.expireVerdicts(verdictCh)
-		return
-	}
-	p.resolveVerdicts(r, verdictCh)
-}
-
-func (p *channelPipeline) runVerdicts(ctx context.Context, jobs <-chan string, verdictCh chan<- probeVerdict) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		var s string
-		var ok bool
-		select {
-		case <-ctx.Done():
-			return
-		case s, ok = <-jobs:
-		}
-		if !ok {
-			break
-		}
-		if !p.send(s) {
-			select {
-			case verdictCh <- probeVerdict{serial: s, alive: false, late: false}:
-			case <-ctx.Done():
-				return
-			}
-		}
-
-	fill:
-		for len(p.inflight) < PIPELINE_WINDOW {
-			select {
-			case <-ctx.Done():
-				return
-			case s, ok := <-jobs:
-				if !ok {
-					break fill
-				}
-				if !p.send(s) {
-					select {
-					case verdictCh <- probeVerdict{serial: s, alive: false, late: false}:
-					case <-ctx.Done():
-						return
-					}
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(SEND_STAGGER):
-				}
-			default:
-				break fill
-			}
-		}
-
-		for len(p.inflight) > 0 {
-			p.pumpVerdicts(ctx, verdictCh)
-		}
-		p.govern()
-	}
-	for (len(p.inflight) > 0 || len(p.graveyard) > 0) && ctx.Err() == nil {
-		p.pumpVerdicts(ctx, verdictCh)
-	}
-}
-
-func scanWorkerWithProfile(ctx context.Context, conn *net.UDPConn, prof cloudProfile, jobs <-chan string, verdictCh chan<- probeVerdict, timeout time.Duration) {
-	p := newChannelPipelineWithProfile(conn, prof, timeout)
-	p.runVerdicts(ctx, jobs, verdictCh)
+	p.run(ctx, jobs, aliveCh, stats)
 }
 
 // readSerialsFile — загрузка входного файла в два прохода с прогрессом
@@ -851,9 +629,12 @@ func readSerialsFile(f *os.File, stats *ScanStats) ([]string, string) {
 	return serials, ""
 }
 
-// lookupServerIPs — все IPv4 A-записи сервера.
-func lookupServerIPs(server string) []net.IP {
-	ips, err := net.LookupIP(server)
+// lookupCloudIPs — все IPv4 A-записи облака. Бюджеты облака могут
+// вестись на пару клиент↔сервер: распределение воркеров по всем адресам
+// (round-robin) даёт шанс масштабировать бюджет на число серверов.
+// Пустой срез — фолбэк на единственный адрес через ResolveUDPAddr.
+func lookupCloudIPs() []net.IP {
+	ips, err := net.LookupIP(MAIN_SERVER)
 	if err != nil {
 		return nil
 	}
@@ -866,17 +647,11 @@ func lookupServerIPs(server string) []net.IP {
 	return v4
 }
 
-// lookupCloudIPs — обратная совместимость (SmartPSS).
-func lookupCloudIPs() []net.IP {
-	return lookupServerIPs(MAIN_SERVER)
-}
-
+// newEgress — шов для будущих исходящих идентичностей (SOCKS5 UDP
+// ASSOCIATE и т.п.): сокет на облако создаётся только здесь. При появлении
+// прокси пул egress'ов раздаётся воркерам вместо round-robin по IP.
 func newEgress(ip net.IP) (*net.UDPConn, error) {
-	return newEgressTo(ip, MAIN_PORT)
-}
-
-func newEgressTo(ip net.IP, port int) (*net.UDPConn, error) {
-	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: port})
+	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: MAIN_PORT})
 	if err != nil {
 		return nil, err
 	}
@@ -913,20 +688,11 @@ func RunScanner(ctx context.Context, inputFile, outputFile string, appendMode bo
 
 	ulimit := getUlimit()
 	maxWorkers := int(ulimit - 200)
-	if maxWorkers < 2 {
-		maxWorkers = 2
+	if maxWorkers < 1 {
+		maxWorkers = 1
 	}
 	if workers <= 0 || workers > maxWorkers {
 		workers = maxWorkers
-	}
-
-	smartWorkers := workers / 2
-	dmssWorkers := workers - smartWorkers
-	if smartWorkers < 1 {
-		smartWorkers = 1
-	}
-	if dmssWorkers < 1 {
-		dmssWorkers = 1
 	}
 
 	// appendMode: true — дописывать в конец (накопление по префиксам),
@@ -944,195 +710,85 @@ func RunScanner(ctx context.Context, inputFile, outputFile string, appendMode bo
 	defer outFile.Close()
 	outWriter := bufio.NewWriterSize(outFile, 256*1024)
 
-	// late-файл: серийники, не получившие финального ответа к дедлайну.
-	// Рядом с выходным, режим повторяет выходной (append — накопление).
-	latePath := strings.TrimSuffix(outputFile, filepath.Ext(outputFile)) + ".late"
-	lateFlags := os.O_CREATE | os.O_WRONLY | os.O_APPEND
-	if !appendMode {
-		lateFlags |= os.O_TRUNC
-	}
-	lateFile, err := os.OpenFile(latePath, lateFlags, 0644)
-	if err != nil {
-		stats.ErrorMsg = i18n.Tr("ошибка создания выходного файла: ") + err.Error()
-		return
-	}
-	defer lateFile.Close()
-	lateWriter := bufio.NewWriterSize(lateFile, 256*1024)
-
-	smartIPs := lookupServerIPs(MAIN_SERVER)
-	if len(smartIPs) == 0 {
+	cloudIPs := lookupCloudIPs()
+	if len(cloudIPs) == 0 {
 		if raddr, rerr := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", MAIN_SERVER, MAIN_PORT)); rerr == nil {
-			smartIPs = []net.IP{raddr.IP}
+			cloudIPs = []net.IP{raddr.IP}
 		}
 	}
-	if len(smartIPs) == 0 {
+	if len(cloudIPs) == 0 {
 		stats.ErrorMsg = i18n.Tr("ошибка резолва сервера: ") + MAIN_SERVER
 		return
 	}
 
-	dmssIPs := lookupServerIPs(DMSS_MAIN_SERVER)
-	if len(dmssIPs) == 0 {
-		if raddr, rerr := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", DMSS_MAIN_SERVER, DMSS_MAIN_PORT)); rerr == nil {
-			dmssIPs = []net.IP{raddr.IP}
-		}
-	}
-	if len(dmssIPs) == 0 {
-		stats.ErrorMsg = i18n.Tr("ошибка резолва сервера: ") + DMSS_MAIN_SERVER
-		return
-	}
-
-	smartConns := make([]*net.UDPConn, 0, smartWorkers)
-	for i := 0; i < smartWorkers; i++ {
-		conn, err := newEgressTo(smartIPs[i%len(smartIPs)], MAIN_PORT)
+	conns := make([]*net.UDPConn, 0, workers)
+	for i := 0; i < workers; i++ {
+		conn, err := newEgress(cloudIPs[i%len(cloudIPs)])
 		if err != nil {
+			workers = i
 			break
 		}
-		smartConns = append(smartConns, conn)
+		conns = append(conns, conn)
 	}
 
-	dmssConns := make([]*net.UDPConn, 0, dmssWorkers)
-	for i := 0; i < dmssWorkers; i++ {
-		conn, err := newEgressTo(dmssIPs[i%len(dmssIPs)], DMSS_MAIN_PORT)
-		if err != nil {
-			break
-		}
-		dmssConns = append(dmssConns, conn)
-	}
-
-	if len(smartConns) == 0 || len(dmssConns) == 0 {
-		for _, c := range smartConns {
-			c.Close()
-		}
-		for _, c := range dmssConns {
-			c.Close()
-		}
+	if len(conns) == 0 {
 		stats.ErrorMsg = i18n.Tr("не смог создать необходимое кол-во сокетов (фикс: ulimit -n 100000)")
 		return
 	}
-
-	smartJobs := make(chan string, smartWorkers*10)
-	smartVerdicts := make(chan probeVerdict, smartWorkers*10)
-	dmssJobs := make(chan string, dmssWorkers*10)
-	dmssVerdicts := make(chan probeVerdict, dmssWorkers*10)
-
-	var smartWg sync.WaitGroup
-	for _, conn := range smartConns {
-		smartWg.Add(1)
-		go func(c *net.UDPConn) {
-			defer smartWg.Done()
-			scanWorkerWithProfile(ctx, c, smartpssProfile, smartJobs, smartVerdicts, ACK_TIMEOUT)
-		}(conn)
-	}
-
-	go func() {
-		smartWg.Wait()
-		close(smartVerdicts)
-	}()
-
-	var dmssWg sync.WaitGroup
-	for _, conn := range dmssConns {
-		dmssWg.Add(1)
-		go func(c *net.UDPConn) {
-			defer dmssWg.Done()
-			scanWorkerWithProfile(ctx, c, dmssProfile, dmssJobs, dmssVerdicts, ACK_TIMEOUT)
-		}(conn)
-	}
-
-	go func() {
-		dmssWg.Wait()
-		close(dmssVerdicts)
-	}()
-
-	var smartState sync.Map // serial -> probeVerdict
-
-	// Маршрутизация: каждый серийник после SmartPSS направляется на проверку в DMSS
-	go func() {
-		for sv := range smartVerdicts {
-			smartState.Store(sv.serial, sv)
-			select {
-			case dmssJobs <- sv.serial:
-			case <-ctx.Done():
-				break
-			}
+	defer func() {
+		for _, conn := range conns {
+			conn.Close()
 		}
-		close(dmssJobs)
 	}()
 
-	// Оценка вердиктов SmartPSS vs DMSS и запись в файлы
-	var evalWg sync.WaitGroup
-	evalWg.Add(1)
+	// Один круг по списку: воркеры на живых сокетах, alive сразу
+	// в выходной файл. Тишина облака отрабатывается ретраями внутри
+	// пайплайна (expire → sendRetry) — отдельных кругов нет.
+	jobs := make(chan string, workers*10)
+	aliveCh := make(chan string, workers*10)
+
+	var rwg sync.WaitGroup
+	for _, conn := range conns {
+		rwg.Add(1)
+		go func(c *net.UDPConn) {
+			defer rwg.Done()
+			scanWorker(ctx, c, jobs, aliveCh, stats, ACK_TIMEOUT)
+		}(conn)
+	}
+
+	var writeWg sync.WaitGroup
+	writeWg.Add(1)
 	go func() {
-		defer evalWg.Done()
-		lateBatch := 0
-		for dv := range dmssVerdicts {
-			var sv probeVerdict
-			if v, ok := smartState.LoadAndDelete(dv.serial); ok {
-				sv = v.(probeVerdict)
-			}
-
-			if sv.alive && dv.alive {
-				// Ответило на обоих серверах = мусор!
-				atomic.AddInt64(&stats.Dead, 1)
-				atomic.AddInt64(&stats.Checked, 1)
-				if events != nil {
-					select {
-					case events <- "[TRASH/DUAL] " + dv.serial:
-					default:
-					}
-				}
-				continue
-			}
-
-			if sv.alive && !dv.alive {
-				// Только SmartPSS
-				atomic.AddInt64(&stats.Alive, 1)
-				atomic.AddInt64(&stats.Checked, 1)
-				outWriter.WriteString(dv.serial + ",profile=smartpss\n")
-				outWriter.Flush()
-				if events != nil {
-					select {
-					case events <- "[VALID] " + dv.serial + ",profile=smartpss":
-					default:
-					}
-				}
-				continue
-			}
-
-			if !sv.alive && dv.alive {
-				// Только DMSS
-				atomic.AddInt64(&stats.Alive, 1)
-				atomic.AddInt64(&stats.Checked, 1)
-				outWriter.WriteString(dv.serial + ",profile=dmss\n")
-				outWriter.Flush()
-				if events != nil {
-					select {
-					case events <- "[VALID] " + dv.serial + ",profile=dmss":
-					default:
-					}
-				}
-				continue
-			}
-
-			// Не ответило ни на одном: dead
-			atomic.AddInt64(&stats.Dead, 1)
-			atomic.AddInt64(&stats.Checked, 1)
-			if sv.late && dv.late {
-				atomic.AddInt64(&stats.Late, 1)
-				lateWriter.WriteString(dv.serial + "\n")
-				lateBatch++
-				if lateBatch >= 128 {
-					lateWriter.Flush()
-					lateBatch = 0
+		defer writeWg.Done()
+		for s := range aliveCh {
+			outWriter.WriteString(s + "\n")
+			outWriter.Flush() // Пишем сразу в файл, а не в память
+			if events != nil {
+				select {
+				case events <- "[VALID] " + s:
+				default:
 				}
 			}
 		}
 		outWriter.Flush()
-		lateWriter.Flush()
 	}()
+
+feed:
+	for _, s := range serials {
+		select {
+		case <-ctx.Done():
+			break feed
+		case jobs <- s:
+		}
+	}
+	close(jobs)
+	rwg.Wait()
+	close(aliveCh)
+	writeWg.Wait()
 
 	start := time.Now()
 
-	// Stats updater loop
+	// Stats updater loop (ETA выпилен — врёт)
 	updStop := make(chan struct{})
 	var lastAliveMark int64
 	lastAliveT := start
@@ -1151,6 +807,8 @@ func RunScanner(ctx context.Context, inputFile, outputFile string, appendMode bo
 				if elapsed > 0 {
 					stats.Speed = float64(checked) / elapsed
 				}
+				// alive/мин за последнее 10-секундное окно: отличает
+				// «застряло намертво» от «капает по бюджету облака»
 				now := time.Now()
 				if now.Sub(lastAliveT) >= 10*time.Second {
 					alive := atomic.LoadInt64(&stats.Alive)
@@ -1161,25 +819,8 @@ func RunScanner(ctx context.Context, inputFile, outputFile string, appendMode bo
 		}
 	}()
 
-	for _, s := range serials {
-		select {
-		case <-ctx.Done():
-			goto shutdown
-		case smartJobs <- s:
-		}
-	}
-
-shutdown:
-	close(smartJobs)
-	smartWg.Wait()
-	dmssWg.Wait()
-	evalWg.Wait()
+	// Круг один: ретраи молчунов — внутри пайплайна, второго круга нет.
+	// Хроника молчит после всех ретраев — это оффлайн, а не медленный ack.
 	close(updStop)
-
-	for _, conn := range smartConns {
-		conn.Close()
-	}
-	for _, conn := range dmssConns {
-		conn.Close()
-	}
+	outWriter.Flush()
 }
