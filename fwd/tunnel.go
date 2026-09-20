@@ -82,7 +82,7 @@ var Debug bool
 var LogHook func(string)
 
 // InitLimit — лимит одновременных P2P-инициализаций.
-var InitLimit = 16
+var InitLimit = 32
 
 // StunFailHook вызывается при откате со STUN на relay.
 var StunFailHook func(serial string)
@@ -139,9 +139,8 @@ func (t *Tunnel) releaseInitSlot() {
 
 func isQuickRestart(err error) bool { return errors.Is(err, errCloudStall) }
 
-// deviceAckTimeout — ожидание ack'ов в хендшейке: коротко, тишина =
-// рестарт попытки, а не 15-секундный простой.
-var deviceAckTimeout = 4 * time.Second
+// deviceAckTimeout — ожидание ack'ов в хендшейке (паритет с dh-fwd: 12с вместо 4с).
+var deviceAckTimeout = 12 * time.Second
 
 var ptcpHeartbeat = []byte{
 	0x13, 0x00, 0x00, 0x00,
@@ -611,10 +610,16 @@ func (t *Tunnel) establish() error {
 	mainRemote.RequestEx(prof.warmupPath, "", prof.warmupAuth, true, reqOpts{warmup: true})
 	res, err := mainRemote.RequestEx(fmt.Sprintf("/online/p2psrv/%s", t.serial), "", true, true, reqOpts{})
 	if err != nil {
+		if strings.Contains(err.Error(), "404") {
+			return errDeviceNotFound
+		}
 		t.logf("online lookup silent: %v", err)
 		return fmt.Errorf("%w: online lookup silent (%v)", errCloudStall, err)
 	}
-	if res == nil || res.Body["body/US"] == "" {
+	if res == nil || res.Code == 404 || res.Body["body/US"] == "" {
+		if res != nil && res.Code == 404 {
+			return errDeviceNotFound
+		}
 		return fmt.Errorf("device %s not found on p2psrv", t.serial)
 	}
 	us := res.Body["body/US"]
@@ -736,28 +741,19 @@ func (t *Tunnel) establish() error {
 		t.startRelayAgent(mainRemote, agentHost, agentPort, agentToken)
 	}
 
-	// Phase 4: ожидание ответа от устройства (Server Nat Info)
+	// Phase 4: Server Nat Info от устройства (через cloud/US)
 	t.setStage("device ack wait")
 	t.logf("phase: p2p-channel sent, waiting device ack…")
 	if early == nil {
-		var ack *DHResponse
-		for try := 0; try < 2; try++ {
-			if try > 0 {
-				t.logf("p2p-channel ack silent — повтор запроса (same identity, fresh crypto)")
-				xchg.send(true)
-			}
-			ack, err = deviceRemote.Read(true, deviceAckTimeout)
-			if err == nil && ack.Code < 200 {
-				ack, err = deviceRemote.Read(true, deviceAckTimeout)
-			}
-			if err == nil {
-				break
-			}
+		t.logf("waiting for p2p-channel ack (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+		res, err = deviceRemote.Read(true, RELAY_READ_TIMEOUT)
+		if err == nil && res.Code < 200 {
+			t.logf("waiting for p2p-channel ack body (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+			res, err = deviceRemote.Read(true, RELAY_READ_TIMEOUT)
 		}
 		if err != nil {
-			return fmt.Errorf("%w: p2p-channel ack silent", errCloudStall)
+			return fmt.Errorf("%w: read device response: %v", errCloudStall, err)
 		}
-		res = ack
 	} else {
 		res = early
 	}
@@ -881,10 +877,19 @@ func (t *Tunnel) establish() error {
 			})
 			p, err = t.waitForPTCPToken(mainRemote, RELAY_READ_TIMEOUT)
 			if err != nil {
-				return fmt.Errorf("ptcp 0x17: %v", err)
+				if errors.Is(err, errPTCPAppFallback) {
+					// Агент сыпет короткие SYNC-ack вместо токена —
+					// это апп-диалект (поколение 2024+): пропускаем 0x17,
+					// дальше STUN как обычно, data path через апп-паритет.
+					t.forceAppRelay = true
+					t.logf("ptcp 0x17: token spam, forcing app relay dialect")
+				} else {
+					return fmt.Errorf("ptcp 0x17: %v", err)
+				}
+			} else {
+				sign = p.Body[12:]
+				mainRemote.RequestPTCP(nil)
 			}
-			sign = p.Body[12:]
-			mainRemote.RequestPTCP(nil)
 		}
 	}
 	t.setStage("stun punch")
@@ -1018,6 +1023,15 @@ func (t *Tunnel) establish() error {
 		deviceRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
 		if _, err := deviceRemote.ReadPTCP(3 * time.Second); err != nil {
 			t.logf("app-parity sync: %v", err)
+			if agentOK {
+				t.logf("direct sync timed out — falling back to relay agent")
+				if StunFailHook != nil {
+					StunFailHook(t.serial)
+				}
+				t.setStage("ready (relay)")
+				t.setPrimary(mainRemote)
+				return nil
+			}
 		}
 		t.setStage("ready (direct)")
 		t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
@@ -1030,6 +1044,15 @@ func (t *Tunnel) establish() error {
 			deviceRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
 			if _, perr := deviceRemote.ReadPTCP(3 * time.Second); perr != nil {
 				t.logf("app-parity sync: %v", perr)
+				if agentOK {
+					t.logf("direct sync timed out — falling back to relay agent")
+					if StunFailHook != nil {
+						StunFailHook(t.serial)
+					}
+					t.setStage("ready (relay)")
+					t.setPrimary(mainRemote)
+					return nil
+				}
 			}
 			t.setStage("ready (direct, app dialect)")
 			t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
@@ -1088,7 +1111,7 @@ func (t *Tunnel) waitRelayChannelAck(mainRemote *UDP, agentHost string, agentPor
 		agentHost, agentPort, interval, relayChannelMaxRetransmits)
 
 	var lastErr error
-	for attempt := 0; attempt < relayChannelMaxRetransmits; attempt++ {
+	for attempt := 0; attempt <= relayChannelMaxRetransmits; attempt++ {
 		if res, err := mainRemote.Read(true, interval); err == nil {
 			t.logf("relay-channel ack received from agent")
 			if v := res.Body["body/version"]; isModernAppRelayVersion(v) {
@@ -1126,12 +1149,51 @@ func (t *Tunnel) storeRePunch(packet []byte, laddrIP string, lport int, pubParts
 	t.rePunchPub = &net.UDPAddr{IP: net.ParseIP(pubParts[0]), Port: pubPort}
 }
 
+// fallbackToRelay мгновенно переключает data path на рабочий релей,
+// не дожидаясь silenceGiveUp-таймаута. Возвращает true если переключил.
+func (t *Tunnel) fallbackToRelay() bool {
+	t.socksMu.Lock()
+	if t.useTCPPath {
+		t.socksMu.Unlock()
+		return false
+	}
+	prim := t.primary
+	mr := t.mainRemote
+	if prim == nil || mr == nil || prim == mr {
+		t.socksMu.Unlock()
+		return false
+	}
+	// primary был прямым (deviceRemote) — переключаем на релей
+	t.primary = mr
+	t.socksMu.Unlock()
+	t.setStage("ready (relay, fast-fallback)")
+	t.logf("data path silent — fast-fallback to relay, no STUN wait")
+	if StunFailHook != nil {
+		StunFailHook(t.serial)
+	}
+	return true
+}
+
 // tryRePunch повторно шлёт сохранённый STUN init (и один PTCP SYNC)
 // на адреса устройства. Троттлится через rePunchEvery.
+// Если STUN молчит а релей жив — сразу переключаемся на релей.
 func (t *Tunnel) tryRePunch() {
 	t.rePunchMu.Lock()
 	defer t.rePunchMu.Unlock()
 	if time.Since(t.lastRePunch) < rePunchEvery {
+		// Троттлинг STUN-перебивки, но релей-фоллбэк делаем вне троттлинга:
+		// если прямой путь молчит — уходим на релей сразу.
+		if t.fallbackToRelay() {
+			t.lastRePunch = time.Now()
+			t.rePunchAttempts++
+		}
+		return
+	}
+	// Первым делом — быстрый уход на релей, без ожидания таймаута.
+	if t.fallbackToRelay() {
+		t.lastRePunch = time.Now()
+		t.rePunchAttempts++
+		t.logf("data path silent — re-punching STUN (recovery %d) skipped, on relay", t.rePunchAttempts)
 		return
 	}
 	t.lastRePunch = time.Now()
@@ -1163,14 +1225,42 @@ func (t *Tunnel) tryRePunch() {
 // бывает токеном, так что дренирование строго безопаснее; если токен не
 // пришёл, таймаут чтения всплывает обычной ошибкой вместо
 // процессоубивающей паники.
+// errPTCPAppFallback — агент вместо токена сыпет короткие SYNC-ack:
+// это апп-диалект, 0x17 пропускаем и идем дальше с forceAppRelay.
+var errPTCPAppFallback = errors.New("ptcp token spam: app dialect fallback")
+
 func (t *Tunnel) waitForPTCPToken(u *UDP, timeout time.Duration) (*PTCP, error) {
+	deadline := time.Now().Add(timeout)
+	shorts := 0
 	for {
-		p, err := u.ReadPTCP(timeout)
+		if t.isStopped() {
+			return nil, fmt.Errorf("ptcp 0x17: stopped")
+		}
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			return nil, fmt.Errorf("ptcp token timeout (%d short frames)", shorts)
+		}
+		if remain > 5*time.Second {
+			remain = 5 * time.Second
+		}
+		p, err := u.ReadPTCP(remain)
 		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			if !isTransportDead(err) {
+				continue
+			}
 			return nil, err
 		}
 		if len(p.Body) >= 13 {
 			return p, nil
+		}
+		shorts++
+		// 10 коротких подряд — это не токен-канал, а апп-диалект:
+		// не жжем весь RELAY_READ_TIMEOUT, уходим в фолбэк сразу.
+		if shorts >= 10 {
+			return nil, errPTCPAppFallback
 		}
 		t.logf("ptcp 0x17: discarding short body (%d bytes: %x) — waiting for token", len(p.Body), p.Body)
 	}
@@ -2330,11 +2420,6 @@ func (t *Tunnel) DialCamera(remotePort int) (net.Conn, error) {
 // В TCP-relay режиме realm — TOU-сессия, открытая SYN-фреймом.
 // На UDP-пути предпочтение пребинженному realm из пула: без ожидания BIND.
 func (t *Tunnel) handleBind(ac acceptConn) {
-	if ac.remotePort == 80 && t.IsRelay() {
-		t.logf("Port 80 rejected: relay data path drops port 80 (camera sends EOF)")
-		ac.conn.Close()
-		return
-	}
 
 	// HTTP accelerator: для соединений на порт 80 Range-запросы ускоряют отдачу
 	// тяжелых веб-ресурсов камеры в несколько параллельных потоков.
@@ -2621,9 +2706,9 @@ func (t *Tunnel) fail(err error) {
 	}
 }
 
-// runWithRetries крутит попытки до успеха или до исчерпания RETRY_ATTEMPTS.
-// Ничего не печатает: ошибки уходят в callback. Прекращается навсегда после
-// Terminate().
+// runWithRetries крутит попытки БЕЗ лимита — пока не будет успеха,
+// терминального вердикта (404/auth/no listeners) или Terminate().
+// Таймаут на построение выпилен: висит вечно, останавливается только снаружи.
 func runWithRetries(t *Tunnel, onExhausted func(err error)) {
 	for attempt := 1; ; attempt++ {
 		if t.isStopped() {
@@ -2728,16 +2813,6 @@ func QueryDeviceInfo(serial string, prof *appProfile, debug bool) (*DeviceInfo, 
 	u.RequestEx(prof.warmupPath, "", prof.warmupAuth, true, reqOpts{warmup: true})
 	res, _ := u.Request(fmt.Sprintf("/online/p2psrv/%s", targetSerial), "", true, true)
 	if res == nil || res.Code >= 400 || res.Body["body/US"] == "" {
-		// Попытка фоллбэка на альтернативный профиль
-		fallbackName := "dmss"
-		if prof.name == "dmss" {
-			fallbackName = "smartpss"
-		}
-		if !strings.Contains(serial, ",profile=") {
-			if altProf, err := profileByName(fallbackName); err == nil {
-				return QueryDeviceInfo(serial+",profile="+fallbackName, altProf, debug)
-			}
-		}
 		return nil, fmt.Errorf("device %s not found on p2psrv", targetSerial)
 	}
 

@@ -16,10 +16,10 @@ import (
 	"time"
 
 	"krushitel/cloud"
+	"krushitel/dhip"
 	"krushitel/exploit"
 	"krushitel/fwd"
 	"krushitel/ironscan"
-	"krushitel/proxy"
 	"krushitel/scanner"
 	"krushitel/smartpss"
 	"krushitel/xmlde"
@@ -37,11 +37,6 @@ func exploitForm() *formState {
 	// друга (датаграммы роняются, туннели ловят stall). Больше = не
 	// быстрее, проверено: при 20 потоках hit-rate вдвое выше.
 	f.addInt(tr("потоков"), 30)
-	passLabel := tr("словарь паролей (Enter = из настроек)")
-	if cfg.PasswordsFile != "" {
-		passLabel = fmt.Sprintf(tr("словарь паролей (Enter = %s)"), filepath.Base(cfg.PasswordsFile))
-	}
-	f.addStr(passLabel, false, true)
 	f.addBool(tr("снапы?"), cfg.Snaps)
 	f.addBool("autogen .xml?", cfg.XML)
 	return f
@@ -51,22 +46,8 @@ func startExploitRun(m *model) {
 	inFile := m.form.fields[0].strVal
 	outDir := m.form.fields[1].strVal
 	threads := m.threadsVal(2)
-	customPassFile := strings.TrimSpace(m.form.fields[3].strVal)
-	cfg.Snaps = m.form.fields[4].boolVal
-	cfg.XML = m.form.fields[5].boolVal
-
-	if customPassFile != "" {
-		passwords, err := fwd.LoadPasswordsFromFile(customPassFile)
-		if err != nil {
-			showMsg(m, tr("крушим"), red("[-] "+tr("ошибка чтения файла паролей: ")+err.Error()))
-			return
-		}
-		if len(passwords) > 0 {
-			cfg.PasswordsFile = customPassFile
-			cfg.DefaultPasswords = passwords
-			fwd.SetDefaultCreds(cfg.DefaultLogin, passwords)
-		}
-	}
+	cfg.Snaps = m.form.fields[3].boolVal
+	cfg.XML = m.form.fields[4].boolVal
 	saveSettings()
 
 	if msg := ensureDir(outDir); msg != "" {
@@ -157,10 +138,8 @@ func launchExploitRun(m *model, inFile, outDir string, threads int, serials []st
 	// только на форме ввода
 	r := newRunState(runExploit, tr("крушим)"))
 	r.exp = stats
-	// лог прогона — в папку результатов при включенном лог-режиме (append между прогонами)
-	if cfg.Debug {
-		r.openLog(filepath.Join(outDir, "log.txt"))
-	}
+	// лог прогона — в папку результатов (append между прогонами)
+	r.openLog(filepath.Join(outDir, "log.txt"))
 	// Глобальный лимит одновременных P2P-init'ов: oluhradar держит
 	// min(workers,100) хендшейков с одного IP и облако это терпит —
 	// 24 было слишком тесно, очередь пробками вставала.
@@ -183,23 +162,24 @@ func launchExploitRun(m *model, inFile, outDir string, threads int, serials []st
 		_ = os.WriteFile(filepath.Join(outDir, exploit.SessionFile), b, 0644)
 	}
 
-	// лог-режим: дампы протокола туннеля и пречека. В ФАЙЛ — напрямую
-	// (без потерь), на экран — через ленту с дропом при переполнении.
-	if cfg.Debug {
-		hook := func(line string) {
-			r.writeLog("[dbg] " + line)
+	// Логирование: пишем АБСОЛЮТНО ВСЁ сетевое взаимодействие в log.txt
+	logLine := func(line string) {
+		r.writeLog(line)
+		if cfg.Debug {
 			select {
 			case r.eventsCh <- "[dbg] " + line:
 			default:
 			}
 		}
-		fwd.Debug = true
-		fwd.LogHook = hook
-		cloud.LogHook = hook
-	} else {
-		fwd.Debug = false
-		fwd.LogHook = nil
-		cloud.LogHook = nil
+	}
+	fwd.Debug = cfg.Debug
+	fwd.LogHook = logLine
+	cloud.LogHook = logLine
+	dhip.LogHook = func(format string, args ...any) {
+		logLine(fmt.Sprintf(format, args...))
+	}
+	exploit.LogHook = func(format string, args ...any) {
+		logLine(fmt.Sprintf(format, args...))
 	}
 
 	opts := exploit.Opts{
@@ -211,19 +191,16 @@ func launchExploitRun(m *model, inFile, outDir string, threads int, serials []st
 		CustomTexts: cfg.CustomTexts[:],
 		DummyLogin:  cfg.DummyLogin,
 		DummyPass:   cfg.DummyPass,
-		Logging:     cfg.Debug,
 		Resume:      resume,
 	}
 
 	go func() {
-		if proxy.IsEnabled() {
-			removed, remaining := proxy.CheckSession(ctx, func(format string, a ...any) {
-				r.logf(format, a...)
-			})
-			if removed > 0 {
-				r.logf("вырезано прокси с неверной авторизацией: %d (осталось: %d)", removed, remaining)
-			}
-		}
+		defer func() {
+			fwd.LogHook = nil
+			cloud.LogHook = nil
+			dhip.LogHook = nil
+			exploit.LogHook = nil
+		}()
 		exploit.RunExploit(ctx, serials, outDir, threads, opts, stats, r.eventsCh)
 	}()
 }
@@ -283,17 +260,7 @@ func launchTitlesRun(m *model, inFile string, threads int, cams []exploit.CamCre
 		CustomTexts: cfg.CustomTexts[:],
 	}
 
-	go func() {
-		if proxy.IsEnabled() {
-			removed, remaining := proxy.CheckSession(ctx, func(format string, a ...any) {
-				r.logf(format, a...)
-			})
-			if removed > 0 {
-				r.logf("вырезано прокси с неверной авторизацией: %d (осталось: %d)", removed, remaining)
-			}
-		}
-		exploit.RunTitles(ctx, cams, threads, opts, stats, r.eventsCh)
-	}()
+	go exploit.RunTitles(ctx, cams, threads, opts, stats, r.eventsCh)
 }
 
 func generateForm() *formState {
@@ -506,11 +473,6 @@ func prefixForm() *formState {
 	f.addInt(tr("порт"), 37777)
 	f.addInt(tr("потоков"), 500)
 	f.addStr(tr("выходной файл (база, без расширения)"), true, false)
-	f.addInt(tr("фильтр: 1=динамики (spkonly.txt), 2=все, 3=свой файл"), 2)
-	f.addStrCond(tr("файл со своим фильтром (для варианта 3)"), true, true, func(st *formState) bool {
-		return len(st.fields) > 4 && st.fields[4].intVal == 3
-	})
-	f.addBool(tr("записывать в файл только префиксы моделей которые удалось определить?"), false)
 	return f
 }
 
@@ -519,51 +481,6 @@ func startPrefixRun(m *model) {
 	port := m.form.fields[1].intVal
 	threads := m.threadsVal(2)
 	outBase := m.form.fields[3].strVal
-	filterChoice := m.form.fields[4].intVal
-	customFilterFile := m.form.fields[5].strVal
-	onlyKnown := m.form.fields[6].boolVal
-
-	var filterPatterns []string
-	if filterChoice == 1 {
-		// 1) Только с динамиками (spkonly.txt)
-		spkFile := "spkonly.txt"
-		if data, err := os.ReadFile(spkFile); err == nil {
-			for _, line := range strings.Split(string(data), "\n") {
-				line = strings.TrimSpace(line)
-				if line != "" && !strings.HasPrefix(line, "#") {
-					filterPatterns = append(filterPatterns, strings.ToUpper(line))
-				}
-			}
-		}
-	} else if filterChoice == 3 {
-		// 3) Свой вариант
-		if customFilterFile != "" {
-			if data, err := os.ReadFile(customFilterFile); err == nil {
-				for _, line := range strings.Split(string(data), "\n") {
-					line = strings.TrimSpace(line)
-					if line != "" && !strings.HasPrefix(line, "#") {
-						filterPatterns = append(filterPatterns, strings.ToUpper(line))
-					}
-				}
-			}
-		}
-	}
-
-	matchesFilter := func(model string) bool {
-		if model == "" {
-			return !onlyKnown
-		}
-		if len(filterPatterns) == 0 {
-			return true // вариант 2 (все)
-		}
-		up := strings.ToUpper(model)
-		for _, pat := range filterPatterns {
-			if strings.Contains(up, pat) {
-				return true
-			}
-		}
-		return false
-	}
 
 	var targets []string
 	if fileExists(tgt) {
@@ -583,7 +500,7 @@ func startPrefixRun(m *model) {
 
 	r := newRunState(runPrefix, tr("префиксы"))
 	r.preTotal = len(targets)
-	// лог — рядом с базой: base_prefix.txt / base_log.txt
+	// лог — рядом с базой: base_prefix.txt / base_serials.txt / base_log.txt
 	r.openLog(outBase + "_log.txt")
 	// Отмена по esc: ctx пробивает пробы (ironscan.Run ctx-aware).
 	ctx, cancel := context.WithCancel(context.Background())
@@ -597,14 +514,6 @@ func startPrefixRun(m *model) {
 	var mu sync.Mutex
 	var found []snModel
 	go func() {
-		if proxy.IsEnabled() {
-			removed, remaining := proxy.CheckSession(ctx, func(format string, a ...any) {
-				r.logf(format, a...)
-			})
-			if removed > 0 {
-				r.logf("вырезано прокси с неверной авторизацией: %d (осталось: %d)", removed, remaining)
-			}
-		}
 		err := ironscan.Run(ctx, ironscan.Options{
 			Targets:     targets,
 			Port:        port,
@@ -615,9 +524,6 @@ func startPrefixRun(m *model) {
 			atomic.AddInt64(&r.preScanned, 1)
 			sn := ironscan.SanitizeSerial(res.Serial)
 			if sn != "" {
-				if !matchesFilter(res.Model) {
-					return
-				}
 				atomic.AddInt64(&r.preFound, 1)
 				mu.Lock()
 				found = append(found, snModel{sn, res.Model})
@@ -658,21 +564,30 @@ func startPrefixRun(m *model) {
 		var prefixes []string
 		seenP := make(map[string]struct{})
 		for _, e := range uniq {
-			if !matchesFilter(e.model) {
+			if len(e.sn) < 10 {
 				continue
 			}
-			if len(e.sn) >= 10 {
-				p := e.sn[:10]
-				if _, ok := seenP[p]; !ok {
-					seenP[p] = struct{}{}
-					prefixes = append(prefixes, p)
+			p := e.sn[:10]
+			if _, ok := seenP[p]; !ok {
+				seenP[p] = struct{}{}
+				prefixes = append(prefixes, p)
+			}
+		}
+		if len(uniq) > 0 {
+			lines := make([]string, 0, len(uniq))
+			for _, e := range uniq {
+				if e.model != "" {
+					lines = append(lines, e.sn+";"+e.model)
+				} else {
+					lines = append(lines, e.sn)
 				}
 			}
+			_ = os.WriteFile(outBase+"_serials.txt", []byte(strings.Join(lines, "\n")+"\n"), 0644)
 		}
 		if len(prefixes) > 0 {
 			_ = os.WriteFile(outBase+"_prefix.txt", []byte(strings.Join(prefixes, "\n")+"\n"), 0644)
 			select {
-			case r.eventsCh <- fmt.Sprintf(tr("[+] префиксов: %d"), len(prefixes)):
+			case r.eventsCh <- fmt.Sprintf(tr("[+] серийников: %d, префиксов: %d"), len(uniq), len(prefixes)):
 			default:
 			}
 		}

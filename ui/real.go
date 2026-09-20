@@ -1,5 +1,15 @@
 package ui
 
+// real.go — оболочка экрана прогона для РЕАЛЬНЫХ движков krushitel
+// (exploit/scanner/cloud/xmlde/ironscan через go.mod replace).
+//
+// Режим exploit показывает ЖИВЫЕ СТРОКИ СЕССИЙ (Stats.SetRow): у каждого
+// серийника одна строка, обновляющаяся на месте по стадиям
+// (пречек → туннель → exploit… → PWNED!/ADDED/FAIL/OFFLINE).
+// Остальные режимы — лента событий, размер которой подстраивается
+// под высоту терминала. Help-строку здесь НЕ рисуем — её прижимает
+// к низу withBottom (иначе дубль).
+
 import (
 	"context"
 	"fmt"
@@ -106,9 +116,47 @@ func (r *runState) openLog(path string) {
 	r.logFile = f
 }
 
+// crashLines — последние строки для экрана краша (main recover читает
+// их после паники, когда модель уже недоступна). Кормится из writeLog
+// (сетевые дампы воркеров) и drain (лента событий).
+var crashLinesMu sync.Mutex
+var crashLines []string
+
+const crashLinesCap = 8
+
+func noteCrashLine(s string) {
+	s = stripANSI(s)
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return
+	}
+	crashLinesMu.Lock()
+	crashLines = append(crashLines, s)
+	if len(crashLines) > crashLinesCap {
+		crashLines = crashLines[len(crashLines)-crashLinesCap:]
+	}
+	crashLinesMu.Unlock()
+}
+
+// NoteCrashLine — экспорт для тестов/диагностики (внутри пакета — noteCrashLine).
+func NoteCrashLine(s string) { noteCrashLine(s) }
+
+// LastCrashLines — копия последних n строк для сплеша в main recover.
+func LastCrashLines(n int) []string {
+	crashLinesMu.Lock()
+	defer crashLinesMu.Unlock()
+	if n <= 0 || n > len(crashLines) {
+		n = len(crashLines)
+	}
+	out := make([]string, n)
+	copy(out, crashLines[len(crashLines)-n:])
+	return out
+}
+
 // writeLog — строка → файл с таймштампом (потокобезопасно; dbg-строки
 // из сотен туннелей пишутся напрямую, минуя каналы — иначе лог решето).
 func (r *runState) writeLog(line string) {
+	noteCrashLine(line)
 	if r.logFile == nil {
 		return
 	}
@@ -117,18 +165,6 @@ func (r *runState) writeLog(line string) {
 	r.logMu.Lock()
 	r.logFile.WriteString(fmt.Sprintf("[%s] %s\n", ts, plain))
 	r.logMu.Unlock()
-}
-
-// logf форматирует строку и пишет в лог-файл и в ленту событий UI.
-func (r *runState) logf(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	r.writeLog(msg)
-	if r.eventsCh != nil {
-		select {
-		case r.eventsCh <- msg:
-		default:
-		}
-	}
 }
 
 // closeLog — флуш и закрытие (выход из прогона).
@@ -189,6 +225,7 @@ func (r *runState) drain() {
 			if len(r.events) > max {
 				r.events = r.events[len(r.events)-max:]
 			}
+			noteCrashLine(ev)
 			r.writeLog(ev)
 		default:
 			return
@@ -437,7 +474,7 @@ func (r *runState) checkView() string {
 			sb.WriteString(centerLine(fmt.Sprintf("%s %.1f%%", bar(readLines, readTotal, 30), pct)) + "\n")
 			sb.WriteString(centerLine(fmt.Sprintf(tr("%d/%d строк"), readLines, readTotal)+
 				" | "+fmt.Sprintf(tr("серийников: %s"), green(fmt.Sprint(valid)))+
-				" | "+r.elapsed()) + "\n\n")
+				" | "+r.elapsed())+"\n\n")
 		} else {
 			sb.WriteString(centerLine(yellow(tr("читаю файл…"))) + "\n\n")
 		}
@@ -450,12 +487,9 @@ func (r *runState) checkView() string {
 	}
 	var sb strings.Builder
 	sb.WriteString(centerLine(fmt.Sprintf("%s %.1f%%", bar(st.Checked, st.Total, 30), pct)) + "\n")
-	orph := atomic.LoadInt64(&st.OrphanAlive) + atomic.LoadInt64(&st.OrphanDead)
-	sb.WriteString(centerLine(fmt.Sprintf("%d/%d | alive: %s | dead: %s | late: %s | orphan: %s | %s | %s | %s",
+	sb.WriteString(centerLine(fmt.Sprintf("%d/%d | alive: %s | dead: %s | %s | %s | %s",
 		st.Checked, st.Total,
 		green(fmt.Sprint(st.Alive)), red(fmt.Sprint(st.Dead)),
-		yellow(fmt.Sprint(atomic.LoadInt64(&st.Late))),
-		yellow(fmt.Sprint(orph)),
 		fmt.Sprintf(tr("%.0f/мин"), st.AliveRate),
 		fmt.Sprintf(tr("%.0f/сек"), st.Speed),
 		r.elapsed())) + "\n\n")

@@ -5,7 +5,6 @@ import (
 	"os"
 
 	"krushitel/fwd"
-	"krushitel/proxy"
 )
 
 // Settings — как в krushitel (config.json), но без dummy-полей: тут только
@@ -32,17 +31,11 @@ type Settings struct {
 	DummyLogin string `json:"dummy_login"`
 	DummyPass  string `json:"dummy_pass"`
 
-	Profile string `json:"profile"` // профиль облака: "smartpss" | "dmss"
+	// Discord RPC (pure fun): тогл вкл/выкл, app id зашит в бинарь.
+	DiscordRPC bool `json:"discord_rpc"`
 
-	// Дефолтные креды для проверки устройств (включая прошивки 2024+)
-	DefaultLogin     string   `json:"default_login"`     // логин по умолчанию (например, "admin")
-	DefaultPasswords []string `json:"default_passwords"` // список паролей для автоматической проверки
-	PasswordsFile    string   `json:"passwords_file"`    // путь к файлу со словарём паролей (passwords.txt / creds.txt)
-
-	// Прокси (http(s) / socks5): одиночный адрес или ротация из файла
-	ProxyEnabled bool   `json:"proxy_enabled"` // включен ли прокси
-	ProxyURL     string `json:"proxy_url"`     // http(s)://... или socks5://...
-	ProxyFile    string `json:"proxy_file"`    // путь к файлу со списком прокси (proxies.txt)
+	// Profile оставлен для совместимости старых config.json; всегда smartpss.
+	Profile string `json:"profile"`
 }
 
 const configFile = "config.json"
@@ -58,64 +51,20 @@ var cfg = Settings{
 	DummyLogin:  "krushitel",
 	DummyPass:   "TancuiPantera1337",
 	Profile:     "smartpss",
-	DefaultLogin: "admin",
-	DefaultPasswords: []string{
-		"admin",
-		"admin123",
-		"123456",
-		"password",
-		"tlJwpbo6",
-		"admin777",
-		"888888",
-		"dahua",
-	},
 }
 
 func loadSettings() {
 	data, err := os.ReadFile(configFile)
 	if err != nil {
-		fwd.SetDefaultCreds(cfg.DefaultLogin, cfg.DefaultPasswords)
 		return
 	}
 	_ = json.Unmarshal(data, &cfg)
 	if cfg.Lang == "" {
 		cfg.Lang = "ru"
 	}
-	if cfg.Profile == "" {
-		cfg.Profile = "smartpss"
-	}
-	if cfg.DefaultLogin == "" {
-		cfg.DefaultLogin = "admin"
-	}
-	if cfg.PasswordsFile != "" {
-		if fileList, err := fwd.LoadPasswordsFromFile(cfg.PasswordsFile); err == nil && len(fileList) > 0 {
-			cfg.DefaultPasswords = fileList
-		}
-	}
-	if len(cfg.DefaultPasswords) == 0 {
-		cfg.DefaultPasswords = []string{
-			"admin",
-			"admin123",
-			"123456",
-			"password",
-			"tlJwpbo6",
-			"admin777",
-			"888888",
-			"dahua",
-		}
-	}
+	// Dolynk/DMSS удалены: профиль всегда smartpss, что бы ни лежало в конфиге.
+	cfg.Profile = "smartpss"
 	_ = fwd.SetProfile(cfg.Profile)
-	fwd.SetDefaultCreds(cfg.DefaultLogin, cfg.DefaultPasswords)
-
-	// Настройка прокси подсистемы
-	proxy.SetEnabled(cfg.ProxyEnabled)
-	if cfg.ProxyURL != "" {
-		_ = proxy.SetSingle(cfg.ProxyURL)
-	}
-	if cfg.ProxyFile != "" {
-		_, _ = proxy.LoadFile(cfg.ProxyFile)
-	}
-
 	// Миграция старого единого текста: уходит в канал + слот 1, поле чистим.
 	if cfg.ChannelText == "" && cfg.Text != "" {
 		cfg.ChannelText = cfg.Text

@@ -1,10 +1,15 @@
-// Package dhip реализует работу с Dahua JSON-RPC (порт 5000): ChannelTitle и CustomTitle OSD.
+// title.go — замена Channel Title (имя канала) и CustomTitle (OSD-оверлей)
+// через DHIP RPC2 (порт 5000). Логика osd.py: ChannelTitle и CustomTitle —
+// независимые конфиги, каждый на свежем коннекте; после setConfig камера
+// рестартит OSD и рвёт TCP без ответа — обрыв после записи = «отправлено,
+// не подтверждено», не ошибка. CustomTitle — слотовый: texts[i] → слот i,
+// лишние слоты скрываются. Паттерн: configManager.getConfig → правка
+// table → setConfig, фоллбэк — flat-формат для камер без таблицы.
 package dhip
 
 import (
 	"encoding/json"
 	"fmt"
-	"krushitel/proxy"
 	"net"
 	"time"
 )
@@ -12,13 +17,48 @@ import (
 // DumpConfig — getConfig(name) → pretty-JSON таблицы. Для инспекции
 // конфигов (ChannelTitle/VideoWidget/что угодно) в тестовых тулзах.
 func DumpConfig(addr, password, name string, timeout time.Duration) (string, error) {
-	conn, err := proxy.DialTimeout("tcp", addr, timeout)
+	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return "", fmt.Errorf("connect: %w", err)
 	}
 	defer conn.Close()
 
 	sess, err := dhipLogin(conn, nil, password)
+	if err != nil {
+		return "", fmt.Errorf("login: %w", err)
+	}
+	table, err := configGetTable(conn, sess, 40, name)
+	if err != nil {
+		return "", err
+	}
+	raw, err := json.MarshalIndent(table, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+// DumpConfigDial — getConfig(name) → pretty-JSON поверх Dialer'а (туннель).
+// Юзер — admin (легаси-обёртка).
+func DumpConfigDial(dial Dialer, password, name string, timeout time.Duration) (string, error) {
+	return DumpConfigUserDial(dial, "admin", password, name, timeout)
+}
+
+// DumpConfigUserDial — getConfig(name) → pretty-JSON от имени указанного
+// юзера (нужно для dummy-юзеров из CVE: пароль хешируется с именем).
+func DumpConfigUserDial(dial Dialer, user, pass, name string, timeout time.Duration) (string, error) {
+	conn, err := dial()
+	if err != nil {
+		return "", fmt.Errorf("connect: %w", err)
+	}
+	defer conn.Close()
+
+	var sess int
+	if user != "" {
+		sess, err = dhipLoginAs(conn, nil, user, pass)
+	} else {
+		sess, err = dhipLogin(conn, nil, pass)
+	}
 	if err != nil {
 		return "", fmt.Errorf("login: %w", err)
 	}
@@ -61,12 +101,22 @@ func SetChannelTitleUserDial(dial Dialer, user, password, title string) error {
 		return fmt.Errorf("login: %w", err)
 	}
 
+	// Огр камеры: ChannelTitle.Name длиннее 32 символов отклоняется
+	// (setConfig result=false). Полный текст остаётся в CustomTitle.
+	name := title
+	if n := len([]rune(name)); n > 32 {
+		r := []rune(name)
+		name = string(r[:32])
+	}
+
 	table, err := configGetTable(conn, sess, 20, "ChannelTitle")
 	if err != nil {
-		// Камера не отдала таблицу — фоллбэк на flat-формат (как в oluhradar).
-		r, ferr := dhipCallCollectT(conn, "configManager.setConfig", map[string]any{
-			"ChannelTitle[0].Name": title,
-		}, sess, 21, nil, nil, nil, nil, CallTimeout)
+		// Устройство не отдало таблицу — фоллбэк на flat-формат по всем каналам 0..15.
+		flatParams := make(map[string]any)
+		for ch := 0; ch < 16; ch++ {
+			flatParams[fmt.Sprintf("ChannelTitle[%d].Name", ch)] = name
+		}
+		r, ferr := dhipCallCollectT(conn, "configManager.setConfig", flatParams, sess, 21, nil, nil, nil, nil, CallTimeout)
 		if ferr != nil {
 			return fmt.Errorf("setConfig flat: %w", ferr)
 		}
@@ -76,13 +126,6 @@ func SetChannelTitleUserDial(dial Dialer, user, password, title string) error {
 		return nil
 	}
 
-	// Огр камеры: ChannelTitle.Name длиннее 32 символов отклоняется
-	// (setConfig result=false). Полный текст остаётся в CustomTitle.
-	name := title
-	if n := len([]rune(name)); n > 32 {
-		r := []rune(name)
-		name = string(r[:32])
-	}
 	for i := range table {
 		if entry, ok := table[i].(map[string]any); ok {
 			entry["Name"] = name
@@ -213,7 +256,14 @@ func configGetTable(conn net.Conn, sess, id int, name string) ([]any, error) {
 	return table, nil
 }
 
-// configSetTable применяет таблицу конфига через configManager.setConfig.
+// configSetTable — configManager.setConfig {"name": name, "table": table}.
+// Нюанс: камера после применения крупного конфига (особенно OSD/VideoWidget)
+// часто рвёт TCP, НЕ отправляя ответ — уходит перезапускать OSD/энкодеры
+// (внешне: i/o timeout/EOF, туннель отваливается по heartbeat и
+// переподнимается). Конфиг при этом применяется — поэтому retryable-обрыв
+// после отправки трактуем как успех; факт подтверждается повторным getConfig.
+// возвращает applied=true, если камера ОТВЕТИЛА result=true; applied=false,
+// nil — обрыв после записи (конфиг отправлен, факт НЕ подтверждён).
 func configSetTable(conn net.Conn, sess, id int, name string, table any) (bool, error) {
 	r, err := dhipCallCollectT(conn, "configManager.setConfig", map[string]any{
 		"name":  name,
@@ -221,7 +271,7 @@ func configSetTable(conn net.Conn, sess, id int, name string, table any) (bool, 
 	}, sess, id, nil, nil, nil, nil, CallTimeout)
 	if err != nil {
 		if isRetryableConnErr(err) {
-			return false, nil // устройство может разорвать TCP при перезапуске сервиса OSD
+			return false, nil // обрыв после записи — норма, но не подтверждено
 		}
 		return false, fmt.Errorf("setConfig %s: %w", name, err)
 	}
@@ -264,4 +314,3 @@ func GetChannelCountDial(dial Dialer, user, password string) int {
 	}
 	return 1
 }
-

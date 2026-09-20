@@ -21,19 +21,14 @@ func Lang() string { return lang }
 // en — англ. словарь = translate.md. Ключи — точные русские строки.
 var en = map[string]string{
 	// ── баннер ──
-	"крушитель v1":   "krushitel v1",
-	"крушитель v1.3": "krushitel v1.3",
+	"крушитель v1": "krushitel v1",
 
 	// ── меню + выход ──
 	"что сегодня делаем?": "what are we doing today?",
 	"крушим)":             "crush some cams)",
-	"меняем текст на камерах":          "change text on cameras",
 	"генерируем SN с списка префиксов": "generate SNs from prefix list",
-	"чекаем список SN на валид":        "check SN list for validity",
 	"сканим серийники":                 "scan serials",
-	"че то делаем с .xml от smartpss":  "do something with smartpss .xml",
 	"расшифровываем .xml от smartpss":  "decrypt smartpss .xml",
-	"ищем префиксы по списку IP":       "find prefixes from IP list",
 	"ищем префиксы":                    "find prefixes",
 	"настройки":                        "settings",
 	"ошибка: %v":                       "error: %v",
@@ -55,41 +50,18 @@ var en = map[string]string{
 	"назад": "back",
 
 	// ── настройки + редактор титров ──
-	"всегда делать снапы (%s)":       "always take snapshots (%s)",
-	"всегда генерировать .xml (%s)":  "always generate .xml (%s)",
-	"OSDChanger (%s)":                "OSDChanger (%s)",
-	"снапы (%s)":                     "snapshots (%s)",
-	"настройки OSDChanger (%s)":      "OSDChanger settings (%s)",
-	"   └ channel title: %s":         "   └ channel title: %s",
-	"   └ OSD слот %d: %s":           "   └ OSD slot %d: %s",
-	"словарь паролей: дефолт (%d шт.)": "passwords dict: default (%d pcs.)",
-	"словарь паролей: %s (%d шт.)":     "passwords dict: %s (%d pcs.)",
-	"прокси (%s)":                     "proxy (%s)",
-	"   └ адрес прокси: %s":          "   └ proxy address: %s",
-	"   └ файл с списком прокси: %s": "   └ proxy list file: %s",
-	"файл с списком прокси":          "proxy list file",
-	"не настроен":                    "not configured",
-	"(пусто)":                        "(empty)",
-	"титры":                          "titles",
+	"снапы (%s)":                "snapshots (%s)",
+	"настройки OSDChanger (%s)": "OSDChanger settings (%s)",
+	"   └ channel title: %s":    "   └ channel title: %s",
+	"   └ OSD слот %d: %s":      "   └ OSD slot %d: %s",
+	"(пусто)":                   "(empty)",
+	"титры":                     "titles",
 	"впиши сюда что-то, что будут видеть все:":          "write something everyone will see:",
 	"! до %d символов ! пусто — поле не используется !": "! up to %d chars ! if empty - field will be unused !",
 	"ограничение: максимум %d символов (у тебя %d)":     "limit: max %d chars (you have %d)",
 	"channel title":       "channel title",
 	"текст OSD-слота %d ": "OSD slot %d text ",
 	"enter — сохранить  ·  esc — назад  ·  ctrl+c — выход": "enter — save  ·  esc — back  ·  ctrl+c — quit",
-
-	// ── редакторы словарей и прокси ──
-	"словарь паролей":                                                         "passwords dictionary",
-	"путь к файлу со словарём (passwords.txt / creds.txt):":                   "path to dictionary file (passwords.txt / creds.txt):",
-	"формат: по одному паролю на строку, либо user:pass. пусто = дефолт":     "format: one password per line, or user:pass. empty = default",
-	"такого файла нет!":                                                      "no such file!",
-	"файл пуст или ошибка чтения":                                             "file is empty or read error",
-	"одиночный прокси":                                                        "single proxy",
-	"введи адрес прокси (http/https/socks5):":                                 "enter proxy address (http/https/socks5):",
-	"пример: socks5://127.0.0.1:1080 или http://user:pass@1.2.3.4:8080. пусто = очистить": "example: socks5://127.0.0.1:1080 or http://user:pass@1.2.3.4:8080. empty = clear",
-	"неверный формат прокси (http/https/socks5://host:port)":                 "invalid proxy format (http/https/socks5://host:port)",
-	"путь к файлу со списком прокси (proxies.txt):":                           "path to proxy list file (proxies.txt):",
-	"формат: по одному адресу на строку. ротация round-robin. пусто = очистить": "format: one address per line. round-robin rotation. empty = clear",
 
 	// ── редактор dummy-кредов ──
 	"добавить нового юзера":              "add dummy user",
@@ -138,10 +110,8 @@ var en = map[string]string{
 	"порт": "port",
 	"выходной файл (база, без расширения)": "output file (base, no extension)",
 	"[-] папка не создается: ":             "[-] can't create folder: ",
-	"[-] файл без хостов :(":                                                  "[-] file has no hosts :(",
-	"записывать в файл только префиксы моделей которые удалось определить?": "save to file only prefixes of identified models?",
-	"[+] серийников: %d, префиксов: %d":                                       "[+] serials: %d, prefixes: %d",
-	"[+] префиксов: %d":                                                       "[+] prefixes: %d",
+	"[-] файл без хостов :(":               "[-] file has no hosts :(",
+	"[+] серийников: %d, префиксов: %d":    "[+] serials: %d, prefixes: %d",
 	"  модель: ":   "  model: ",
 	"  прошивка: ": "  firmware: ",
 
@@ -159,14 +129,12 @@ var en = map[string]string{
 	"туннель: перезапуск демона (попытка %d)": "tunnel: daemon restart (attempt %d)",
 	"туннель поднят с %d-й попытки":           "tunnel up on attempt %d",
 	"туннель: попытка %d не удалась (%v)":     "tunnel: attempt %d failed (%v)",
-	"[+] рескан: %d серийников":               "[+] rescan: %d serials",
 
 	// ── движок exploit ──
 	"ошибка чтения входного файла: ":      "input file read error: ",
 	"ошибка открытия входного файла: ":    "input file open error: ",
 	"ошибка создания выходного файла: ":   "output file creation error: ",
 	"ошибка открытия results.txt: ":       "results.txt open error: ",
-	"ошибка открытия results.csv: ":       "results.csv open error: ",
 	"ошибка открытия done.txt: ":          "done.txt open error: ",
 	"ошибка открытия nostun.txt: ":        "nostun.txt open error: ",
 	"ошибка создания папки результатов: ": "results folder creation error: ",
@@ -216,6 +184,7 @@ var en = map[string]string{
 	"%s — устройство требует tunnel-auth (type 1) — без кредов туннель невозможен, из очереди исключён": "%s — device requires tunnel-auth (type 1) — no creds, tunnel impossible, excluded from queue",
 	"%s — исчерпан (%d туннель-подъёма за прогон) — из очереди исключён окончательно":                   "%s — exhausted (%d tunnel attempts this run) — excluded from queue permanently",
 	"%s — туннель не встал (%v) — в ре-очередь (попытка %d/%d)":                                         "%s — tunnel failed (%v) — re-queued (attempt %d/%d)",
+	"конвейер: %d санитаров (хендшейк) → %d воркеров (эксплойт)":                                        "pipeline: %d nurses (handshake) → %d workers (exploit)",
 	"autogen .xml (%s)": "autogen .xml (%s)",
 	"по дефолту/by default: krushitel:TancuiPantera1337": "by default: krushitel:TancuiPantera1337",
 	"крушим":               "crush some cams",
@@ -230,6 +199,26 @@ var en = map[string]string{
 	"читаю файл…":      "reading file…",
 	"серийников: %s":   "serials: %s",
 	"%.0f/мин":         "%.0f/min",
+
+	// ── discord rpc ──
+	"сканит камеры через крушитель v%s": "scanning cam's with krushitel v%s",
+	"в меню":                            "in menu",
+	"discord rpc (%s)":                  "discord rpc (%s)",
+
+	// ── автообновление ──
+	"обновление":                                   "update",
+	"доступна новая версия: v%s (у тебя v%s)":       "new version available: v%s (you have v%s)",
+	"обновить":                                      "update",
+	"позже":                                         "later",
+	"качаю обновление...":                          "downloading update...",
+	"применяю обновление...":                       "applying update...",
+	"перезапускаюсь...":                            "restarting...",
+	"не вышло обновиться: %v":                      "update failed: %v",
+	"enter — дальше":                               "enter — continue",
+	"esc — отмена · q — выход":                     "esc — cancel · q — quit",
+
+	// ── краш-сплеш ──
+	"нажми любую клавишу...": "press any key...",
 }
 
 // Tr — перевод строки по словарю; при ru (или отсутствии ключа) — как есть.

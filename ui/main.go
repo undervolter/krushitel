@@ -5,18 +5,18 @@ package ui
 // вместо отдельной tea.Program на каждый промпт, как в старом ui.go.
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"krushitel/exploit"
-	"krushitel/fwd"
 	"krushitel/i18n"
-	"krushitel/proxy"
+	"krushitel/update"
 )
 
 // tr — обёртка локализации: ru = ключ как есть, en = перевод из словаря.
@@ -32,11 +32,10 @@ const (
 	stMsg
 	stSettings
 	stTitleEdit
-	stDummyEdit     // редактор dummy-кредов (login:passwd)
-	stPasswordsEdit // редактор пути к словарю паролей (passwords.txt)
-	stProxyEdit     // редактор одиночного прокси
-	stProxyFileEdit // редактор пути к пулу прокси (proxies.txt)
-	stGreet         // приветствие: выбор языка при первом запуске
+	stDummyEdit // редактор dummy-кредов (login:passwd)
+	stGreet     // приветствие: выбор языка при первом запуске
+	stUpdate    // вопрос про обнову (есть релиз новее)
+	stUpdating  // скачивание + применение обновы
 )
 
 type tickMsg time.Time
@@ -62,25 +61,64 @@ type model struct {
 	dummyInput textinput.Model
 	dummyErr   string
 
-	passwordsInput textinput.Model
-	passwordsErr   string
-
-	proxyInput textinput.Model
-	proxyErr   string
-
-	proxyFileInput textinput.Model
-	proxyFileErr   string
+	upd       *update.Release // свежий релиз, если Check нашёл
+	updCancel context.CancelFunc
+	updCur    int // курсор промпта обновы: 0 = обновить, 1 = позже
 }
 
+// teaProg/stdRealOut — для рестарта после обновы: гасим alt-экран и
+// стартуем свежий бинарник с живым stdout (os.Stdout к тому моменту
+// уже подменён на devnull).
+var (
+	teaProg    *tea.Program
+	stdRealOut *os.File
+)
+
 func Run() {
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	realStdout := os.Stdout
+	if devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0); err == nil {
+		os.Stdout = devNull
+		os.Stderr = devNull
+		defer func() {
+			os.Stdout = realStdout
+			_ = devNull.Close()
+		}()
+	}
+	// Автоапдейт: хвосты прошлой подмены долой, проверка свежего
+	// релиза с коротким таймаутом. Без сети/ошибки — молча как обычно.
+	update.Sweep()
+	ctx, cancel := context.WithTimeout(context.Background(), update.CheckTimeout)
+	upd, _ := update.Check(ctx)
+	cancel()
+	// WithoutCatchPanics: паники TUI-потока идут к нам, а не глотаются
+	// bubbletea ("program was killed") — иначе наш сплеш никогда не покажется.
+	p := tea.NewProgram(initialModel(upd), tea.WithAltScreen(), tea.WithOutput(realStdout), tea.WithoutCatchPanics())
+	teaProg = p
+	stdRealOut = realStdout
+	defer discordStop() // rpc always-on: гасим presence при любом выходе
+	// Паника TUI-потока: чиним терминал, дампим стек, рисуем сплеш.
+	// Зарегистрирован ПОСЛЕ дефера ресторa stdout — срабатывает первым.
+	defer func() {
+		if r := recover(); r != nil {
+			stack := debug.Stack()
+			crashDump(stack, r)
+			_ = p.ReleaseTerminal() // best effort: raw-режим, курсор, буфер
+			reason := strings.TrimSpace(strings.SplitN(fmt.Sprintf("%v", r), "\n", 2)[0])
+			if reason == "" {
+				reason = "unknown (see crash.log)"
+			}
+			fmt.Fprint(realStdout, CrashSplash(reason, string(stack)))
+			WaitForKey(realStdout)
+			os.Exit(1)
+		}
+	}()
 	if _, err := p.Run(); err != nil {
-		fmt.Printf(tr("ошибка: %v")+"\n", err)
+		fmt.Fprintf(realStdout, tr("ошибка: %v")+"\n", err)
 		os.Exit(1)
 	}
 }
 
-func initialModel() model {
+func initialModel(upd *update.Release) model {
 	loadSettings()
 	ti := textinput.New()
 	ti.Placeholder = "pwned by krushitel"
@@ -90,28 +128,13 @@ func initialModel() model {
 	di.Placeholder = "login:passwd"
 	di.CharLimit = 65 // логин 32 + ':' + пароль 32
 	di.Width = 50
-	pi := textinput.New()
-	pi.Placeholder = "passwords.txt"
-	pi.CharLimit = 256
-	pi.Width = 60
-
-	proxi := textinput.New()
-	proxi.Placeholder = "socks5://127.0.0.1:1080 или http://user:pass@1.2.3.4:8080"
-	proxi.CharLimit = 256
-	proxi.Width = 60
-
-	proxfi := textinput.New()
-	proxfi.Placeholder = "proxies.txt"
-	proxfi.CharLimit = 256
-	proxfi.Width = 60
-
-	m := model{
-		state:          stMenu,
-		titleInput:     ti,
-		dummyInput:     di,
-		passwordsInput: pi,
-		proxyInput:     proxi,
-		proxyFileInput: proxfi,
+	m := model{state: stMenu, titleInput: ti, dummyInput: di}
+	if upd != nil {
+		// Есть релиз новее — сначала вопрос про обнову, меню потом.
+		i18n.SetLang(cfg.Lang)
+		m.upd = upd
+		m.state = stUpdate
+		return m
 	}
 	if cfg.IsActivated {
 		// уже активированы — сразу в меню на сохранённом языке
@@ -142,12 +165,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state == stRun && m.run != nil {
 			m.run.h = m.h // высота терминала — для размеров сессий/логов
 			m.run.drain()
-			return m, tickCmd()
 		}
+		if m.state == stUpdating {
+			if cmd := m.checkUpdDone(); cmd != nil {
+				return m, cmd
+			}
+		}
+		discordTick(m.run) // rpc always-on: хоть в меню, хоть в прогоне
 		return m, tickCmd()
 
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC {
+			discordStop()
 			m.quitting = true
 			return m, tea.Quit
 		}
@@ -171,12 +200,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateTitleEdit(msg)
 		case stDummyEdit:
 			return m.updateDummyEdit(msg)
-		case stPasswordsEdit:
-			return m.updatePasswordsEdit(msg)
-		case stProxyEdit:
-			return m.updateProxyEdit(msg)
-		case stProxyFileEdit:
-			return m.updateProxyFileEdit(msg)
+		case stUpdate:
+			return m.updateUpdatePrompt(msg)
+		case stUpdating:
+			return m.updateUpdating(msg)
 		}
 	}
 	return m, nil
@@ -246,11 +273,11 @@ func (m model) greetView() string {
 
 var mainMenuOptions = []string{
 	"крушим)",
-	"меняем текст на камерах",
+	"OSDChanger",
 	"генерируем SN с списка префиксов",
-	"чекаем список SN на валид",
-	"че то делаем с .xml от smartpss",
-	"ищем префиксы по списку IP",
+	"сканим серийники",
+	"расшифровываем .xml от smartpss",
+	"ищем префиксы",
 	"настройки",
 }
 
@@ -339,6 +366,7 @@ func (m model) updateRun(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch strings.ToLower(msg.String()) {
 	case "q":
 		m.run.closeLog()
+		discordStop()
 		m.quitting = true
 		return m, tea.Quit
 	case "b":
@@ -419,6 +447,174 @@ func (m model) updateMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// ── автообновление ─────────────────────────────────────────────────
+
+// updEnter — дальше как обычно: первый запуск → приветствие, иначе меню.
+// Заодно отменяет недокачанную установку.
+func (m *model) updEnter() {
+	if m.updCancel != nil {
+		m.updCancel()
+		m.updCancel = nil
+	}
+	m.upd = nil
+	if cfg.IsActivated {
+		m.state = stMenu
+	} else {
+		m.state = stGreet
+	}
+}
+
+// updateUpdatePrompt — вопрос про обнову: стрелки + enter, дубли y/n.
+// y (и н) — качаем, n/esc — пропускаем, q — выход.
+func (m model) updateUpdatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyUp, tea.KeyShiftTab:
+		m.updCur = (m.updCur - 1 + 2) % 2
+		return m, nil
+	case tea.KeyDown, tea.KeyTab:
+		m.updCur = (m.updCur + 1) % 2
+		return m, nil
+	case tea.KeyEnter:
+		if m.updCur == 0 {
+			return m.updStart()
+		}
+		m.updEnter()
+		return m, nil
+	case tea.KeyEsc:
+		m.updEnter()
+		return m, nil
+	case tea.KeyRunes:
+		switch strings.ToLower(string(msg.Runes)) {
+		case "y", "н":
+			return m.updStart()
+		case "n", "т":
+			m.updEnter()
+			return m, nil
+		case "q", "й":
+			m.quitting = true
+			return m, tea.Quit
+		}
+	}
+	return m, nil
+}
+
+// updStart — погнали качать: стейт прогресса + воркер установки в фоне.
+func (m model) updStart() (tea.Model, tea.Cmd) {
+	ctx, cancel := context.WithCancel(context.Background())
+	m.updCancel = cancel
+	m.state = stUpdating
+	rel := m.upd
+	go update.Install(ctx, rel)
+	return m, nil
+}
+
+// updateUpdating — экран прогресса. Esc — отмена и дальше, enter при
+// ошибке — дальше, q — выход. Успех тик сам уводит в рестарт.
+func (m model) updateUpdating(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	_, _, _, err, finished := update.St.Snap()
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.updEnter()
+		return m, nil
+	case tea.KeyEnter:
+		if finished && err != nil {
+			m.updEnter()
+			return m, nil
+		}
+	case tea.KeyRunes:
+		if r := strings.ToLower(string(msg.Runes)); r == "q" || r == "й" {
+			m.quitting = true
+			return m, tea.Quit
+		}
+	}
+	return m, nil
+}
+
+// checkUpdDone — установка докачалась и встала: гасим alt-экран,
+// стартуем свежий бинарник, выходим. nil = ещё качается/ошибка.
+func (m *model) checkUpdDone() tea.Cmd {
+	stage, _, _, _, finished := update.St.Snap()
+	if !finished || stage != update.StageDone {
+		return nil
+	}
+	m.quitting = true
+	if teaProg != nil {
+		_ = teaProg.ReleaseTerminal()
+	}
+	_ = update.Restart(stdRealOut, stdRealOut)
+	return tea.Quit
+}
+
+func (m model) updatePromptView() string {
+	// Уведомление: жёлтый бокс по центру, фона нет вообще.
+	body := []string{
+		fmt.Sprintf(tr("доступна новая версия: v%s (у тебя v%s)"), m.upd.Version, update.CurrentVersion),
+		"",
+		dim(firstNoteLine(m.upd.Notes)),
+		"",
+	}
+	for i, opt := range []string{tr("обновить"), tr("позже")} {
+		if i == m.updCur {
+			body = append(body, "▶  "+styleBold.Render(opt))
+		} else {
+			body = append(body, "   "+styleDim.Render(opt))
+		}
+	}
+	box := noticeBox(tr("обновление"), body, noticeYellow, noticeWidth(m.w))
+	return centerBox(box, m.w, m.h)
+}
+
+func (m model) updateProgressView() string {
+	stage, done, total, err, _ := update.St.Snap()
+	if err != nil {
+		// Предупреждение: фон чуть темнее, бокс подсвечен красным.
+		box := noticeBox(tr("обновление"),
+			[]string{
+				red(fmt.Sprintf(tr("не вышло обновиться: %v"), err)),
+				"",
+				dim(tr("enter — дальше")),
+			},
+			noticeRed, noticeWidth(m.w))
+		return overlayWarning(box, m.w, m.h)
+	}
+	var body string
+	switch stage {
+	case update.StageApply:
+		body = cyan(tr("применяю обновление..."))
+	case update.StageDone:
+		body = green(tr("перезапускаюсь..."))
+	default:
+		body = cyan(tr("качаю обновление...")) + "\n\n" + updBar(done, total)
+	}
+	box := noticeBox(tr("обновление"), strings.Split(body, "\n"), noticeYellow, noticeWidth(m.w))
+	return centerBox(box, m.w, m.h)
+}
+
+// firstNoteLine — первая непустая строка релиз-ноутов, ужатая до 100 рун.
+func firstNoteLine(notes string) string {
+	for _, ln := range strings.Split(notes, "\n") {
+		if ln = strings.TrimSpace(ln); ln != "" {
+			return cutStr(ln, 100)
+		}
+	}
+	return ""
+}
+
+// updBar — [####----] 42% · 3.1/7.4 MB; без total — только мегабайты.
+func updBar(done, total int64) string {
+	const w = 24
+	if total <= 0 {
+		return fmt.Sprintf("%.1f MB", float64(done)/1048576)
+	}
+	if done > total {
+		done = total
+	}
+	fill := int(done * w / total)
+	bar := "[" + strings.Repeat("#", fill) + strings.Repeat("-", w-fill) + "]"
+	return fmt.Sprintf("%s %d%% · %.1f/%.1f MB", bar, done*100/total,
+		float64(done)/1048576, float64(total)/1048576)
+}
+
 // ── настройки ────────────────────────────────────────────────────────
 
 // settingsRow — строка меню настроек.
@@ -438,11 +634,8 @@ const (
 	rowEditCT2   // OSD слот 3
 	rowEditCT3   // OSD слот 4
 	rowDummy     // dummy-креды: ввод login:passwd одной строкой
-	rowPasswords // словарь паролей (passwords.txt)
-	rowProxyToggle // прокси: вкл / выкл
-	rowProxySingle // одиночный прокси (http/socks5://...)
-	rowProxyFile   // список прокси из файла (proxies.txt)
 	rowDebug     // лог-режим: дампы протокола облака в ленту логов
+	rowDiscord    // discord rpc: вкл/выкл
 	rowLang        // язык: «язык: русский» / «language: english»
 	rowBack
 )
@@ -451,9 +644,9 @@ const (
 // только когда автозамена включена.
 func (m model) settingsRows() []settingsRow {
 	rows := []settingsRow{
-		{fmt.Sprintf(tr("всегда делать снапы (%s)"), onOff(cfg.Snaps)), rowSnaps},
-		{fmt.Sprintf(tr("всегда генерировать .xml (%s)"), onOff(cfg.XML)), rowXML},
-		{fmt.Sprintf(tr("OSDChanger (%s)"), onOff(cfg.Titles)), rowTitles},
+		{fmt.Sprintf(tr("снапы (%s)"), onOff(cfg.Snaps)), rowSnaps},
+		{fmt.Sprintf(tr("autogen .xml (%s)"), onOff(cfg.XML)), rowXML},
+		{fmt.Sprintf(tr("настройки OSDChanger (%s)"), onOff(cfg.Titles)), rowTitles},
 	}
 	if cfg.Titles {
 		rows = append(rows,
@@ -470,41 +663,10 @@ func (m model) settingsRows() []settingsRow {
 	if cfg.Lang == "en" {
 		langLabel = "language: english"
 	}
-	passLabel := fmt.Sprintf(tr("словарь паролей: дефолт (%d шт.)"), len(cfg.DefaultPasswords))
-	if cfg.PasswordsFile != "" {
-		passLabel = fmt.Sprintf(tr("словарь паролей: %s (%d шт.)"), filepath.Base(cfg.PasswordsFile), len(cfg.DefaultPasswords))
-	}
-	proxyStatus := tr("выкл")
-	if cfg.ProxyEnabled {
-		if cfg.ProxyURL == "" && cfg.ProxyFile == "" {
-			proxyStatus = tr("не настроен")
-		} else {
-			proxyStatus = tr("вкл")
-		}
-	}
 	rows = append(rows,
 		settingsRow{tr("добавить нового юзера"), rowDummy},
-		settingsRow{passLabel, rowPasswords},
-		settingsRow{fmt.Sprintf(tr("прокси (%s)"), proxyStatus), rowProxyToggle},
-	)
-	if cfg.ProxyEnabled {
-		singleVal := cfg.ProxyURL
-		if singleVal == "" {
-			singleVal = tr("(пусто)")
-		}
-		fileVal := cfg.ProxyFile
-		if fileVal == "" {
-			fileVal = tr("(пусто)")
-		} else {
-			fileVal = filepath.Base(fileVal)
-		}
-		rows = append(rows,
-			settingsRow{fmt.Sprintf(tr("   └ адрес прокси: %s"), singleVal), rowProxySingle},
-			settingsRow{fmt.Sprintf(tr("   └ файл с списком прокси: %s"), fileVal), rowProxyFile},
-		)
-	}
-	rows = append(rows,
 		settingsRow{fmt.Sprintf(tr("лог-режим (%s)"), onOff(cfg.Debug)), rowDebug},
+		settingsRow{fmt.Sprintf(tr("discord rpc (%s)"), onOff(cfg.DiscordRPC)), rowDiscord},
 		settingsRow{langLabel, rowLang},
 		settingsRow{tr("назад"), rowBack},
 	)
@@ -558,22 +720,15 @@ func (m model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case rowDummy:
 			m.openDummyEdit()
 			return m, textinput.Blink
-		case rowPasswords:
-			m.openPasswordsEdit()
-			return m, textinput.Blink
-		case rowProxyToggle:
-			cfg.ProxyEnabled = !cfg.ProxyEnabled
-			proxy.SetEnabled(cfg.ProxyEnabled)
-			saveSettings()
-		case rowProxySingle:
-			m.openProxyEdit()
-			return m, textinput.Blink
-		case rowProxyFile:
-			m.openProxyFileEdit()
-			return m, textinput.Blink
 		case rowDebug:
 			cfg.Debug = !cfg.Debug
 			saveSettings()
+		case rowDiscord:
+			cfg.DiscordRPC = !cfg.DiscordRPC
+			saveSettings()
+			if !cfg.DiscordRPC {
+				discordStop()
+			}
 		case rowLang:
 			if cfg.Lang == "en" {
 				cfg.Lang = "ru"
@@ -621,12 +776,10 @@ func (m model) View() string {
 		content, help = m.titleEditView(), tr("enter — сохранить  ·  esc — назад  ·  ctrl+c — выход")
 	case stDummyEdit:
 		content, help = m.dummyEditView(), tr("enter — сохранить  ·  esc — назад  ·  ctrl+c — выход")
-	case stPasswordsEdit:
-		content, help = m.passwordsEditView(), tr("enter — сохранить  ·  esc — назад  ·  ctrl+c — выход")
-	case stProxyEdit:
-		content, help = m.proxyEditView(), tr("enter — сохранить  ·  esc — назад  ·  ctrl+c — выход")
-	case stProxyFileEdit:
-		content, help = m.proxyFileEditView(), tr("enter — сохранить  ·  esc — назад  ·  ctrl+c — выход")
+	case stUpdate:
+		content, help = m.updatePromptView(), ""
+	case stUpdating:
+		content, help = m.updateProgressView(), tr("esc — отмена · q — выход")
 	}
 	return withBottom(content, help, m.h)
 }
@@ -825,195 +978,6 @@ func (m model) dummyEditView() string {
 	sb.WriteString("\n" + centerLine(dim(tr("по дефолту/by default: krushitel:TancuiPantera1337"))) + "\n")
 	if m.dummyErr != "" {
 		sb.WriteString("\n" + centerLine(red("↑ "+m.dummyErr)) + "\n")
-	}
-	return sb.String()
-}
-
-// openPasswordsEdit — редактор пути к словарю паролей (passwords.txt / creds.txt).
-func (m *model) openPasswordsEdit() {
-	m.passwordsInput.SetValue(cfg.PasswordsFile)
-	m.passwordsErr = ""
-	m.passwordsInput.Focus()
-	m.state = stPasswordsEdit
-}
-
-func (m model) updatePasswordsEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyEsc:
-		m.passwordsErr = ""
-		m.state = stSettings
-		return m, nil
-	case tea.KeyEnter:
-		val := strings.TrimSpace(m.passwordsInput.Value())
-		val = strings.ReplaceAll(val, "\r", "")
-		val = strings.ReplaceAll(val, "\n", "")
-		if val == "" {
-			cfg.PasswordsFile = ""
-			cfg.DefaultPasswords = []string{
-				"admin", "admin123", "123456", "password", "tlJwpbo6", "admin777", "888888", "dahua",
-			}
-			fwd.SetDefaultCreds(cfg.DefaultLogin, cfg.DefaultPasswords)
-			saveSettings()
-			m.passwordsErr = ""
-			m.state = stSettings
-			return m, nil
-		}
-		if !fileExists(val) {
-			m.passwordsErr = tr("такого файла нет!")
-			return m, nil
-		}
-		list, err := fwd.LoadPasswordsFromFile(val)
-		if err != nil || len(list) == 0 {
-			m.passwordsErr = tr("файл пуст или ошибка чтения")
-			return m, nil
-		}
-		cfg.PasswordsFile = val
-		cfg.DefaultPasswords = list
-		fwd.SetDefaultCreds(cfg.DefaultLogin, cfg.DefaultPasswords)
-		saveSettings()
-		m.passwordsErr = ""
-		m.state = stSettings
-		return m, nil
-	}
-	var cmd tea.Cmd
-	m.passwordsInput, cmd = m.passwordsInput.Update(msg)
-	return m, cmd
-}
-
-func (m model) passwordsEditView() string {
-	var sb strings.Builder
-	sb.WriteString(bannerBlock())
-	sb.WriteString(strings.Repeat("\n", 4))
-	sb.WriteString(panelS(tr("словарь паролей")) + "\n\n")
-	sb.WriteString(centerLine(cyan(tr("путь к файлу со словарём (passwords.txt / creds.txt):"))) + "\n")
-	sb.WriteString(centerLine(m.passwordsInput.View()) + "\n")
-	sb.WriteString("\n" + centerLine(dim(tr("формат: по одному паролю на строку, либо user:pass. пусто = дефолт"))) + "\n")
-	if m.passwordsErr != "" {
-		sb.WriteString("\n" + centerLine(red("↑ "+m.passwordsErr)) + "\n")
-	}
-	return sb.String()
-}
-
-// ── редакторы прокси ─────────────────────────────────────────────────
-
-func (m *model) openProxyEdit() {
-	m.proxyInput.SetValue(cfg.ProxyURL)
-	m.proxyErr = ""
-	m.proxyInput.Focus()
-	m.state = stProxyEdit
-}
-
-func (m model) updateProxyEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyEsc:
-		m.proxyErr = ""
-		m.state = stSettings
-		return m, nil
-	case tea.KeyEnter:
-		val := strings.TrimSpace(m.proxyInput.Value())
-		val = strings.ReplaceAll(val, "\r", "")
-		val = strings.ReplaceAll(val, "\n", "")
-		if val != "" {
-			if err := proxy.SetSingle(val); err != nil {
-				m.proxyErr = tr("неверный формат прокси (http/https/socks5://host:port)")
-				return m, nil
-			}
-			cfg.ProxyURL = val
-			cfg.ProxyEnabled = true
-			proxy.SetEnabled(true)
-		} else {
-			_ = proxy.SetSingle("")
-			cfg.ProxyURL = ""
-			if cfg.ProxyFile == "" {
-				cfg.ProxyEnabled = false
-				proxy.SetEnabled(false)
-			}
-		}
-		saveSettings()
-		m.proxyErr = ""
-		m.state = stSettings
-		return m, nil
-	}
-	var cmd tea.Cmd
-	m.proxyInput, cmd = m.proxyInput.Update(msg)
-	return m, cmd
-}
-
-func (m model) proxyEditView() string {
-	var sb strings.Builder
-	sb.WriteString(bannerBlock())
-	sb.WriteString(strings.Repeat("\n", 4))
-	sb.WriteString(panelS(tr("одиночный прокси")) + "\n\n")
-	sb.WriteString(centerLine(cyan(tr("введи адрес прокси (http/https/socks5):"))) + "\n")
-	sb.WriteString(centerLine(m.proxyInput.View()) + "\n")
-	sb.WriteString("\n" + centerLine(dim(tr("пример: socks5://127.0.0.1:1080 или http://user:pass@1.2.3.4:8080. пусто = очистить"))) + "\n")
-	if m.proxyErr != "" {
-		sb.WriteString("\n" + centerLine(red("↑ "+m.proxyErr)) + "\n")
-	}
-	return sb.String()
-}
-
-func (m *model) openProxyFileEdit() {
-	m.proxyFileInput.SetValue(cfg.ProxyFile)
-	m.proxyFileErr = ""
-	m.proxyFileInput.Focus()
-	m.state = stProxyFileEdit
-}
-
-func (m model) updateProxyFileEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyEsc:
-		m.proxyFileErr = ""
-		m.state = stSettings
-		return m, nil
-	case tea.KeyEnter:
-		val := strings.TrimSpace(m.proxyFileInput.Value())
-		val = strings.ReplaceAll(val, "\r", "")
-		val = strings.ReplaceAll(val, "\n", "")
-		if val == "" {
-			cfg.ProxyFile = ""
-			_, _ = proxy.LoadFile("")
-			if cfg.ProxyURL == "" {
-				cfg.ProxyEnabled = false
-				proxy.SetEnabled(false)
-			}
-			saveSettings()
-			m.proxyFileErr = ""
-			m.state = stSettings
-			return m, nil
-		}
-		if !fileExists(val) {
-			m.proxyFileErr = tr("такого файла нет!")
-			return m, nil
-		}
-		count, err := proxy.LoadFile(val)
-		if err != nil || count == 0 {
-			m.proxyFileErr = tr("файл пуст или ошибка чтения")
-			return m, nil
-		}
-		cfg.ProxyFile = val
-		cfg.ProxyEnabled = true
-		proxy.SetEnabled(true)
-		saveSettings()
-		m.proxyFileErr = ""
-		m.state = stSettings
-		return m, nil
-	}
-	var cmd tea.Cmd
-	m.proxyFileInput, cmd = m.proxyFileInput.Update(msg)
-	return m, cmd
-}
-
-func (m model) proxyFileEditView() string {
-	var sb strings.Builder
-	sb.WriteString(bannerBlock())
-	sb.WriteString(strings.Repeat("\n", 4))
-	sb.WriteString(panelS(tr("файл с списком прокси")) + "\n\n")
-	sb.WriteString(centerLine(cyan(tr("путь к файлу со списком прокси (proxies.txt):"))) + "\n")
-	sb.WriteString(centerLine(m.proxyFileInput.View()) + "\n")
-	sb.WriteString("\n" + centerLine(dim(tr("формат: по одному адресу на строку. ротация round-robin. пусто = очистить"))) + "\n")
-	if m.proxyFileErr != "" {
-		sb.WriteString("\n" + centerLine(red("↑ "+m.proxyFileErr)) + "\n")
 	}
 	return sb.String()
 }

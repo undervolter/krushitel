@@ -104,9 +104,17 @@ func LoadPasswordsFromFile(path string) ([]string, error) {
 	return out, nil
 }
 
-// Start поднимает туннель и ждёт готовности листенеров (до 45 сек).
+// Start поднимает туннель и ждёт готовности листенеров.
 // dtype: 0 = без авторизации (CVE-2021-33044), 1 = с кредами (p2p-channel V2).
 func Start(serial string, specs []PortSpec, dtype int, user, pass string) (*Forwarder, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return StartContext(ctx, serial, specs, dtype, user, pass)
+}
+
+// StartContext поднимает туннель с привязкой к ctx: без искусственных таймаутов
+// готовности, как в SmartPSS. Завершается по готовности, терминальной ошибке или ctx.Done().
+func StartContext(ctx context.Context, serial string, specs []PortSpec, dtype int, user, pass string) (*Forwarder, error) {
 	idxs := make([]int, len(specs))
 	for i := range specs {
 		idxs[i] = i
@@ -138,12 +146,9 @@ func Start(serial string, specs []PortSpec, dtype int, user, pass string) (*Forw
 	case err := <-errCh:
 		t.Terminate()
 		return nil, fmt.Errorf("tunnel: %w", err)
-	case <-time.After(45 * time.Second):
+	case <-ctx.Done():
 		t.Terminate()
-		// фаза, на которой застрял handshake — без debug-дампов видно,
-		// где именно висит (device ack wait = камера молчит, discover/
-		// relay lookup = тупит облако)
-		return nil, fmt.Errorf("tunnel ready timeout (застрял на: %s)", t.Stage())
+		return nil, ctx.Err()
 	case <-t.Ready():
 		f.Ports = t.LocalPorts()
 		// поздние падения туннеля прокидываем в Err
@@ -205,14 +210,21 @@ func (f *Forwarder) Stop() {
 // 3) Если креды не заданы, но устройство требует авторизацию — перебирает
 //    дефолтные пароли (девайсы 2024+).
 func StartWithAuth(serial, user, pass string, specs []PortSpec) (*Forwarder, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	return StartWithAuthContext(ctx, serial, user, pass, specs)
+}
+
+// StartWithAuthContext — поднимает форвардер с привязкой к ctx:
+// 1) Сначала ВСЕГДА пробует Type 0 (CVE-2021-33044 байпас).
+// 2) Если заданы креды — пробует Type-1 (p2p-channel V2) с логином/паролем.
+// 3) Если креды не заданы, а устройство требует авторизацию (Type 1) —
+//    перебирает дефолтные пароли (девайсы 2024+).
+func StartWithAuthContext(ctx context.Context, serial, user, pass string, specs []PortSpec) (*Forwarder, error) {
 	targetSerial := serial
-	fallbackProfile := "dmss"
-	if ActiveProfile().name == "dmss" {
-		fallbackProfile = "smartpss"
-	}
 
 	// 1) Сначала ВСЕГДА пробуем Type 0 (CVE-2021-33044)
-	f, err0 := Start(targetSerial, specs, 0, "", "")
+	f, err0 := StartContext(ctx, targetSerial, specs, 0, "", "")
 	if err0 == nil {
 		f.User = user
 		f.Pass = pass
@@ -220,63 +232,37 @@ func StartWithAuth(serial, user, pass string, specs []PortSpec) (*Forwarder, err
 		return f, nil
 	}
 
-	// Если 404 на дефолтном облаке и профиль не указан явно — пробуем альтернативное облако по Type 0
-	if errors.Is(err0, ErrDeviceNotFound) && !strings.Contains(serial, ",profile=") {
-		altSerial := serial + ",profile=" + fallbackProfile
-		fAlt, errAlt := Start(altSerial, specs, 0, "", "")
-		if errAlt == nil {
-			fAlt.User = user
-			fAlt.Pass = pass
-			fAlt.Dtype = 0
-			return fAlt, nil
+	// 2) Если заданы явные креды — бьём Type-1 ими
+	if user != "" && pass != "" {
+		f1, err1 := StartContext(ctx, targetSerial, specs, 1, user, pass)
+		if err1 == nil {
+			f1.User = user
+			f1.Pass = pass
+			f1.Dtype = 1
+			return f1, nil
 		}
-		if isAuthError(errAlt) {
-			targetSerial = altSerial
-			err0 = errAlt
-		}
+		return nil, err1
 	}
 
-	// 2) Если устройство вернуло 401/403/auth error ИЛИ есть явные креды:
-	if isAuthError(err0) || (user != "" && pass != "") {
-		// Если заданы явные креды — бьём Type-1 ими
-		if user != "" && pass != "" {
-			f1, err1 := Start(targetSerial, specs, 1, user, pass)
-			if err1 == nil {
-				f1.User = user
-				f1.Pass = pass
-				f1.Dtype = 1
-				return f1, nil
-			}
-			// Если 404 и профиль не зашит явно — пробуем альтернативное облако
-			if errors.Is(err1, ErrDeviceNotFound) && !strings.Contains(serial, ",profile=") {
-				altSerial := serial + ",profile=" + fallbackProfile
-				fAlt, errAlt := Start(altSerial, specs, 1, user, pass)
-				if errAlt == nil {
-					fAlt.User = user
-					fAlt.Pass = pass
-					fAlt.Dtype = 1
-					return fAlt, nil
-				}
-			}
-			return nil, err1
-		}
-
-		// Креды не заданы: проверяем дефолтные пароли (девайсы 2024+)
+	// 3) Креды не заданы: если устройство требует авторизацию (Type 1),
+	// перебираем дефолтные пароли (девайсы 2024+)
+	if isAuthError(err0) {
 		login, passwords := getDefaultCreds()
 		if len(passwords) > 0 {
-			time.Sleep(LockoutCooldown)
-
 			for i, p := range passwords {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				if i > 0 {
 					time.Sleep(LockoutCooldown)
 				}
 				u := login
 				pw := p
-				if idx := strings.Index(p, ":"); idx >= 0 {
+				if idx := strings.Index(p, ":"); idx != -1 {
 					u = p[:idx]
 					pw = p[idx+1:]
 				}
-				f1, err1 := Start(targetSerial, specs, 1, u, pw)
+				f1, err1 := StartContext(ctx, targetSerial, specs, 1, u, pw)
 				if err1 == nil {
 					f1.User = u
 					f1.Pass = pw
@@ -288,17 +274,20 @@ func StartWithAuth(serial, user, pass string, specs []PortSpec) (*Forwarder, err
 				}
 			}
 		}
+		return nil, ErrAuthRequired
 	}
 
 	return nil, err0
 }
 
-// StartSupervised — подъём туннеля с ОГРАНИЧЕННЫМ числом попыток без явных кредов.
+// StartSupervised — подъём туннеля, пока жив ctx.
+// Терминалы (404/auth) отдают сразу.
 func StartSupervised(ctx context.Context, serial string, specs []PortSpec, onEvent func(string)) (*Forwarder, error) {
 	return StartSupervisedWithAuth(ctx, serial, "", "", specs, onEvent)
 }
 
-// StartSupervisedWithAuth — подъём туннеля с ОГРАНИЧЕННЫМ числом попыток и явными кредами.
+// StartSupervisedWithAuth — подъём туннеля (макс 3 попытки, пока жив ctx)
+// и явными кредами.
 func StartSupervisedWithAuth(ctx context.Context, serial, user, pass string, specs []PortSpec, onEvent func(string)) (*Forwarder, error) {
 	const maxAttempts = 3
 	var lastErr error
@@ -309,7 +298,7 @@ func StartSupervisedWithAuth(ctx context.Context, serial, user, pass string, spe
 		if attempt > 1 && onEvent != nil {
 			onEvent(fmt.Sprintf(i18n.Tr("туннель: перезапуск демона (попытка %d)"), attempt))
 		}
-		f, err := StartWithAuth(serial, user, pass, specs)
+		f, err := StartWithAuthContext(ctx, serial, user, pass, specs)
 		if err == nil {
 			if attempt > 1 && onEvent != nil {
 				onEvent(fmt.Sprintf(i18n.Tr("туннель поднят с %d-й попытки"), attempt))
@@ -319,7 +308,7 @@ func StartSupervisedWithAuth(ctx context.Context, serial, user, pass string, spe
 		lastErr = err
 		// Терминальные вердикты облака: рестарты бессмысленны, отдаём
 		// сразу (404 — устройства нет; auth — нужны креды на туннель).
-		if errors.Is(err, ErrDeviceNotFound) || errors.Is(err, ErrAuthRequired) {
+		if errors.Is(err, ErrDeviceNotFound) || errors.Is(err, ErrAuthRequired) || isAuthError(err) {
 			return nil, err
 		}
 		if onEvent != nil {

@@ -34,13 +34,25 @@
 * Uses CVE-2021-33044/33045 and CVE-2024-39943
 * and much more...
 
-### Building
+### Building on Windows
+
 ```sh
 git clone github.com/undervolter/krushitel
 cd krushitel
-go build .
+build_all.cmd
+cd bin
+```
+### Building on Linux
+```sh
+git clone github.com/undervolter/krushitel
+cd krushitel
+build.sh
+cd bin
 ```
 <h2>Compiled binaries are available in Releases.</h2>
+
+### Bugs
+- Not found yet
 
 <h2>Found a bug? Please report it in the issues!</h2>
 

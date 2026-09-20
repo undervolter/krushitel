@@ -13,6 +13,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"krushitel/update"
 )
 
 //go:embed banner.txt
@@ -29,8 +30,6 @@ func init() {
 		log.SetFlags(0)
 		_ = log.Output(2, "banner.txt: "+err.Error()) // не фатально
 	}
-	bannerArt = strings.ReplaceAll(bannerArt, "\r\n", "\n")
-	bannerArt = strings.ReplaceAll(bannerArt, "\r", "\n")
 }
 
 var (
@@ -62,12 +61,10 @@ var termWidth int
 // на все строки арта — иначе ёлка разваливается), остальные строки экрана
 // центрируются centerLine'ом по отдельности.
 func bannerBlock() string {
-	clean := strings.ReplaceAll(bannerArt, "\r\n", "\n")
-	clean = strings.ReplaceAll(clean, "\r", "\n")
-	art := strings.Split(strings.TrimRight(clean, "\n"), "\n")
+	art := strings.Split(strings.TrimRight(bannerArt, "\n"), "\n")
 	info := []string{
 		"",
-		styleCyan.Bold(true).Render(tr("крушитель v1.3")),
+		styleCyan.Bold(true).Render("крушитель v"+update.CurrentVersion),
 		styleDim.Render("exploit-based dahua sn scanner"),
 		"",
 		styleDim.Render("t.me/kkrushitel"),
@@ -75,32 +72,10 @@ func bannerBlock() string {
 		"",
 	}
 
-	// Находим минимальный отступ слева у всех непустых строк арта и срезаем его
-	minIndent := -1
-	for _, ln := range art {
-		trimmed := strings.TrimRight(ln, "\r")
-		if strings.TrimSpace(trimmed) == "" {
-			continue
-		}
-		spaces := len(trimmed) - len(strings.TrimLeft(trimmed, " "))
-		if minIndent == -1 || spaces < minIndent {
-			minIndent = spaces
-		}
-	}
-	if minIndent > 0 {
-		for i, ln := range art {
-			trimmed := strings.TrimRight(ln, "\r")
-			if len(trimmed) >= minIndent {
-				art[i] = trimmed[minIndent:]
-			}
-		}
-	}
-
 	// ширина арта — по самой длинной строке (уши/крылья), а не магическая
 	// константа: арт меняется без правки кода
 	artWidth := 0
 	for _, ln := range art {
-		ln = strings.TrimRight(ln, "\r")
 		if n := len([]rune(ln)); n > artWidth {
 			artWidth = n
 		}
@@ -109,7 +84,6 @@ func bannerBlock() string {
 	var lines []string
 	widths := make([]int, 0, len(art))
 	for i, ln := range art {
-		ln = strings.TrimRight(ln, "\r")
 		runes := []rune(ln)
 		pad := artWidth - len(runes)
 		if pad < 0 {
@@ -144,19 +118,6 @@ func bannerBlock() string {
 		sb.WriteString(fitWidth(padStr+line) + "\n")
 	}
 	return sb.String()
-}
-
-// rightLine — прижимает строку к правому краю терминала (2 пробела от правого края).
-func rightLine(s string) string {
-	if termWidth <= 0 {
-		return margin + s
-	}
-	w := lipgloss.Width(s)
-	pad := termWidth - w - 2
-	if pad < 0 {
-		pad = 0
-	}
-	return fitWidth(strings.Repeat(" ", pad) + s)
 }
 
 // fitWidth — последний рубеж против ползущего рендера: строка НЕ должна

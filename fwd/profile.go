@@ -3,28 +3,11 @@ package fwd
 import (
 	"crypto/rand"
 	"fmt"
-	"time"
 )
 
-// Профили приложений: каждый стоковый клиент Dahua (SmartPSS, DMSS) говорит
-// по тому же P2P-облачному протоколу, но своим диалектом — свой главный
-// сервер, своя зашитая WSSE-пара, свой набор глаголов и version-заголовков.
-// Резолюция устройства гейтится парой (DMSS-привязанное устройство отвечает
-// только DMSS-идентичности; replay-проверено 2026-09-06), поэтому разговор
-// с устройством, привязанным через DMSS, требует dmss-профиля.
-//
-// smartpss воспроизводит до-профильное поведение dh-fwd байт в байт и
-// остаётся дефолтом; dmss зеркалит Android-приложение DMSS (APK 2.6.20,
-// захват сессии 2026-09-06).
-
-// Константы приложения, извлечённые из Android-приложения DMSS (публичные,
-// зашиты в каждую сборку DMSS — тот же класс констант, что и пара SmartPSS
-// ниже).
-const (
-	DMSS_MAIN_SERVER   = "p2p.dolynkcloud.com"
-	DMSS_WSSE_USERNAME = "793k5zdi4dd5f037sooag8yo_dolynkc"
-	DMSS_WSSE_USERKEY  = "ef8hatgmcuk4qamgg4fxx19x33s9q1xy"
-)
+// Профиль приложения: говорим диалектом стокового клиента SmartPSS
+// (главный сервер easy4ipcloud, зашитая WSSE-пара, глаголы DHGET/DHPOST).
+// Поддержка DMSS/Dolynk удалена из стабл-версии.
 
 // appProfile захватывает облачный диалект одного стокового клиента.
 // Нулевые поля означают «фича не проговаривается этим клиентом»
@@ -96,66 +79,27 @@ var smartpssProfile = &appProfile{
 	channelRetransmit: true,
 }
 
-var dmssProfile = &appProfile{
-	name:        "dmss",
-	mainServer:  DMSS_MAIN_SERVER,
-	mainPort:    MAIN_PORT,
-	wsseUser:    DMSS_WSSE_USERNAME,
-	wsseUserKey: DMSS_WSSE_USERKEY,
-	verbGet:     "NFGET",
-	verbPost:    "NFPOST",
-	// Приложение штампует локальное время с числовым офсетом (захват
-	// 2026-09-06: Created="2026-09-06T10:18:35+03:00"). Лейаут должен быть
-	// -07:00 (всегда числовой), НЕ Z07:00: Z-форма рендерит литеральную "Z"
-	// при UTC-процессе (контейнер Alpine без TZ), что не числовой офсет.
-	// Точное совпадение с +03:00 телефона НЕ требуется — evidence захватов
-	// показывает, что числовые офсеты принимаются.
-	createdNow: func() string { return time.Now().Format("2006-01-02T15:04:05-07:00") },
-	toUType:    "Client/Dmss_Android",
-	version:    "6.7.15",
-	sversion:   "1.1.0",
-
-	pcsRequestID:       true,
-	extendedBody:       true,
-	channelRetransmit:  true,
-	localChannel:       true,
-	autoSalt:           true,
-	noRelayAuth:        true,
-	relayAgentOptional: true, // приложение никогда не аллоцирует TCP relay-агента (паритет захватов)
-
-	appHeaderOrder: true,
-	randomCSeq:     true,
-
-	warmupPath: "/online/stun",
-	warmupAuth: false, // stun несёт только X-ToUType — без auth, без version-заголовков
-}
-
-// Активный профиль пакета. Дефолт smartpss — легаси-поведение; драйвер
-// (TUI/настройки) переключает через SetProfile.
+// Активный профиль пакета — всегда smartpss (поддержка DMSS удалена).
 var activeProfile = smartpssProfile
 
 // ActiveProfile возвращает текущий профиль облака.
 func ActiveProfile() *appProfile { return activeProfile }
 
-// SetProfile переключает профиль облака по имени ("smartpss" | "dmss").
+// SetProfile оставлен для совместимости конфигов: принимает только "smartpss".
 func SetProfile(name string) error {
-	p, err := profileByName(name)
-	if err != nil {
-		return err
+	if name != "" && name != "smartpss" {
+		return fmt.Errorf("unknown app profile %q (only smartpss supported)", name)
 	}
-	activeProfile = p
+	activeProfile = smartpssProfile
 	return nil
 }
 
-// profileByName резолвит значение флага --app.
+// profileByName резолвит профиль: только smartpss.
 func profileByName(name string) (*appProfile, error) {
-	switch name {
-	case "smartpss":
+	if name == "" || name == "smartpss" {
 		return smartpssProfile, nil
-	case "dmss":
-		return dmssProfile, nil
 	}
-	return nil, fmt.Errorf("unknown app profile %q (want smartpss or dmss)", name)
+	return nil, fmt.Errorf("unknown app profile %q (only smartpss supported)", name)
 }
 
 // randomHex отдаёт n крипто-случайных байт как 2n lowercase hex — формат

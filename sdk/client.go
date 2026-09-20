@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"krushitel/proxy"
 	"net"
 	"strconv"
 	"strings"
@@ -184,13 +183,13 @@ func readFrame(conn net.Conn) ([]byte, error) {
 // хеш-логин тем же соединением. Возвращает открытый conn (закрывает при
 // ошибке).
 func (c *Client) login(timeout time.Duration) (net.Conn, error) {
-	conn := c.conn
-	if conn == nil {
-		var err error
-		conn, err = proxy.DialTimeout("tcp", c.addr, timeout)
-		if err != nil {
-			return nil, fmt.Errorf("dial %s: %w", c.addr, err)
-		}
+	if c.conn != nil {
+		c.conn.SetDeadline(time.Now().Add(timeout))
+		return c.conn, nil
+	}
+	conn, err := net.DialTimeout("tcp", c.addr, timeout)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", c.addr, err)
 	}
 	conn.SetDeadline(time.Now().Add(timeout))
 
@@ -445,12 +444,11 @@ func parseUserListFull(resp []byte) []SDKUser {
 		if idx, err := strconv.Atoi(parts[0]); err == nil {
 			u.Index = idx
 		}
-		if len(parts) == 3 {
+		if len(parts) > 2 {
 			u.Pass = parts[2]
-		} else if len(parts) >= 4 {
-			// Последний сегмент — Group, промежуточные — Pass (может содержать двоеточия)
-			u.Pass = strings.Join(parts[2:len(parts)-1], ":")
-			u.Group = parts[len(parts)-1]
+		}
+		if len(parts) > 3 {
+			u.Group = parts[3]
 		}
 		users = append(users, u)
 	}

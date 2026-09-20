@@ -19,15 +19,14 @@ const (
 )
 
 type formField struct {
-	kind      fieldKind
-	label     string
-	def       string              // для fInt
-	validate  func(string) string // для fStr
-	input     textinput.Model
-	strVal    string
-	intVal    int
-	boolVal   bool
-	condition func(*formState) bool
+	kind     fieldKind
+	label    string
+	def      string              // для fInt
+	validate func(string) string // для fStr
+	input    textinput.Model
+	strVal   string
+	intVal   int
+	boolVal  bool
 }
 
 // formState — последовательные промпты: текущий вопрос внизу списка,
@@ -50,7 +49,7 @@ func (f *formState) addStr(label string, required bool, fileMustExist bool) {
 		if required && s == "" {
 			return tr("обязательное поле")
 		}
-		if s != "" && fileMustExist && !fileExists(s) {
+		if fileMustExist && !fileExists(s) {
 			return tr("такого файла нет! перепиши, пожалуйста")
 		}
 		return ""
@@ -59,22 +58,6 @@ func (f *formState) addStr(label string, required bool, fileMustExist bool) {
 	ti.CharLimit = 512
 	ti.Width = 60
 	f.fields = append(f.fields, formField{kind: fStr, label: label, validate: v, input: ti})
-}
-
-func (f *formState) addStrCond(label string, required bool, fileMustExist bool, cond func(*formState) bool) {
-	v := func(s string) string {
-		if required && s == "" {
-			return tr("обязательное поле")
-		}
-		if s != "" && fileMustExist && !fileExists(s) {
-			return tr("такого файла нет! перепиши, пожалуйста")
-		}
-		return ""
-	}
-	ti := textinput.New()
-	ti.CharLimit = 512
-	ti.Width = 60
-	f.fields = append(f.fields, formField{kind: fStr, label: label, validate: v, input: ti, condition: cond})
 }
 
 func (f *formState) addInt(label string, def int) {
@@ -178,9 +161,6 @@ func (f *formState) update(m *model, msg tea.KeyMsg) bool {
 func (f *formState) next(m *model) {
 	f.errMsg = ""
 	f.cur++
-	for f.cur < len(f.fields) && f.fields[f.cur].condition != nil && !f.fields[f.cur].condition(f) {
-		f.cur++
-	}
 	if f.cur >= len(f.fields) {
 		f.onDone(m)
 		return
@@ -197,9 +177,6 @@ func (f *formState) view() string {
 
 	for i := 0; i <= f.cur && i < len(f.fields); i++ {
 		fld := &f.fields[i]
-		if fld.condition != nil && !fld.condition(f) {
-			continue
-		}
 		switch {
 		case i < f.cur || (i == f.cur && f.cur >= len(f.fields)):
 			// отвечено
