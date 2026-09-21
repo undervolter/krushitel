@@ -39,7 +39,7 @@ const (
 	W_MAX           = 128
 	GOV_GROW        = 8
 	GOV_SHRINK      = 16
-	ACK_TIMEOUT     = 3 * time.Second
+	ACK_TIMEOUT     = 15 * time.Second
 
 	// междатаграммная пауза при наполнении окна
 	SEND_STAGGER = 100 * time.Microsecond
@@ -47,7 +47,7 @@ const (
 	// кладбище: истёкший по дедлайну запрос переносится сюда ещё на
 	// ACK_GRACE — опоздавший ack находит свой CSeq и выносит честный
 	// вердикт. Тишина дольше ACK_GRACE — это ретрай.
-	ACK_GRACE = 3 * time.Second
+	ACK_GRACE = 15 * time.Second
 
 	// CHANNEL_RETRIES — сколько раз переотправлять p2p-channel проб,
 	// если облако молчит (тишина дольше ACK_GRACE). Всего попыток =
@@ -576,6 +576,7 @@ func (p *channelPipeline) pump(ctx context.Context, aliveCh chan<- string, stats
 		return
 	}
 	p.resolve(r, aliveCh, stats)
+	p.expire(stats)
 }
 
 func scanWorker(ctx context.Context, conn *net.UDPConn, jobs <-chan string, aliveCh chan<- string, stats *ScanStats, timeout time.Duration) {
