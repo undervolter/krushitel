@@ -9,6 +9,7 @@ package ironscan
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -63,6 +64,26 @@ func SanitizeSerial(raw string) string {
 		return ""
 	}
 	return pickSerial(s)
+}
+
+// SanitizeSerialBytes — как SanitizeSerial, но вход []byte без аллокаций:
+// string() делаем один раз и только для строк, прошедших дешёвые фильтры
+// (пусто / «;модель» / короче минимального серийника 14). Мусор отваливается
+// с нулём аллокаций — на сотнях млн строк это разы по скорости и GC.
+func SanitizeSerialBytes(raw []byte) string {
+	s := bytes.TrimSpace(raw)
+	if len(s) == 0 {
+		return ""
+	}
+	if i := bytes.IndexByte(s, ';'); i >= 0 {
+		s = bytes.TrimSpace(s[:i])
+	}
+	// короче 14 — валидного серийника тут нет точно (Dahua 14-15, Amcrest 18),
+	// regex не гоняем.
+	if len(s) < 14 {
+		return ""
+	}
+	return SanitizeSerial(string(s))
 }
 
 // Options — параметры скана.

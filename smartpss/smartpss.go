@@ -191,12 +191,15 @@ type PerDeviceFiles struct {
 	prefix string // базовое имя файла, "import"
 }
 
-func NewDeviceFiles(dir string) *PerDeviceFiles {
+func NewDeviceFiles(dir string) (*PerDeviceFiles, error) {
 	if dir != "" {
-		// папка результатов создаём сразу, а не на первом Append
-		_ = os.MkdirAll(dir, 0755)
+		// Ошибку НЕ глотаем: на Linux это права/владелец/RO-маунт, и молчание
+		// здесь = «включил в настройках, а xml нет» без единой строчки в логе.
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, err
+		}
 	}
-	return &PerDeviceFiles{dir: dir, prefix: "import"}
+	return &PerDeviceFiles{dir: dir, prefix: "import"}, nil
 }
 
 // Append добавляет камеру в текущий чанк, при переполнении (64) начинает

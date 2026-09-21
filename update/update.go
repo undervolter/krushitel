@@ -18,7 +18,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
@@ -29,7 +28,7 @@ import (
 // CurrentVersion — единственный источник версии софта. Сюда смотрят
 // RPC-строки, баннер, краш-сплеш и проверка обновлений; build_release.ps1
 // забирает её же для имён архивов.
-const CurrentVersion = "1.3.1"
+const CurrentVersion = "1.0"
 
 const (
 	repoOwner = "undervolter"
@@ -358,16 +357,10 @@ func Sweep() {
 }
 
 // Restart — запустить свежий бинарник с теми же аргументами.
-// stdout/stderr передаём явно: к моменту рестарта TUI уже подменил
-// os.Stdout на devnull. Возвращает после Start, вызыватель гасит себя.
-func Restart(stdout, stderr *os.File) error {
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	c := exec.Command(exe, os.Args[1:]...)
-	c.Stdin = os.Stdin
-	c.Stdout = stdout
-	c.Stderr = stderr
-	return c.Start()
+// Вызывается из main() ПОСЛЕ полного закрытия TUI.
+// На Linux делается нативный syscall.Exec (замена образа процесса in-place с сохранением PID).
+// На Windows запускается через c.Run (родитель ждет дочерний процесс, предотвращая перехват консоли шеллом).
+func Restart() error {
+	return restart()
 }
+

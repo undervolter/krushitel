@@ -30,7 +30,6 @@ import (
 const (
 	runExploit = iota
 	runCheck
-	runGen
 	runPrefix
 	runTitles
 )
@@ -52,12 +51,8 @@ type runState struct {
 	chk *scanner.ScanStats
 	// titles (krushitel/exploit, подменю «титры по списку»)
 	ttl *exploit.TitlesStats
-	// generate (krushitel/cloud)
-	genWritten int64
-	genTotal   int64
-	genDone    int64 // atomic: 1 = GenerateSerials вернулся
-	genFile    string
-	genErr     string
+	// genErr — общая строка ошибки прогона (поиск префиксов: krushitel/ironscan)
+	genErr string
 	// prefix (krushitel/ironscan)
 	preScanned int64
 	preFound   int64
@@ -243,8 +238,6 @@ func (r *runState) finished() bool {
 			atomic.LoadInt64(&r.exp.ExtrasInFlight) == 0
 	case runCheck:
 		return r.chk != nil && r.chk.Done
-	case runGen:
-		return atomic.LoadInt64(&r.genDone) == 1
 	case runPrefix:
 		return atomic.LoadInt64(&r.preDone) == 1
 	case runTitles:
@@ -271,7 +264,7 @@ func (r *runState) statusMsg() string {
 		return r.exp.ErrorMsg
 	case runCheck:
 		return r.chk.ErrorMsg
-	case runGen:
+	case runPrefix:
 		return r.genErr
 	case runTitles:
 		return r.ttl.ErrorMsg
@@ -296,8 +289,6 @@ func (r *runState) view() string {
 		sb.WriteString(r.exploitView())
 	case runCheck:
 		sb.WriteString(r.checkView())
-	case runGen:
-		sb.WriteString(r.genView())
 	case runPrefix:
 		sb.WriteString(r.prefixView())
 	case runTitles:
@@ -462,17 +453,18 @@ func (r *runState) eventsBlock() string {
 
 func (r *runState) checkView() string {
 	st := r.chk
-	// фаза чтения входного файла: движок ещё не сканит — бар показывает
-	// загрузку/санитайз серийников, чтобы экран не выглядел повисшим
-	if atomic.LoadInt64(&st.Reading) == 1 {
-		readLines := atomic.LoadInt64(&st.ReadLines)
-		readTotal := atomic.LoadInt64(&st.ReadTotal)
+	// фаза чтения входного файла: бар показывает загрузку только пока скан не стартовал
+	if atomic.LoadInt64(&st.Reading) == 1 && atomic.LoadInt64(&st.Checked) == 0 {
+		readBytes := atomic.LoadInt64(&st.ReadBytes)
+		totalBytes := atomic.LoadInt64(&st.ReadTotalBytes)
+		lines := atomic.LoadInt64(&st.ReadLines)
 		valid := atomic.LoadInt64(&st.ReadValid)
 		var sb strings.Builder
-		if readTotal > 0 {
-			pct := float64(readLines) / float64(readTotal) * 100
-			sb.WriteString(centerLine(fmt.Sprintf("%s %.1f%%", bar(readLines, readTotal, 30), pct)) + "\n")
-			sb.WriteString(centerLine(fmt.Sprintf(tr("%d/%d строк"), readLines, readTotal)+
+		if totalBytes > 0 {
+			pct := float64(readBytes) / float64(totalBytes) * 100
+			sb.WriteString(centerLine(fmt.Sprintf("%s %.1f%%", bar(readBytes, totalBytes, 30), pct)) + "\n")
+			sb.WriteString(centerLine(fmt.Sprintf("%.1f/%.1f %s", float64(readBytes)/1048576, float64(totalBytes)/1048576, tr("МБ"))+
+				" | "+fmt.Sprintf(tr("%d строк"), lines)+
 				" | "+fmt.Sprintf(tr("серийников: %s"), green(fmt.Sprint(valid)))+
 				" | "+r.elapsed())+"\n\n")
 		} else {
@@ -493,16 +485,6 @@ func (r *runState) checkView() string {
 		fmt.Sprintf(tr("%.0f/мин"), st.AliveRate),
 		fmt.Sprintf(tr("%.0f/сек"), st.Speed),
 		r.elapsed())) + "\n\n")
-	sb.WriteString(r.eventsBlock())
-	return sb.String()
-}
-
-func (r *runState) genView() string {
-	written := atomic.LoadInt64(&r.genWritten)
-	var sb strings.Builder
-	sb.WriteString(centerLine(fmt.Sprintf("%s %s", bar(written, r.genTotal, 30),
-		fmt.Sprintf(tr("%d/%d строк"), written, r.genTotal))) + "\n\n")
-	sb.WriteString(centerLine(fmt.Sprintf(tr("файл: %s | %s"), r.genFile, r.elapsed())) + "\n\n")
 	sb.WriteString(r.eventsBlock())
 	return sb.String()
 }

@@ -46,7 +46,10 @@ func TestEncodeP2PWN(t *testing.T) {
 // (exploit-режим кладёт импорты в <results>/xml).
 func TestDeviceFilesSubdir(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "results", "xml")
-	p := NewDeviceFiles(dir)
+	p, err := NewDeviceFiles(dir)
+	if err != nil {
+		t.Fatalf("NewDeviceFiles: %v", err)
+	}
 	if err := p.Append("5L04507PAJ01B96", "admin", "secret"); err != nil {
 		t.Fatalf("append: %v", err)
 	}

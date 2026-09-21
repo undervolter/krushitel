@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"krushitel/ui"
+	"krushitel/update"
 )
 
 // crash.log: паника вне TUI (до/после ui.Run) раньше умирала молча.
@@ -40,5 +41,13 @@ func main() {
 			os.Exit(1)
 		}
 	}()
-	ui.Run()
+	if ui.Run() {
+		if lf != nil {
+			_ = lf.Close()
+		}
+		if err := update.Restart(); err != nil {
+			fmt.Fprintf(os.Stderr, "ошибка перезапуска: %v\n", err)
+			os.Exit(1)
+		}
+	}
 }

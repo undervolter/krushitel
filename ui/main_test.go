@@ -304,23 +304,23 @@ func TestDummyEdit(t *testing.T) {
 	}
 }
 
-// Скан SN: существующий непустой выходной файл открывает подтверждение
+// Скан префиксов: существующий непустой выходной файл открывает подтверждение
 // «дописать/перезаписать» вместо тихого APPEND. Сам прогон (сеть) не
 // запускается — проверяется только ветка подтверждения.
-func TestCheckOverwriteConfirm(t *testing.T) {
+func TestPrefixScanOverwriteConfirm(t *testing.T) {
 	chdirTemp(t)
 	m := initialModel(nil)
 
-	os.WriteFile("in.txt", []byte("5H016B4PAG001EF\n"), 0644)
+	os.WriteFile("in.txt", []byte("5H016B4PAG\n"), 0644)
 	os.WriteFile("out.txt", []byte("OLD1\nOLD2\n"), 0644)
 
-	m.form = checkForm()
+	m.form = prefixScanForm()
 	m.state = stForm
 	m.form.fields[0].strVal = "in.txt"
 	m.form.fields[1].strVal = "out.txt"
 	m.form.fields[2].intVal = 4
 
-	startCheckRun(&m)
+	startPrefixScanRun(&m)
 
 	if m.state != stForm || m.form == nil {
 		t.Fatalf("подтверждение не показано: state=%v form=%v", m.state, m.form)

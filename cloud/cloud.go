@@ -1,11 +1,11 @@
-// Package cloud — работа с облаком Dahua (easy4ipcloud) и генерация SN.
-// Функция 2: префиксы (10 символов) → все серийники XXXXXXXXXYYYYY
-// (Y = 00000..FFFFF, 1<<20 вариантов на префикс).
+// Package cloud — работа с облаком Dahua (easy4ipcloud).
+// Префиксы (10 символов) читаются через LoadPrefixes; развёртка
+// XXXXXXXXXYYYYY (Y = 00000..FFFFF) — на лету в скан-пайплайне
+// (см. scanner.RunPrefixScan), файлов со списками больше нет.
 // Функция 3: онлайн-чек серийников через /online/p2psrv/<SN>.
 package cloud
 
 import (
-	"bufio"
 	"crypto/sha1"
 	"encoding/base64"
 	"fmt"
@@ -27,47 +27,6 @@ const (
 	CloudUsername = "cba1b29e32cb17aa46b8ff9e73c7f40b"
 	CloudUserKey  = "996103384cdf19179e19243e959bbf8b"
 )
-
-// ── функция 2: генерация SN ──────────────────────────────────────────
-
-const suffixCombos = 1 << 20 // 00000..FFFFF
-
-// GenerateSerials пишет в outputPath все серийники для каждого 10-символьного
-// префикса. onProgress вызывается периодически с числом записанных строк.
-func GenerateSerials(inputPath, outputPath string, onProgress func(written int64)) (int64, error) {
-	prefixes, err := LoadPrefixes(inputPath)
-	if err != nil {
-		return 0, err
-	}
-
-	f, err := create(outputPath)
-	if err != nil {
-		return 0, fmt.Errorf("create output: %w", err)
-	}
-	defer f.Close()
-
-	buf := bufio.NewWriterSize(f, 512*1024)
-	var total int64
-	var lastProg int64
-
-	for _, prefix := range prefixes {
-		for i := 0; i < suffixCombos; i++ {
-			if _, err := buf.WriteString(fmt.Sprintf("%s%05X\n", prefix, i)); err != nil {
-				return total, fmt.Errorf("write: %w", err)
-			}
-			total++
-			if onProgress != nil && total-lastProg >= 1<<20 {
-				lastProg = total
-				onProgress(total)
-			}
-		}
-	}
-
-	if onProgress != nil {
-		onProgress(total)
-	}
-	return total, buf.Flush()
-}
 
 // LoadPrefixes читает файл префиксов. Строка длиной 10 символов — уже
 // префикс; строка длиннее (например, целый серийник 5L04507PAJBD5F6) —

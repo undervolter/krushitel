@@ -40,6 +40,9 @@ const (
 
 type tickMsg time.Time
 
+// TEMP-TEST краш-скрина: убрать после проверки.
+type crashTestMsg struct{}
+
 type model struct {
 	w, h     int
 	state    sessionState
@@ -50,9 +53,10 @@ type model struct {
 
 	form     *formState
 	run      *runState
-	msgLines []string
-	msgPanel string
-	quitting bool
+	msgLines   []string
+	msgPanel   string
+	quitting   bool
+	restarting bool
 
 	titleInput textinput.Model
 	titleErr   string
@@ -66,21 +70,18 @@ type model struct {
 	updCur    int // курсор промпта обновы: 0 = обновить, 1 = позже
 }
 
-// teaProg/stdRealOut — для рестарта после обновы: гасим alt-экран и
-// стартуем свежий бинарник с живым stdout (os.Stdout к тому моменту
-// уже подменён на devnull).
-var (
-	teaProg    *tea.Program
-	stdRealOut *os.File
-)
+// teaProg — ссылка на активную программу (нужна для SuspendExec в elevate.go).
+var teaProg *tea.Program
 
-func Run() {
+func Run() bool {
 	realStdout := os.Stdout
+	realStderr := os.Stderr
 	if devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0); err == nil {
 		os.Stdout = devNull
 		os.Stderr = devNull
 		defer func() {
 			os.Stdout = realStdout
+			os.Stderr = realStderr
 			_ = devNull.Close()
 		}()
 	}
@@ -94,7 +95,6 @@ func Run() {
 	// bubbletea ("program was killed") — иначе наш сплеш никогда не покажется.
 	p := tea.NewProgram(initialModel(upd), tea.WithAltScreen(), tea.WithOutput(realStdout), tea.WithoutCatchPanics())
 	teaProg = p
-	stdRealOut = realStdout
 	defer discordStop() // rpc always-on: гасим presence при любом выходе
 	// Паника TUI-потока: чиним терминал, дампим стек, рисуем сплеш.
 	// Зарегистрирован ПОСЛЕ дефера ресторa stdout — срабатывает первым.
@@ -112,10 +112,15 @@ func Run() {
 			os.Exit(1)
 		}
 	}()
-	if _, err := p.Run(); err != nil {
+	finalM, err := p.Run()
+	if err != nil {
 		fmt.Fprintf(realStdout, tr("ошибка: %v")+"\n", err)
 		os.Exit(1)
 	}
+	if fm, ok := finalM.(model); ok && fm.restarting {
+		return true
+	}
+	return false
 }
 
 func initialModel(upd *update.Release) model {
@@ -147,6 +152,14 @@ func initialModel(upd *update.Release) model {
 }
 
 func (m model) Init() tea.Cmd {
+	// TEMP-TEST краш-скрина: TUI грузится как обычно, паника прилетает
+	// сообщением через 5 сек в горутину event-loop — ловит наш recover
+	// в Run (как настоящая паника TUI-потока). Убрать после проверки.
+	if os.Getenv("KRUSHITEL_PANIC_TEST") != "" {
+		return tea.Batch(tickCmd(), tea.Tick(5*time.Second, func(t time.Time) tea.Msg {
+			return crashTestMsg{}
+		}))
+	}
 	return tickCmd()
 }
 
@@ -173,6 +186,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		discordTick(m.run) // rpc always-on: хоть в меню, хоть в прогоне
 		return m, tickCmd()
+
+	case crashTestMsg: // TEMP-TEST краш-скрина: убрать после проверки.
+		panic("test crash: KRUSHITEL_PANIC_TEST")
 
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC {
@@ -274,8 +290,7 @@ func (m model) greetView() string {
 var mainMenuOptions = []string{
 	"крушим)",
 	"OSDChanger",
-	"генерируем SN с списка префиксов",
-	"сканим серийники",
+	"сканим префиксы (без генерации)",
 	"расшифровываем .xml от smartpss",
 	"ищем префиксы",
 	"настройки",
@@ -295,7 +310,7 @@ func (m model) updateMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		}
-		if r >= '1' && r <= '7' {
+		if r >= '1' && r <= '6' {
 			return m.selectMenu(int(r - '0' - 1))
 		}
 	}
@@ -311,18 +326,15 @@ func (m model) selectMenu(idx int) (tea.Model, tea.Cmd) {
 		m.form = titlesForm()
 		m.state = stForm
 	case 2:
-		m.form = generateForm()
+		m.form = prefixScanForm()
 		m.state = stForm
 	case 3:
-		m.form = checkForm()
-		m.state = stForm
-	case 4:
 		m.state = stXMLMenu
 		m.xmlCur = 0
-	case 5:
+	case 4:
 		m.form = prefixForm()
 		m.state = stForm
-	case 6:
+	case 5:
 		m.state = stSettings
 		m.setCur = 0
 	}
@@ -530,18 +542,16 @@ func (m model) updateUpdating(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// checkUpdDone — установка докачалась и встала: гасим alt-экран,
-// стартуем свежий бинарник, выходим. nil = ещё качается/ошибка.
+// checkUpdDone — установка докачалась и встала: штатно выходим из TUI,
+// выставляя restarting. Сам перезапуск произойдет в main() после того,
+// как bubbletea полностью очистит и вернет терминал в cooked-режим.
 func (m *model) checkUpdDone() tea.Cmd {
 	stage, _, _, _, finished := update.St.Snap()
 	if !finished || stage != update.StageDone {
 		return nil
 	}
 	m.quitting = true
-	if teaProg != nil {
-		_ = teaProg.ReleaseTerminal()
-	}
-	_ = update.Restart(stdRealOut, stdRealOut)
+	m.restarting = true
 	return tea.Quit
 }
 

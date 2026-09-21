@@ -3,7 +3,6 @@ package cloud
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -33,51 +32,6 @@ func TestLoadPrefixesFromSerials(t *testing.T) {
 		if prefixes[i] != want[i] {
 			t.Fatalf("prefix %d: got %q want %q", i, prefixes[i], want[i])
 		}
-	}
-}
-
-// TestGenerateSerialsExample — генерация для префикса 5L04507PAJ обязана
-// содержать серийник из примера (5L04507PAJBD5F6 = prefix + %05X(0xBD5F6)).
-func TestGenerateSerialsExample(t *testing.T) {
-	dir := t.TempDir()
-	in := filepath.Join(dir, "in.txt")
-	out := filepath.Join(dir, "out.txt")
-	if err := os.WriteFile(in, []byte("5L04507PAJ\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	total, err := GenerateSerials(in, out, nil)
-	if err != nil {
-		t.Fatalf("GenerateSerials: %v", err)
-	}
-	if total != 1<<20 {
-		t.Fatalf("total = %d, want %d", total, 1<<20)
-	}
-
-	data, err := os.ReadFile(out)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lines := strings.Split(string(data), "\n")
-	if len(lines) < 1<<20+1 {
-		t.Fatalf("lines = %d", len(lines))
-	}
-	if lines[0] != "5L04507PAJ00000" {
-		t.Fatalf("first line = %q", lines[0])
-	}
-	if lines[0xFFFFF] != "5L04507PAJFFFFF" {
-		t.Fatalf("last line = %q", lines[0xFFFFF])
-	}
-	want := "5L04507PAJBD5F6" // prefix + 0xBD5F6
-	found := false
-	for _, ln := range lines {
-		if ln == want {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("example serial %q not found in output", want)
 	}
 }
 

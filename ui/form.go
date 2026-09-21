@@ -23,6 +23,7 @@ type formField struct {
 	label    string
 	def      string              // для fInt
 	validate func(string) string // для fStr
+	pass     bool                // маскировать ввод и ответ (пароли)
 	input    textinput.Model
 	strVal   string
 	intVal   int
@@ -33,6 +34,7 @@ type formField struct {
 // отвеченные — приглушённо со значениями. Реплика promptR/confirmYN.
 type formState struct {
 	panel  string // заголовок режима ("крушим")
+	desc   string // красная строка под заголовком (фатальные диалоги)
 	fields []formField
 	cur    int
 	errMsg string
@@ -66,6 +68,17 @@ func (f *formState) addInt(label string, def int) {
 	ti.Width = 20
 	ti.SetValue(fmt.Sprintf("%d", def))
 	f.fields = append(f.fields, formField{kind: fInt, label: label, def: fmt.Sprintf("%d", def), intVal: def, input: ti})
+}
+
+// addPass — строка с маскировкой (пароль sudo): ввод точками, отвеченное
+// значение на экране тоже маской, в strVal — как есть.
+func (f *formState) addPass(label string) {
+	ti := textinput.New()
+	ti.CharLimit = 256
+	ti.Width = 40
+	ti.EchoMode = textinput.EchoPassword
+	f.fields = append(f.fields, formField{kind: fStr, label: label, pass: true,
+		validate: func(string) string { return "" }, input: ti})
 }
 
 func (f *formState) addBool(label string, def bool) {
@@ -174,6 +187,13 @@ func (f *formState) view() string {
 	sb.WriteString(bannerBlock())
 	sb.WriteString(strings.Repeat("\n", 4)) // шапка ниже баннера
 	sb.WriteString(panelS(f.panel) + "\n\n")
+	if f.desc != "" {
+		// красная строка фатального диалога (многострочность — по \n)
+		for _, ln := range strings.Split(f.desc, "\n") {
+			sb.WriteString(centerLine(red(ln)) + "\n")
+		}
+		sb.WriteString("\n")
+	}
 
 	for i := 0; i <= f.cur && i < len(f.fields); i++ {
 		fld := &f.fields[i]
@@ -187,7 +207,16 @@ func (f *formState) view() string {
 			case fInt:
 				val = strconv.Itoa(fld.intVal)
 			default:
-				val = fld.strVal
+				if fld.pass {
+					// пароль на экране не светим даже отвеченный
+					if fld.strVal == "" {
+						val = dim(tr("(пусто)"))
+					} else {
+						val = "••••••"
+					}
+				} else {
+					val = fld.strVal
+				}
 			}
 			sb.WriteString(centerLine(dim(fmt.Sprintf("%s: %s ✓", fld.label, val))) + "\n")
 		case i == f.cur:

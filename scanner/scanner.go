@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"os"
@@ -19,6 +20,7 @@ import (
 
 	"krushitel/i18n"
 	"krushitel/ironscan"
+	"krushitel/syslimits"
 )
 
 const (
@@ -37,27 +39,19 @@ const (
 	W_MAX           = 128
 	GOV_GROW        = 8
 	GOV_SHRINK      = 16
-	ACK_TIMEOUT     = 10 * time.Second
+	ACK_TIMEOUT     = 3 * time.Second
 
-	// междатаграммная пауза при наполнении окна: 64 запросов залпом в
-	// одну микросекунду — флуд-профиль; 150мкс на датаграмму растягивают
-	// цикл заполнения до ~10мс, стоимость копеечная
-	SEND_STAGGER = 150 * time.Microsecond
+	// междатаграммная пауза при наполнении окна
+	SEND_STAGGER = 100 * time.Microsecond
 
 	// кладбище: истёкший по дедлайну запрос переносится сюда ещё на
 	// ACK_GRACE — опоздавший ack находит свой CSeq и выносит честный
-	// вердикт (живой ack идёт через релей до девайса и приходит позже
-	// мгновенных облачных 404/queued; без грейса живые стабильно
-	// опаздывали и серийник ошибочно писался dead).
-	// Тишина дольше ACK_GRACE — это ретрай, а не похороны: облако молча
-	// дропает пакеты, поэтому замолчавший серийник переотправляется
-	// (см. CHANNEL_RETRIES), dead — только после исчерпания ретраев.
-	ACK_GRACE = 30 * time.Second
+	// вердикт. Тишина дольше ACK_GRACE — это ретрай.
+	ACK_GRACE = 3 * time.Second
 
 	// CHANNEL_RETRIES — сколько раз переотправлять p2p-channel проб,
 	// если облако молчит (тишина дольше ACK_GRACE). Всего попыток =
-	// 1 + CHANNEL_RETRIES. Ретрай идёт новым CSeq — залипшие ответы
-	// прошлых попыток игнорируются.
+	// 1 + CHANNEL_RETRIES.
 	CHANNEL_RETRIES = 2
 
 	// teardown-эксперимент: после живого ack шлём валидный STUN-init на
@@ -82,10 +76,14 @@ type ScanStats struct {
 
 	// фаза чтения входного файла (до старта воркеров). Все поля
 	// атомарные: тикер UI читает их из другого горутинного потока.
-	Reading   int64 // 1 = идёт чтение/санитайз входного файла
-	ReadLines int64 // обработано строк на фазе санитайза
-	ReadTotal int64 // всего строк (первый быстрый проход-подсчёт)
-	ReadValid int64 // найдено валидных серийников
+	// Чтение — один стрим-проход (см. streamSerials): прогресс по байтам,
+	// память O(окно дедупа), а не O(файл).
+	Reading        int64 // 1 = идёт чтение/санитайз входного файла
+	ReadLines      int64 // обработано строк на фазе санитайза
+	ReadBytes      int64 // прочитано байт входа
+	ReadTotalBytes int64 // размер входа в байтах (0 = неизвестен)
+	ReadValid      int64 // найдено валидных серийников
+	DedupResets    int64 // сколько раз сбросилось окно дедупа (см. DedupWindow)
 	AliveRate float64 // живых в минуту за последнее окно наблюдения (обнова каждые 10с)
 }
 
@@ -219,6 +217,7 @@ type channelPipeline struct {
 	graceTTL                  time.Duration // сколько истёкший запрос живёт в кладбище
 	window                    int           // текущее окно в полёте (governor)
 	sent                      int64         // отправок в текущем цикле
+	resolvedCycle             int64         // ответов в текущем цикле
 	expiredCycle              int64         // истёкших без ответа в текущем цикле
 	inflight                  map[int64]*inflightChannel
 	graveyard                 map[int64]*graveEntry
@@ -293,8 +292,10 @@ func (p *channelPipeline) send(serial string) bool {
 	cseq := atomic.AddInt64(&cseqCounter, 1)
 	aid := randomAID()
 	if !p.write("DHPOST", fmt.Sprintf("/device/%s/p2p-channel", serial), p2pChannelBody(p.lport, aid), cseq) {
+		protolog("× %s send fail (socket write, cseq=%d)", serial, cseq)
 		return false
 	}
+	protolog("> DHPOST /device/%s/p2p-channel cseq=%d", serial, cseq)
 	p.inflight[cseq] = &inflightChannel{serial: serial, aid: aid, deadline: time.Now().Add(p.timeout)}
 	p.sent++
 	return true
@@ -346,6 +347,7 @@ func (p *channelPipeline) expire(stats *ScanStats) {
 			delete(p.graveyard, c)
 			if g.retries >= CHANNEL_RETRIES {
 				atomic.AddInt64(&stats.Dead, 1)
+				protolog("× %s dead (silence, retries exhausted)", g.serial)
 				continue
 			}
 			p.sendRetry(g, stats)
@@ -362,6 +364,7 @@ func (p *channelPipeline) sendRetry(g *graveEntry, stats *ScanStats) {
 		p.sendFail(g.serial, stats)
 		return
 	}
+	protolog("~ %s retry %d/%d cseq=%d", g.serial, g.retries+1, CHANNEL_RETRIES, cseq)
 	p.inflight[cseq] = &inflightChannel{serial: g.serial, aid: aid, retries: g.retries + 1, deadline: time.Now().Add(p.timeout)}
 	p.sent++
 }
@@ -374,18 +377,22 @@ func (p *channelPipeline) resolve(r dhResp, aliveCh chan<- string, stats *ScanSt
 		if ir, ok := p.inflight[r.CSeq]; ok && !ir.extended {
 			ir.extended = true
 			ir.deadline = time.Now().Add(p.timeout)
+			protolog("< %d cseq=%d %s (provisional, deadline+)", r.Code, r.CSeq, ir.serial)
 		}
 		return
 	}
 	if ir, ok := p.inflight[r.CSeq]; ok {
 		delete(p.inflight, r.CSeq)
+		p.resolvedCycle++
 		p.markChecked(ir.serial, stats)
 		if channelAckAlive(r) {
 			atomic.AddInt64(&stats.Alive, 1)
+			protolog("< %d cseq=%d %s (alive)", r.Code, r.CSeq, ir.serial)
 			aliveCh <- ir.serial
 			p.teardown(ir.aid, r)
 		} else {
 			atomic.AddInt64(&stats.Dead, 1)
+			protolog("< %d cseq=%d %s (dead)", r.Code, r.CSeq, ir.serial)
 		}
 		return
 	}
@@ -394,12 +401,15 @@ func (p *channelPipeline) resolve(r dhResp, aliveCh chan<- string, stats *ScanSt
 	// истечении — здесь лишь раскладываем alive/dead).
 	if g, ok := p.graveyard[r.CSeq]; ok {
 		delete(p.graveyard, r.CSeq)
+		p.resolvedCycle++
 		if channelAckAlive(r) {
 			atomic.AddInt64(&stats.Alive, 1)
+			protolog("< %d cseq=%d %s (late alive)", r.Code, r.CSeq, g.serial)
 			aliveCh <- g.serial
 			p.teardown(g.aid, r)
 		} else {
 			atomic.AddInt64(&stats.Dead, 1)
+			protolog("< %d cseq=%d %s (late dead)", r.Code, r.CSeq, g.serial)
 		}
 		return
 	}
@@ -466,10 +476,11 @@ func (p *channelPipeline) teardown(aid []byte, ack dhResp) {
 // govern — адаптивное окно: доля истёкших без ответа ниже 2% — облако
 // отвечает нормально, окно растёт; выше 10% — облако дропает, окно сжимается.
 func (p *channelPipeline) govern() {
-	if p.sent == 0 {
+	total := p.resolvedCycle + p.expiredCycle
+	if total == 0 {
 		return
 	}
-	share := float64(p.expiredCycle) / float64(p.sent)
+	share := float64(p.expiredCycle) / float64(total)
 	switch {
 	case share < 0.02:
 		p.window += GOV_GROW
@@ -482,67 +493,70 @@ func (p *channelPipeline) govern() {
 			p.window = W_MIN
 		}
 	}
-	p.sent, p.expiredCycle = 0, 0
+	p.sent = 0
+	p.resolvedCycle, p.expiredCycle = 0, 0
 }
 
-// run — главный цикл воркера: наполняет окно, читает ответы, мэтчит по CSeq.
-// Тишина облака отрабатывается ретраями внутри expire — отдельных кругов
-// и late-файлов нет: серийник либо получает вердикт, либо умирает после
-// исчерпания CHANNEL_RETRIES.
+// run — главный цикл воркера: непрерывный скользящий конвейер (sliding window).
+// Новые запросы уходят сразу, как только освобождается слот в p.window, не
+// дожидаясь опорожнения всего окна (устраняет stop-and-wait задержку).
 func (p *channelPipeline) run(ctx context.Context, jobs <-chan string, aliveCh chan<- string, stats *ScanStats) {
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		// блокирующе берём первый серийник окна
-		var s string
-		var ok bool
-		select {
-		case <-ctx.Done():
-			return
-		case s, ok = <-jobs:
-		}
-		if !ok {
-			break // канал закрыт — дожидаемся окно и кладбище внизу
-		}
-		if !p.send(s) {
-			p.sendFail(s, stats)
-		}
 
-		// дозаполняем окно, пока есть джобы
-	fill:
-		for len(p.inflight) < PIPELINE_WINDOW {
+		// Дозаполняем окно до p.window, пока в jobs есть данные
+		for len(p.inflight) < p.window {
 			select {
 			case <-ctx.Done():
 				return
 			case s, ok := <-jobs:
 				if !ok {
-					break fill // канал закрыт — дальше только слив
+					goto drain
 				}
 				if !p.send(s) {
 					p.sendFail(s, stats)
 				}
-				// растягиваем пачку: залп в одну микросекунду — флуд-профиль
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(SEND_STAGGER):
-				}
 			default:
-				break fill // джобы придут на следующем обороте
+				// в jobs прямо сейчас нет готовых элементов — переходим к чтению
+				goto readPhase
 			}
 		}
 
-		// фаза чтения: пока окно не опустело
-		for len(p.inflight) > 0 {
-			p.pump(ctx, aliveCh, stats)
+	readPhase:
+		// Если ничего не летит и в кладбище пусто — ждём блокирующе новую работу
+		if len(p.inflight) == 0 && len(p.graveyard) == 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case s, ok := <-jobs:
+				if !ok {
+					return
+				}
+				if !p.send(s) {
+					p.sendFail(s, stats)
+				}
+			}
+			continue
 		}
-		p.govern()
+
+		// Читаем датаграмму или обрабатываем таймаут
+		p.pump(ctx, aliveCh, stats)
+
+		// Адаптируем окно по завершении порции запросов
+		if (p.resolvedCycle + p.expiredCycle) >= int64(p.window) {
+			p.govern()
+		}
 	}
-	// jobs закрыты: дожидаемся окно и кладбище — ретраи внутри expire
-	// обязаны отработать до выхода (молчание ≠ вердикт).
+
+drain:
+	// jobs закрыты: дожидаемся завершения окна и кладбища
 	for (len(p.inflight) > 0 || len(p.graveyard) > 0) && ctx.Err() == nil {
 		p.pump(ctx, aliveCh, stats)
+		if (p.resolvedCycle + p.expiredCycle) >= int64(p.window) {
+			p.govern()
+		}
 	}
 }
 
@@ -572,47 +586,92 @@ func scanWorker(ctx context.Context, conn *net.UDPConn, jobs <-chan string, aliv
 // readSerialsFile — загрузка входного файла в два прохода с прогрессом
 // в stats: фаза 1 быстро считает строки (чистый подсчёт \n по чанкам —
 // бар знает свой 100% заранее), фаза 2 санитайзит серийники и двигает бар.
-// Вход прогоняем через SanitizeSerial: «SN;модель», md5-мусор и прочие
-// не-серийники отбрасываются ДО проба (иначе мусорные строки улетали в
-// облако и часть ответов трактовалась как валид). Возврат — (список,
-// сообщение об ошибке); пустая строка = ок.
-func readSerialsFile(f *os.File, stats *ScanStats) ([]string, string) {
+const (
+	// ReadBufSize — буфер последовательного чтения входа (один ридер —
+	// диск любит последовательность; 4 МБ сглаживают рывки).
+	ReadBufSize = 4 << 20
+	// ScanBufMax — потолок строки входа для bufio.Scanner.
+	ScanBufMax = 1 << 20
+	// DedupWindow — сколько уникальных серийников держим для дедупа.
+	// Дальше окно сбрасывается (память фиксирована ~десятки МБ): дубли
+	// через границу окна уйдут в повторный проб, но на выход не задвоятся
+	// (writer давит повторы через seenAlive — живых мало, мапа крошечная).
+	DedupWindow = 1 << 20
+)
+
+// countReader — считает байты, прочитанные из входа, для прогресса.
+// Атомарно: продьюсер в своей горутине, UI тикает из другой.
+type countReader struct {
+	r io.Reader
+	n *int64
+}
+
+func (c *countReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 {
+		atomic.AddInt64(c.n, int64(n))
+	}
+	return n, err
+}
+
+// emitEvent — одна строка в канал событий без блокировки (канал может
+// быть nil или забит — тогда молча пропускаем).
+func emitEvent(events chan<- string, s string) {
+	if events == nil {
+		return
+	}
+	select {
+	case events <- s:
+	default:
+	}
+}
+
+// Debug — тумблер протокольного логирования (дампы DH-запросов/ответов
+// как в dh-fwd: направление, метод/код, CSeq, серийник).
+// Осторожно: на миллионах проб лог распухает до гигабайтов.
+var Debug bool
+
+// LogHook — кастомный логгер протокола (nil = молча).
+// Дёргается из хот-пасса воркеров — обязана быть быстрой и потокобезопасной.
+var LogHook func(string)
+
+// protolog — одна строка протокола в хук (ноль работы при выключенном дебаге).
+func protolog(format string, args ...any) {
+	if !Debug || LogHook == nil {
+		return
+	}
+	LogHook(fmt.Sprintf(format, args...))
+}
+
+// streamSerials — стрим-поставщик серийников: один проход по файлу, санитайз
+// без аллокаций (string только для валидных), дедуп окном фиксированного
+// размера, прогресс по байтам (stats.Total растёт по мере отдачи — бар
+// скана честный). Ничего не копит: память O(окно), а не O(файл) —
+// многогигабайтные входы не жрут RAM. Закрывает out по завершении.
+// Возвращает число отданных уникальных и текст ошибки ("" = ок).
+// dedupWindow — размер окна дедупа (тесты подсовывают маленькое).
+func streamSerials(ctx context.Context, f *os.File, stats *ScanStats, events chan<- string, out chan<- string, dedupWindow int) (int64, string) {
 	atomic.StoreInt64(&stats.Reading, 1)
 	defer atomic.StoreInt64(&stats.Reading, 0)
+	defer close(out)
 
-	// ── фаза 1: подсчёт строк ──
-	totalLines := int64(0)
-	{
-		var last byte
-		var seenBytes int64
-		br := bufio.NewReaderSize(f, 1<<20)
-		buf := make([]byte, 1<<20)
-		for {
-			n, rerr := br.Read(buf)
-			if n > 0 {
-				totalLines += int64(bytes.Count(buf[:n], []byte{'\n'}))
-				seenBytes += int64(n)
-				last = buf[n-1]
-			}
-			if rerr != nil {
-				break
-			}
-		}
-		if seenBytes > 0 && last != '\n' {
-			totalLines++
-		}
-		atomic.StoreInt64(&stats.ReadTotal, totalLines)
-		f.Seek(0, 0)
+	if dedupWindow < 1 {
+		dedupWindow = DedupWindow
 	}
+	var readBytes int64
+	sc := bufio.NewScanner(&countReader{r: f, n: &readBytes})
+	sc.Buffer(make([]byte, 64*1024), ScanBufMax)
 
-	// ── фаза 2: санитайз серийников с прогрессом по строкам ──
-	var serials []string
 	seen := make(map[string]struct{})
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+	var emitted, lines, valid, resets int64
+	flush := func() {
+		atomic.StoreInt64(&stats.ReadLines, lines)
+		atomic.StoreInt64(&stats.ReadValid, valid)
+		atomic.StoreInt64(&stats.Total, emitted)
+	}
 	for sc.Scan() {
-		atomic.AddInt64(&stats.ReadLines, 1)
-		s := ironscan.SanitizeSerial(sc.Text())
+		lines++
+		s := ironscan.SanitizeSerialBytes(sc.Bytes())
 		if s == "" {
 			continue
 		}
@@ -620,13 +679,32 @@ func readSerialsFile(f *os.File, stats *ScanStats) ([]string, string) {
 			continue
 		}
 		seen[s] = struct{}{}
-		serials = append(serials, s)
-		atomic.AddInt64(&stats.ReadValid, 1)
+		if len(seen) >= dedupWindow {
+			seen = make(map[string]struct{})
+			resets++
+		}
+		select {
+		case <-ctx.Done():
+			flush()
+			return emitted, ""
+		case out <- s:
+		}
+		emitted++
+		valid++
+		if emitted&4095 == 0 {
+			flush()
+		}
+	}
+	flush()
+	atomic.StoreInt64(&stats.ReadBytes, readBytes)
+	atomic.StoreInt64(&stats.DedupResets, resets)
+	if resets > 0 {
+		emitEvent(events, "[SYS] "+fmt.Sprintf(i18n.Tr("дедуп-окно переполнено %d раз(а) — дубли могли уйти в повторный проб"), resets))
 	}
 	if err := sc.Err(); err != nil {
-		return nil, i18n.Tr("ошибка чтения входного файла: ") + err.Error()
+		return emitted, i18n.Tr("ошибка чтения входного файла: ") + err.Error()
 	}
-	return serials, ""
+	return emitted, ""
 }
 
 // lookupCloudIPs — все IPv4 A-записи облака. Бюджеты облака могут
@@ -661,54 +739,37 @@ func newEgress(ip net.IP) (*net.UDPConn, error) {
 	return conn, nil
 }
 
-func RunScanner(ctx context.Context, inputFile, outputFile string, appendMode bool, workers int, stats *ScanStats, events chan<- string) {
-	defer func() { stats.Done = true }()
-
-	// Load serials
-	f, err := os.Open(inputFile)
-	if err != nil {
-		stats.ErrorMsg = i18n.Tr("ошибка открытия входного файла: ") + err.Error()
-		return
-	}
-
-	var serials []string
-	serials, serr := readSerialsFile(f, stats)
-	f.Close()
-	if serr != "" {
-		stats.ErrorMsg = serr
-		return
-	}
-
-	total := int64(len(serials))
-	stats.Total = total
-	if total == 0 {
-		stats.ErrorMsg = i18n.Tr("Файл пуст")
-		return
-	}
-
-	ulimit := getUlimit()
-	maxWorkers := int(ulimit - 200)
-	if maxWorkers < 1 {
-		maxWorkers = 1
-	}
-	if workers <= 0 || workers > maxWorkers {
-		workers = maxWorkers
-	}
-
-	// appendMode: true — дописывать в конец (накопление по префиксам),
-	// false — перезаписать файл текущим прогоном. По умолчанию TUI
-	// спрашивает пользователя, если файл уже существует.
+// openOutput — выходной файл + буферизированный writer.
+// appendMode: true — дописывать в конец (накопление по префиксам),
+// false — перезаписать файл текущим прогоном.
+func openOutput(outputFile string, appendMode bool, stats *ScanStats) (*os.File, *bufio.Writer, string) {
 	outFlags := os.O_CREATE | os.O_WRONLY | os.O_APPEND
 	if !appendMode {
 		outFlags |= os.O_TRUNC
 	}
 	outFile, err := os.OpenFile(outputFile, outFlags, 0644)
 	if err != nil {
-		stats.ErrorMsg = i18n.Tr("ошибка создания выходного файла: ") + err.Error()
-		return
+		return nil, nil, i18n.Tr("ошибка создания выходного файла: ") + err.Error()
 	}
-	defer outFile.Close()
-	outWriter := bufio.NewWriterSize(outFile, 256*1024)
+	return outFile, bufio.NewWriterSize(outFile, 256*1024), ""
+}
+
+// runPipe — общий движок скана: лимиты ОС, резолв облака, egress-сокеты,
+// воркеры, writer с seenAlive (каждый живой пишется один раз; seedAlive —
+// предзагруженные живые для resume), updater статистики. feed льёт серийники
+// в jobs (бэкпрешер полного канала — память плоская) и закрывает его.
+// Возвращает текст ошибки ("" = ок).
+func runPipe(ctx context.Context, stats *ScanStats, events chan<- string, outWriter *bufio.Writer, workers int, feed func(jobs chan string), seedAlive map[string]struct{}) string {
+	// Лимиты ОС — сами, чтобы юзер не парился: на линуксе мягкий лимит fd
+	// поднимаем через Setrlimit, на винде берём безопасный кап.
+	lim := syslimits.Ensure()
+	workers = lim.ClampWorkers(workers)
+	if lim.Raised {
+		emitEvent(events, "[SYS] fd limit "+strconv.FormatUint(lim.FDBefore, 10)+" → "+strconv.FormatUint(lim.FDAfter, 10))
+	}
+	if lim.ManualFix != "" {
+		emitEvent(events, "[SYS] "+i18n.Tr("подними лимит вручную: ")+lim.ManualFix)
+	}
 
 	cloudIPs := lookupCloudIPs()
 	if len(cloudIPs) == 0 {
@@ -717,8 +778,7 @@ func RunScanner(ctx context.Context, inputFile, outputFile string, appendMode bo
 		}
 	}
 	if len(cloudIPs) == 0 {
-		stats.ErrorMsg = i18n.Tr("ошибка резолва сервера: ") + MAIN_SERVER
-		return
+		return i18n.Tr("ошибка резолва сервера: ") + MAIN_SERVER
 	}
 
 	conns := make([]*net.UDPConn, 0, workers)
@@ -732,8 +792,7 @@ func RunScanner(ctx context.Context, inputFile, outputFile string, appendMode bo
 	}
 
 	if len(conns) == 0 {
-		stats.ErrorMsg = i18n.Tr("не смог создать необходимое кол-во сокетов (фикс: ulimit -n 100000)")
-		return
+		return i18n.Tr("не смог создать сокеты (фикс: ") + syslimits.SocketHint() + ")"
 	}
 	defer func() {
 		for _, conn := range conns {
@@ -741,9 +800,9 @@ func RunScanner(ctx context.Context, inputFile, outputFile string, appendMode bo
 		}
 	}()
 
-	// Один круг по списку: воркеры на живых сокетах, alive сразу
-	// в выходной файл. Тишина облака отрабатывается ретраями внутри
-	// пайплайна (expire → sendRetry) — отдельных кругов нет.
+	// Один круг: воркеры на живых сокетах, alive сразу в выходной файл.
+	// Тишина облака отрабатывается ретраями внутри пайплайна
+	// (expire → sendRetry) — отдельных кругов нет.
 	jobs := make(chan string, workers*10)
 	aliveCh := make(chan string, workers*10)
 
@@ -758,37 +817,30 @@ func RunScanner(ctx context.Context, inputFile, outputFile string, appendMode bo
 
 	var writeWg sync.WaitGroup
 	writeWg.Add(1)
+	// seenAlive давит повторы на выходе: дубли через границу дедуп-окна
+	// могут уйти в повторный проб, но в файл каждый живой пишется один раз.
+	// Живых на порядки меньше, чем вход, — мапа крошечная.
+	seenAlive := make(map[string]struct{}, len(seedAlive))
+	for s := range seedAlive {
+		seenAlive[s] = struct{}{}
+	}
 	go func() {
 		defer writeWg.Done()
 		for s := range aliveCh {
+			if _, ok := seenAlive[s]; ok {
+				continue
+			}
+			seenAlive[s] = struct{}{}
 			outWriter.WriteString(s + "\n")
 			outWriter.Flush() // Пишем сразу в файл, а не в память
-			if events != nil {
-				select {
-				case events <- "[VALID] " + s:
-				default:
-				}
-			}
+			emitEvent(events, "[VALID] "+s)
 		}
 		outWriter.Flush()
 	}()
 
-feed:
-	for _, s := range serials {
-		select {
-		case <-ctx.Done():
-			break feed
-		case jobs <- s:
-		}
-	}
-	close(jobs)
-	rwg.Wait()
-	close(aliveCh)
-	writeWg.Wait()
-
+	// Stats updater loop стартует ДО фида (иначе скорость мёртвая всё время
+	// подачи входа). ETA выпилен — врёт.
 	start := time.Now()
-
-	// Stats updater loop (ETA выпилен — врёт)
 	updStop := make(chan struct{})
 	var lastAliveMark int64
 	lastAliveT := start
@@ -819,8 +871,69 @@ feed:
 		}
 	}()
 
+	feed(jobs)
+
+	rwg.Wait()
+	close(aliveCh)
+	writeWg.Wait()
+
 	// Круг один: ретраи молчунов — внутри пайплайна, второго круга нет.
 	// Хроника молчит после всех ретраев — это оффлайн, а не медленный ack.
 	close(updStop)
 	outWriter.Flush()
+	return ""
+}
+
+func RunScanner(ctx context.Context, inputFile, outputFile string, appendMode bool, workers int, stats *ScanStats, events chan<- string) {
+	defer func() { stats.Done = true }()
+
+	// Вход читаем стримом (см. streamSerials) — в RAM ничего не копим,
+	// поэтому многогигабайтные файлы не жрут память. Размер нужен сразу
+	// для прогресса по байтам.
+	f, err := os.Open(inputFile)
+	if err != nil {
+		stats.ErrorMsg = i18n.Tr("ошибка открытия входного файла: ") + err.Error()
+		return
+	}
+	fi, serr := f.Stat()
+	if serr != nil {
+		f.Close()
+		stats.ErrorMsg = i18n.Tr("ошибка открытия входного файла: ") + serr.Error()
+		return
+	}
+	if fi.Size() == 0 {
+		f.Close()
+		stats.ErrorMsg = i18n.Tr("Файл пуст")
+		return
+	}
+	atomic.StoreInt64(&stats.ReadTotalBytes, fi.Size())
+
+	outFile, outWriter, oerr := openOutput(outputFile, appendMode, stats)
+	if oerr != "" {
+		f.Close()
+		stats.ErrorMsg = oerr
+		return
+	}
+	defer outFile.Close()
+
+	// Один круг: продьюсер льёт валидные серийники в jobs по мере чтения
+	// (бэкпрешер полного канала тормозит ридер — RAM плоская), jobs
+	// закрывается концом входа. Ретраи молчунов — внутри пайплайна,
+	// второго круга нет.
+	var emitted int64
+	var feedErr string
+	feed := func(jobs chan string) {
+		emitted, feedErr = streamSerials(ctx, f, stats, events, jobs, DedupWindow)
+		f.Close()
+	}
+	if perr := runPipe(ctx, stats, events, outWriter, workers, feed, nil); perr != "" {
+		stats.ErrorMsg = perr
+		return
+	}
+	if feedErr != "" {
+		stats.ErrorMsg = feedErr
+	}
+	if emitted == 0 && stats.ErrorMsg == "" {
+		stats.ErrorMsg = i18n.Tr("Файл пуст")
+	}
 }
