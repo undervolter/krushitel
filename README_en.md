@@ -34,29 +34,25 @@
 * Uses CVE-2021-33044/33045 and CVE-2024-39943
 * and much more...
 
-### Building on Windows
+### Building
 
 ```sh
 git clone github.com/undervolter/krushitel
 cd krushitel
-build_all.cmd
-cd bin
-```
-### Building on Linux
-```sh
-git clone github.com/undervolter/krushitel
-cd krushitel
-build.sh
-cd bin
+go build .
 ```
 <h2>Compiled binaries are available in Releases.</h2>
-
-### Bugs
-- Not found yet
 
 <h2>Found a bug? Please report it in the issues!</h2>
 
 If you would like to support the development of this software, feel free to submit a pull request.
+
+<div align="center">
+<h1>Acknowledges</h1>
+</div>
+  
+ - [thebadinteger/p2pwn](https://github.com/thebadinteger/p2pwn) — CVE-2024-39943
+ - [thebadinteger/smartpssxml](https://github.com/thebadinteger/smartpssxml) - XML export realzation
 
 <div align="center">
 <h2>t.me/kkrushitel</h2>
