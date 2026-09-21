@@ -45,18 +45,21 @@ cd krushitel
 build.sh
   ```
 <h2>Скомпилированные бинарники доступны в Releases.</h2>
-
-### Баги
- - Пока не обнаружены
  
 <h2>Нашел какой то баг? Пожалуйста, отпиши в issues!</h2>
 
 Если вы хотите поддержать разработку софта - пожалуйста, пулл реквесты для вас открыты.
 
-
+<div align="center">
+<h1>Благодарности</h1>
+</div>
+  
+ - [thebadinteger/p2pwn](https://github.com/thebadinteger/p2pwn) — CVE-2024-39943
+ - [thebadinteger/smartpssxml](https://github.com/thebadinteger/smartpssxml) - Реализация XML экспорта
 
 <div align="center">
 <h2>t.me/kkrushitel</h2>
 </div>
+
 
 
