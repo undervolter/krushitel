@@ -76,8 +76,8 @@ func Test_dhTunnel_ports(t *testing.T) {
 // Реверс-инвариант: portSpecs держит соответствие порт→spec.
 func Test_portSpecs(t *testing.T) {
 	specs := portSpecs(defaultTunnelPorts)
-	if len(specs) != 4 {
-		t.Fatalf("len = %d", len(specs))
+	if len(specs) != len(defaultTunnelPorts) {
+		t.Fatalf("len = %d, expected %d", len(specs), len(defaultTunnelPorts))
 	}
 	for i, sp := range specs {
 		if sp.Local != 0 || sp.Remote != defaultTunnelPorts[i] {

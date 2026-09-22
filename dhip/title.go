@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"strings"
 	"time"
 )
 
@@ -175,6 +174,82 @@ func SetCustomTitleRectTextsDial(dial Dialer, password string, texts []string, r
 	return SetCustomTitleRectTextsUserDial(dial, "admin", password, texts, rect)
 }
 
+// defaultSlotRect возвращает координаты слота в сетке 8192x8192
+// Слот 0: [200, 1000, 4500, 1500]
+// Слот 1: [200, 1600, 4500, 2100]
+// Слот 2: [200, 2200, 4500, 2700]
+// Слот 3: [200, 2800, 4500, 3300]
+func defaultSlotRect(slot int) []int {
+	y1 := 1000 + slot*600
+	y2 := y1 + 500
+	return []int{200, y1, 4500, y2}
+}
+
+func isZeroRect(r any) bool {
+	if r == nil {
+		return true
+	}
+	switch v := r.(type) {
+	case []any:
+		if len(v) == 4 {
+			for _, val := range v {
+				switch n := val.(type) {
+				case float64:
+					if n != 0 {
+						return false
+					}
+				case int:
+					if n != 0 {
+						return false
+					}
+				}
+			}
+			return true
+		}
+	case []int:
+		if len(v) == 4 {
+			return v[0] == 0 && v[1] == 0 && v[2] == 0 && v[3] == 0
+		}
+	}
+	return true
+}
+
+func sendFlatVideoWidget(conn net.Conn, sess int, texts []string, rect []int) (bool, error) {
+	flatParams := make(map[string]any)
+	for ch := 0; ch < 32; ch++ {
+		for j := 0; j < 4; j++ {
+			prefix := fmt.Sprintf("VideoWidget[%d].CustomTitle[%d]", ch, j)
+			if j < len(texts) {
+				flatParams[prefix+".Text"] = texts[j]
+				flatParams[prefix+".EncodeBlend"] = true
+				flatParams[prefix+".PreviewBlend"] = true
+				r := rect
+				if r == nil || len(r) != 4 {
+					r = defaultSlotRect(j)
+				}
+				flatParams[prefix+".Rect[0]"] = r[0]
+				flatParams[prefix+".Rect[1]"] = r[1]
+				flatParams[prefix+".Rect[2]"] = r[2]
+				flatParams[prefix+".Rect[3]"] = r[3]
+			} else {
+				flatParams[prefix+".EncodeBlend"] = false
+				flatParams[prefix+".PreviewBlend"] = false
+			}
+		}
+	}
+	r, ferr := dhipCallCollectT(conn, "configManager.setConfig", flatParams, sess, 31, nil, nil, nil, nil, CallTimeout)
+	if ferr != nil {
+		if isRetryableConnErr(ferr) {
+			return false, nil
+		}
+		return false, fmt.Errorf("setConfig flat VideoWidget: %w", ferr)
+	}
+	if ok, _ := r["result"].(bool); !ok {
+		return false, fmt.Errorf("setConfig flat VideoWidget: result=false")
+	}
+	return true, nil
+}
+
 // SetCustomTitleRectTextsUserDial — юзеро-явная версия (см.
 // SetChannelTitleUserDial: dummy-юзеры CVE-2024-39943 тоже админ-группы).
 func SetCustomTitleRectTextsUserDial(dial Dialer, user, password string, texts []string, rect []int) (bool, error) {
@@ -191,43 +266,9 @@ func SetCustomTitleRectTextsUserDial(dial Dialer, user, password string, texts [
 
 	table, err := configGetTable(conn, sess, 30, "VideoWidget")
 	if err != nil {
-		errStr := err.Error()
-		if strings.Contains(errStr, "json decode") || strings.Contains(errStr, "unexpected end of JSON") || strings.Contains(errStr, "EOF") || strings.Contains(errStr, "timeout") {
-			// Устройство не отдало таблицу разом (слишком большая или сбой декода) —
-			// фоллбэк на flat-формат VideoWidget[N].CustomTitle[M] по каналам 0..31.
-			flatParams := make(map[string]any)
-			for ch := 0; ch < 32; ch++ {
-				for j := 0; j < 4; j++ {
-					prefix := fmt.Sprintf("VideoWidget[%d].CustomTitle[%d]", ch, j)
-					if j < len(texts) {
-						flatParams[prefix+".Text"] = texts[j]
-						flatParams[prefix+".EncodeBlend"] = true
-						flatParams[prefix+".PreviewBlend"] = true
-						if rect != nil && len(rect) == 4 {
-							flatParams[prefix+".Rect[0]"] = rect[0]
-							flatParams[prefix+".Rect[1]"] = rect[1]
-							flatParams[prefix+".Rect[2]"] = rect[2]
-							flatParams[prefix+".Rect[3]"] = rect[3]
-						}
-					} else {
-						flatParams[prefix+".EncodeBlend"] = false
-						flatParams[prefix+".PreviewBlend"] = false
-					}
-				}
-			}
-			r, ferr := dhipCallCollectT(conn, "configManager.setConfig", flatParams, sess, 31, nil, nil, nil, nil, CallTimeout)
-			if ferr != nil {
-				if isRetryableConnErr(ferr) {
-					return false, nil
-				}
-				return false, fmt.Errorf("setConfig flat VideoWidget: %w", ferr)
-			}
-			if ok, _ := r["result"].(bool); !ok {
-				return false, fmt.Errorf("setConfig flat VideoWidget: result=false")
-			}
-			return true, nil
-		}
-		return false, fmt.Errorf("getConfig VideoWidget: %w", err)
+		// Устройство не отдало таблицу разом (json decode/EOF/timeout) —
+		// отправляем flat-формат VideoWidget[N].CustomTitle[M] с рабочими Rect
+		return sendFlatVideoWidget(conn, sess, texts, rect)
 	}
 
 	changed := false
@@ -236,11 +277,22 @@ func SetCustomTitleRectTextsUserDial(dial Dialer, user, password string, texts [
 		if !ok {
 			continue
 		}
-		// CustomTitle — массив из 4 оверлеев на канал (по дампу реальной
-		// камеры: Text + Rect + флаги видимости).
 		ct, ok := entry["CustomTitle"].([]any)
 		if !ok || len(ct) == 0 {
-			continue
+			// На части устройств CustomTitle не создан по умолчанию — инициализируем 4 слота
+			ct = make([]any, 4)
+			for j := range ct {
+				defR := defaultSlotRect(j)
+				ct[j] = map[string]any{
+					"Text":         "",
+					"EncodeBlend":  false,
+					"PreviewBlend": false,
+					"Rect":         []any{defR[0], defR[1], defR[2], defR[3]},
+					"FrontColor":   []any{255, 255, 255, 255},
+					"BackColor":    []any{0, 0, 0, 128},
+				}
+			}
+			entry["CustomTitle"] = ct
 		}
 		for j := range ct {
 			c, ok := ct[j].(map[string]any)
@@ -253,6 +305,11 @@ func SetCustomTitleRectTextsUserDial(dial Dialer, user, password string, texts [
 				c["PreviewBlend"] = true
 				if rect != nil && len(rect) == 4 {
 					c["Rect"] = []any{rect[0], rect[1], rect[2], rect[3]}
+				} else if isZeroRect(c["Rect"]) {
+					// Если в конфиге нулевые координаты [0,0,0,0] — текст не отображается!
+					// Задаём валидные координаты слота в сетке 8192x8192
+					defR := defaultSlotRect(j)
+					c["Rect"] = []any{defR[0], defR[1], defR[2], defR[3]}
 				}
 			} else {
 				// слотов больше, чем текстов — прячем лишние
@@ -261,14 +318,19 @@ func SetCustomTitleRectTextsUserDial(dial Dialer, user, password string, texts [
 			}
 			changed = true
 		}
-		// ChannelTitle (имя канала в OSD) не трогаем: у него свой
-		// EncodeBlend/PreviewBlend, и пользователь уже управляет им
-		// через ChannelTitle.Name.
 	}
 	if !changed {
-		return false, fmt.Errorf("VideoWidget: нет CustomTitle ни на одном канале")
+		return sendFlatVideoWidget(conn, sess, texts, rect)
 	}
-	return configSetTable(conn, sess, 31, "VideoWidget", table)
+	applied, err := configSetTable(conn, sess, 31, "VideoWidget", table)
+	if err != nil {
+		// При сбое отправки крупной таблицы — пробуем плоский формат
+		if fapplied, ferr := sendFlatVideoWidget(conn, sess, texts, rect); ferr == nil {
+			return fapplied, nil
+		}
+		return applied, err
+	}
+	return applied, nil
 }
 
 // configGetTable — configManager.getConfig {"name": name} → params.table.

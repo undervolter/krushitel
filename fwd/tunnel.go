@@ -2119,12 +2119,22 @@ func (t *Tunnel) dropRealm(realm uint32) {
 	}
 }
 
+func (t *Tunnel) portPoolTarget(remotePort int) int {
+	if remotePort == 80 || remotePort == 81 {
+		if t.poolTarget < 50 {
+			return 50
+		}
+	}
+	return t.poolTarget
+}
+
 // preBindRealm открывает один realm и паркует его в пул.
 func (t *Tunnel) preBindRealm(remotePort int) {
 	t.poolMu.Lock()
 	st := t.pools[remotePort]
-	if st == nil || t.poolTarget <= 0 ||
-		len(st.queue)+st.inflight >= t.poolTarget {
+	target := t.portPoolTarget(remotePort)
+	if st == nil || target <= 0 ||
+		len(st.queue)+st.inflight >= target {
 		t.poolMu.Unlock()
 		return
 	}
@@ -2186,7 +2196,7 @@ func (t *Tunnel) poolKeeper(done chan struct{}, remotePort int) {
 				t.poolMu.Unlock()
 				return
 			}
-			spawn := t.poolTarget - len(st.queue) - st.inflight
+			spawn := t.portPoolTarget(remotePort) - len(st.queue) - st.inflight
 			if spawn < 0 {
 				spawn = 0
 			}
@@ -2332,10 +2342,6 @@ func (virtAddr) String() string  { return "camera-via-tunnel" }
 // realm. Закрытие коннекта гасит realm DISC'ом на камере. Для TOU-пути
 // realm открывается SYN'ом.
 func (t *Tunnel) DialCamera(remotePort int) (net.Conn, error) {
-	if remotePort == 80 && t.IsRelay() {
-		return nil, fmt.Errorf("relay tunnel: port 80 unavailable (camera drops connection)")
-	}
-
 	server, client := newVirtPipe()
 
 	// туннель мог умереть/рестартнуть до нас: primary уже nil

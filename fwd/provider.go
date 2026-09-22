@@ -49,11 +49,8 @@ type Binding struct {
 }
 
 // HasPort сообщает, доступен ли порт на данном биндинге.
-// Для релейных туннелей (IsRelay) порт 80 никогда не пробрасывается облаком Dahua.
+// Веб через relay рабочий (порты 80 и 81).
 func (b Binding) HasPort(port int) bool {
-	if b.IsRelay && port == 80 {
-		return false
-	}
 	return true
 }
 
@@ -77,8 +74,8 @@ type Provider interface {
 	Shutdown()
 }
 
-// defaultTunnelPorts — порты камеры для туннеля эксплойта (37777 первый, как в dh-fwd).
-var defaultTunnelPorts = []int{37777, 5000, 80, 554}
+// defaultTunnelPorts — порты камеры для туннеля эксплойта (37777 первый, как в dh-fwd, 80/81 для веба).
+var defaultTunnelPorts = []int{37777, 5000, 80, 81, 554}
 
 // portSpecs — порты камеры → спецификации форвардов (локальный ephemeral).
 func portSpecs(ports []int) []PortSpec {
@@ -404,7 +401,7 @@ func (s *DhFwdService) spawn() error {
 		"--service",
 		"-p", s.portsArg(),
 		"-threads", "1", // один handshake на серийник: 3 порта в одной группе
-		"--pool", "0",
+		"--pool", "50",
 	)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
