@@ -108,7 +108,7 @@ func FindActiveChannels(addr, user, pass string, totalChannels int, timeout time
 		ok bool
 	}
 	resCh := make(chan probeRes, totalChannels)
-	sem := make(chan struct{}, 4)
+	sem := make(chan struct{}, 8)
 
 	var wg sync.WaitGroup
 	for ch := 1; ch <= totalChannels; ch++ {

@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -81,15 +82,20 @@ func (s *fakeDhipServer) handle(conn net.Conn) {
 		s.requests = append(s.requests, recReq{pkt.Method, pkt.Params})
 
 		result, paramsOut := s.handler(pkt.Method, pkt.Params, pkt.ID)
-		resp := map[string]any{
-			"id":      pkt.ID,
-			"session": pkt.Sess,
-			"result":  result,
+		var raw []byte
+		if rawStr, ok := paramsOut["__raw__"].(string); ok {
+			raw = []byte(rawStr)
+		} else {
+			resp := map[string]any{
+				"id":      pkt.ID,
+				"session": pkt.Sess,
+				"result":  result,
+			}
+			if paramsOut != nil {
+				resp["params"] = paramsOut
+			}
+			raw, _ = json.Marshal(resp)
 		}
-		if paramsOut != nil {
-			resp["params"] = paramsOut
-		}
-		raw, _ := json.Marshal(resp)
 		out := make([]byte, 32)
 		copy(out[0:8], dhipMagic)
 		binary.LittleEndian.PutUint32(out[8:12], uint32(pkt.Sess))
@@ -455,5 +461,116 @@ func Test_SetChannelTitle_ogre32(t *testing.T) {
 	}
 	if gotName != long[:32] {
 		t.Fatalf("Name = %q, want усечение до 32: %q", gotName, long[:32])
+	}
+}
+
+// При ошибке json decode (неполный фрейм/ошибка десериализации) VideoWidget
+// должен переключаться на flat-формат VideoWidget[N].CustomTitle[M].
+func Test_SetCustomTitle_flat_fallback_on_json_error(t *testing.T) {
+	var gotFlatSet bool
+	srv := newFakeDhipServer(t, func(method string, params map[string]any, id int) (bool, map[string]any) {
+		switch method {
+		case "global.login":
+			return fakeLoginHandler(nil)(method, params, id)
+		case "configManager.getConfig":
+			if params["name"] == "VideoWidget" {
+				// Возвращаем обрезанный JSON (unexpected end of JSON input)
+				bad := `{"id":30,"method":"configManager.getConfig","params":{"name":"VideoWidget","table":[{"Name":"cut`
+				return true, map[string]any{"__raw__": bad}
+			}
+			return true, nil
+		case "configManager.setConfig":
+			if _, ok := params["VideoWidget[0].CustomTitle[0].Text"]; ok {
+				gotFlatSet = true
+				return true, nil
+			}
+			return true, nil
+		}
+		return false, nil
+	})
+
+	applied, err := SetCustomTitle(srv.addr(), "pass123", "pwned", 5*time.Second)
+	if err != nil {
+		t.Fatalf("SetCustomTitle flat fallback failed: %v", err)
+	}
+	if !applied {
+		t.Fatalf("applied = false")
+	}
+	if !gotFlatSet {
+		t.Fatalf("flat setConfig не был вызван")
+	}
+}
+
+// Проверяем корректную склейку многофрагментных DHIP-ответов
+func Test_readDHIPFrame_multi_fragment(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Читаем любой запрос
+		hdr := make([]byte, 32)
+		io.ReadFull(conn, hdr)
+		bLen := binary.LittleEndian.Uint32(hdr[16:20])
+		body := make([]byte, bLen)
+		io.ReadFull(conn, body)
+
+		// Отправляем ответ, разбитый на 2 DHIP-фрейма:
+		// Полный JSON: `{"id":30,"result":true,"params":{"table":[{"Name":"ch1"},{"Name":"ch2"}]}}`
+		fullJSON := []byte(`{"id":30,"result":true,"params":{"table":[{"Name":"ch1"},{"Name":"ch2"}]}}`)
+		split := 35
+		chunk1 := fullJSON[:split]
+		chunk2 := fullJSON[split:]
+
+		// Фрейм 0
+		f0 := make([]byte, 32)
+		copy(f0[0:8], dhipMagic)
+		binary.LittleEndian.PutUint32(f0[8:12], 1)
+		binary.LittleEndian.PutUint32(f0[12:16], 30)
+		binary.LittleEndian.PutUint32(f0[16:20], uint32(len(chunk1))) // pkgLen
+		binary.LittleEndian.PutUint32(f0[20:24], 0)                   // pkgIdx
+		binary.LittleEndian.PutUint32(f0[24:28], uint32(len(fullJSON))) // msgLen = полный размер
+		conn.Write(append(f0, chunk1...))
+
+		// Небольшая пауза между фреймами
+		time.Sleep(10 * time.Millisecond)
+
+		// Фрейм 1
+		f1 := make([]byte, 32)
+		copy(f1[0:8], dhipMagic)
+		binary.LittleEndian.PutUint32(f1[8:12], 1)
+		binary.LittleEndian.PutUint32(f1[12:16], 30)
+		binary.LittleEndian.PutUint32(f1[16:20], uint32(len(chunk2))) // pkgLen
+		binary.LittleEndian.PutUint32(f1[20:24], 1)                   // pkgIdx
+		binary.LittleEndian.PutUint32(f1[24:28], uint32(len(chunk2))) // msgLen
+		conn.Write(append(f1, chunk2...))
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Посылаем dummy-запрос с id=30
+	r, err := dhipCallCollectT(conn, "configManager.getConfig", map[string]any{"name": "VideoWidget"}, 1, 30, nil, nil, nil, nil, 3*time.Second)
+	if err != nil {
+		t.Fatalf("dhipCallCollectT multi-fragment fail: %v", err)
+	}
+	params, ok := r["params"].(map[string]any)
+	if !ok {
+		t.Fatalf("params not found in response: %v", r)
+	}
+	table, ok := params["table"].([]any)
+	if !ok || len(table) != 2 {
+		t.Fatalf("table invalid or len != 2: %v", table)
 	}
 }

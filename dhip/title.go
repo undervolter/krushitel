@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -190,6 +191,42 @@ func SetCustomTitleRectTextsUserDial(dial Dialer, user, password string, texts [
 
 	table, err := configGetTable(conn, sess, 30, "VideoWidget")
 	if err != nil {
+		errStr := err.Error()
+		if strings.Contains(errStr, "json decode") || strings.Contains(errStr, "unexpected end of JSON") || strings.Contains(errStr, "EOF") || strings.Contains(errStr, "timeout") {
+			// Устройство не отдало таблицу разом (слишком большая или сбой декода) —
+			// фоллбэк на flat-формат VideoWidget[N].CustomTitle[M] по каналам 0..31.
+			flatParams := make(map[string]any)
+			for ch := 0; ch < 32; ch++ {
+				for j := 0; j < 4; j++ {
+					prefix := fmt.Sprintf("VideoWidget[%d].CustomTitle[%d]", ch, j)
+					if j < len(texts) {
+						flatParams[prefix+".Text"] = texts[j]
+						flatParams[prefix+".EncodeBlend"] = true
+						flatParams[prefix+".PreviewBlend"] = true
+						if rect != nil && len(rect) == 4 {
+							flatParams[prefix+".Rect[0]"] = rect[0]
+							flatParams[prefix+".Rect[1]"] = rect[1]
+							flatParams[prefix+".Rect[2]"] = rect[2]
+							flatParams[prefix+".Rect[3]"] = rect[3]
+						}
+					} else {
+						flatParams[prefix+".EncodeBlend"] = false
+						flatParams[prefix+".PreviewBlend"] = false
+					}
+				}
+			}
+			r, ferr := dhipCallCollectT(conn, "configManager.setConfig", flatParams, sess, 31, nil, nil, nil, nil, CallTimeout)
+			if ferr != nil {
+				if isRetryableConnErr(ferr) {
+					return false, nil
+				}
+				return false, fmt.Errorf("setConfig flat VideoWidget: %w", ferr)
+			}
+			if ok, _ := r["result"].(bool); !ok {
+				return false, fmt.Errorf("setConfig flat VideoWidget: result=false")
+			}
+			return true, nil
+		}
 		return false, fmt.Errorf("getConfig VideoWidget: %w", err)
 	}
 
