@@ -1,4 +1,8 @@
 <div align="center">
+<h1>Это бета версия софта - в ней может что то не работать! </h1>
+</div>
+
+<div align="center">
 
 <h1>krushitel</h1>
 
