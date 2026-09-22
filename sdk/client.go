@@ -242,6 +242,22 @@ func (c *Client) login(timeout time.Duration) (net.Conn, error) {
 	return nil, fmt.Errorf("login failed: code %d/%d", resp[8], resp[9])
 }
 
+// TryNoAuth — SDK-проба без авторизации: plain-логин с пустыми кредами
+// на готовом коннекте. true = устройство приняло без пароля (старая
+// прошивка / крашнутый auth-сервис). Коннект НЕ закрывается — вызыватель
+// решает что с ним делать.
+func TryNoAuth(conn net.Conn, timeout time.Duration) bool {
+	conn.SetDeadline(time.Now().Add(timeout))
+	if _, err := conn.Write(loginPacket("", "")); err != nil {
+		return false
+	}
+	resp, err := readFrame(conn)
+	if err != nil || len(resp) < 10 {
+		return false
+	}
+	return resp[8] == 0
+}
+
 func containsJPEGEnd(data []byte) bool {
 	for i := 0; i < len(data)-1; i++ {
 		if data[i] == 0xff && data[i+1] == 0xd9 {

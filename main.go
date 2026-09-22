@@ -45,7 +45,7 @@ func main() {
 		if lf != nil {
 			_ = lf.Close()
 		}
-		if err := update.Restart(); err != nil {
+		if err := update.Restart(os.Stdout, lf); err != nil {
 			fmt.Fprintf(os.Stderr, "ошибка перезапуска: %v\n", err)
 			os.Exit(1)
 		}
