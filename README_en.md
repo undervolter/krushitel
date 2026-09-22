@@ -1,4 +1,8 @@
 <div align="center">
+<h2>This is a beta version - some features may not work properly! </h2>
+</div>
+
+<div align="center">
 
 <h1>krushitel</h1>
 
