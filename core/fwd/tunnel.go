@@ -789,7 +789,7 @@ func (t *Tunnel) establish() error {
 		resp, pctx := t.runStunPunch(deviceRemote, devParts, devPort, deviceLaddr, aid, directPunchWindow, directPunchReadTO, 2)
 		if resp != nil {
 			t.logf("direct punch ok (%s)", pctx.via)
-			if t.profile.noRelayAuth || t.forceAppRelay {
+			if !agentOK && (t.profile.noRelayAuth || t.forceAppRelay) {
 				if err := t.finishDirect(deviceRemote, nil, agentOK, mainRemote, pctx, devParts); err != nil {
 					return err
 				}
