@@ -40,6 +40,8 @@ var (
 
 	relayChannelFirstInterval   = 700 * time.Millisecond
 	relayChannelRetransInterval = 1200 * time.Millisecond
+	directPunchWindow           = 3 * time.Second
+	directPunchReadTO           = 1 * time.Second
 	relayChannelMaxRetransmits  = 9
 )
 
@@ -780,6 +782,25 @@ func (t *Tunnel) establish() error {
 	devPort, _ := strconv.Atoi(devParts[1])
 	deviceRemote.SetRemote(devParts[0], devPort)
 
+	var earlyPunch *punchCtx
+	if !t.useTCP {
+		t.setStage("stun punch (direct)")
+		t.logf("phase: direct stun punch first…")
+		resp, pctx := t.runStunPunch(deviceRemote, devParts, devPort, deviceLaddr, aid, directPunchWindow, directPunchReadTO, 2)
+		if resp != nil {
+			t.logf("direct punch ok (%s)", pctx.via)
+			if t.profile.noRelayAuth || t.forceAppRelay {
+				if err := t.finishDirect(deviceRemote, nil, agentOK, mainRemote, pctx, devParts); err != nil {
+					return err
+				}
+				return nil
+			}
+			earlyPunch = pctx
+		} else {
+			t.logf("direct punch failed — falling back to relay flow")
+		}
+	}
+
 	if agentOK {
 		authStr := ""
 		if t.dtype > 0 {
@@ -860,66 +881,82 @@ func (t *Tunnel) establish() error {
 		}
 	}
 	t.setStage("stun punch")
-	t.logf("phase: ptcp sign ok (%d bytes), stun punch…", len(sign))
+	var resp []byte
+	var pctx *punchCtx
+	if earlyPunch != nil {
+		pctx = earlyPunch
+		resp = pctx.stunInit
+	} else {
+		resp, pctx = t.runStunPunch(deviceRemote, devParts, devPort, deviceLaddr, aid, punchWindow(), 2*time.Second, 2)
+	}
+	if resp == nil {
+		if !agentOK {
+			return fmt.Errorf("STUN punch failed and no relay agent available — no data path")
+		}
+		t.logf("STUN failed — using relay agent as the data path")
+		if StunFailHook != nil {
+			StunFailHook(t.serial)
+		}
+		t.setStage("ready (relay)")
+		t.setPrimary(mainRemote)
+		return nil
+	}
+	if err := t.finishDirect(deviceRemote, sign, agentOK, mainRemote, pctx, devParts); err != nil {
+		return err
+	}
+	return nil
+}
 
+type punchCtx struct {
+	stunInit []byte
+	laddr    *net.UDPAddr
+	via      string
+}
+
+func (t *Tunnel) runStunPunch(deviceRemote *UDP, devParts []string, devPort int, deviceLaddr string, aid []byte, window, readTO time.Duration, maxRetrans int) ([]byte, *punchCtx) {
 	invAid := make([]byte, 8)
 	for i, b := range aid {
 		invAid[i] = ^b
 	}
-
 	cookie := make([]byte, 4)
 	rand.Read(cookie)
 	transID := make([]byte, 12)
 	rand.Read(transID)
-
-	eaddr := make([]byte, 6)
-	binary.BigEndian.PutUint16(eaddr[0:2], uint16(devPort))
-	copy(eaddr[2:], net.ParseIP(devParts[0]).To4())
-	for i, b := range eaddr {
-		eaddr[i] = ^b
-	}
-
 	stunInit := []byte{0xFF, 0xFE, 0xFF, 0xE7}
 	stunInit = append(stunInit, cookie...)
 	stunInit = append(stunInit, transID...)
 	stunInit = append(stunInit, []byte{0x7F, 0xD5, 0xFF, 0xF7}...)
 	stunInit = append(stunInit, invAid...)
 	stunInit = append(stunInit, []byte{0xFF, 0xFB, 0xFF, 0xF7, 0xFF, 0xFE}...)
-	var localPortVal int
-	var localIPs []string
-	var localIPStr string
+
+	var laddr *net.UDPAddr
 	if lastColon := strings.LastIndex(deviceLaddr, ":"); lastColon != -1 {
-		localPortVal, _ = strconv.Atoi(deviceLaddr[lastColon+1:])
+		localPortVal, _ := strconv.Atoi(deviceLaddr[lastColon+1:])
 		for _, part := range strings.Split(deviceLaddr[:lastColon], ",") {
 			part = strings.TrimSpace(part)
-			if part != "" {
-				localIPs = append(localIPs, part)
-				if localIPStr == "" {
-					localIPStr = part
+			if ip := net.ParseIP(part); ip != nil {
+				t.logf(":%d >>> %s:%d (LocalAddr)", deviceRemote.lport, part, localPortVal)
+				deviceRemote.SendTo(stunInit, &net.UDPAddr{IP: ip, Port: localPortVal})
+				if laddr == nil {
+					laddr = &net.UDPAddr{IP: ip, Port: localPortVal}
 				}
 			}
-		}
-	}
-	for _, lip := range localIPs {
-		if ip := net.ParseIP(lip); ip != nil {
-			t.logf(":%d >>> %s:%d (LocalAddr)", deviceRemote.lport, lip, localPortVal)
-			deviceRemote.SendTo(stunInit, &net.UDPAddr{IP: ip, Port: localPortVal})
 		}
 	}
 	t.logf(":%d >>> %s:%d (PubAddr)", deviceRemote.lport, devParts[0], devPort)
 	deviceRemote.Send(stunInit)
 
 	var stunResponse []byte
-	deviceRemote.SetTimeout(2 * time.Second)
-	deadline := time.Now().Add(punchWindow())
+	var via string
+	deviceRemote.SetTimeout(readTO)
+	deadline := time.Now().Add(window)
 	attempt := 0
-
 	for time.Now().Before(deadline) {
 		data, addr, err := deviceRemote.RecvFrom(4096)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				attempt++
-				if attempt <= 2 && time.Now().Before(deadline) {
+				if attempt <= maxRetrans && time.Now().Before(deadline) {
 					t.logf("Retransmit STUN init (attempt %d)", attempt)
 					deviceRemote.Send(stunInit)
 					continue
@@ -935,13 +972,18 @@ func (t *Tunnel) establish() error {
 		}
 		magic := data[:4]
 		t.logf("STUN <<< %s magic=%x len=%d", addr, magic, len(data))
-
-		if string(magic) == "\xFE\xFE\xFF\xE7" {
+		switch string(magic) {
+		case "þþÿç":
 			stunResponse = data
+			via = "response fefeffe7"
 			t.logf("Got STUN response (fefeffe7)")
 			punchSucceed()
-			break
-		} else if string(magic) == "\xFF\xFE\xFF\xE7" {
+		case "þþÿó":
+			stunResponse = data
+			via = "confirm fefefff3"
+			t.logf("Got camera confirm (fefefff3) — punch converged")
+			punchSucceed()
+		case "ÿþÿç":
 			if len(data) < 40 {
 				t.logf("STUN <<< cross-STUN init too short (%d bytes) — ignored", len(data))
 				continue
@@ -957,29 +999,32 @@ func (t *Tunnel) establish() error {
 			resp = append(resp, data[34:40]...)
 			deviceRemote.SendTo(resp, addr)
 			t.logf("STUN >>> %s response sent", addr)
-		} else {
+		default:
 			t.logf("Unknown magic: %x", magic)
+			if t.debug {
+				n := len(data)
+				if n > 40 {
+					n = 40
+				}
+				t.logf("[dbg] STUN dump % x", data[:n])
+			}
+		}
+		if stunResponse != nil {
+			break
 		}
 	}
-
 	if stunResponse == nil {
-		if !agentOK {
-			return fmt.Errorf("STUN punch failed and no relay agent available — no data path")
-		}
-		t.logf("STUN failed — using relay agent as the data path")
-		if StunFailHook != nil {
-			StunFailHook(t.serial)
-		}
-		t.setStage("ready (relay)")
-		t.setPrimary(mainRemote)
-		return nil
+		return nil, nil
 	}
+	return stunResponse, &punchCtx{stunInit: stunInit, laddr: laddr, via: via}
+}
 
+func (t *Tunnel) finishDirect(deviceRemote *UDP, sign []byte, agentOK bool, mainRemote *UDP, pctx *punchCtx, devParts []string) error {
 	confirm := []byte{0xFE, 0xFE, 0xFF, 0xF3}
-	confirm = append(confirm, cookie...)
-	confirm = append(confirm, transID...)
+	confirm = append(confirm, pctx.stunInit[4:8]...)
+	confirm = append(confirm, pctx.stunInit[8:20]...)
 	confirm = append(confirm, []byte{0x7F, 0xD6, 0xFF, 0xF7}...)
-	confirm = append(confirm, invAid...)
+	confirm = append(confirm, pctx.stunInit[20:28]...)
 
 	for range 5 {
 		t.logf("Confirm >>>")
@@ -997,7 +1042,16 @@ func (t *Tunnel) establish() error {
 	}
 	deviceRemote.SetTimeout(deviceAckTimeout)
 
-	if prof.noRelayAuth || t.forceAppRelay {
+	ready := func(stage string) error {
+		t.setStage(stage)
+		if pctx.laddr != nil {
+			t.storeRePunch(pctx.stunInit, pctx.laddr.IP.String(), pctx.laddr.Port, devParts)
+		}
+		t.setPrimary(deviceRemote)
+		return nil
+	}
+
+	if t.profile.noRelayAuth || t.forceAppRelay {
 		t.logf("app-parity data path: SYNC only, no 0x17/0x19 auth")
 		deviceRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
 		if _, err := deviceRemote.ReadPTCP(3 * time.Second); err != nil {
@@ -1012,10 +1066,7 @@ func (t *Tunnel) establish() error {
 				return nil
 			}
 		}
-		t.setStage("ready (direct)")
-		t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
-		t.setPrimary(deviceRemote)
-		return nil
+		return ready("ready (direct)")
 	}
 	if err := ptcpHandshake(deviceRemote, sign); err != nil {
 		if strings.Contains(err.Error(), "auth mismatch: got 0x00") {
@@ -1033,10 +1084,7 @@ func (t *Tunnel) establish() error {
 					return nil
 				}
 			}
-			t.setStage("ready (direct, app dialect)")
-			t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
-			t.setPrimary(deviceRemote)
-			return nil
+			return ready("ready (direct, app dialect)")
 		}
 		t.logf("ptcp device handshake failed (%v) — using relay agent as the data path", err)
 		if agentOK {
@@ -1047,10 +1095,7 @@ func (t *Tunnel) establish() error {
 		return fmt.Errorf("ptcp device handshake: %v", err)
 	}
 	t.logf("PTCP handshake complete (direct)")
-	t.setStage("ready (direct)")
-	t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
-	t.setPrimary(deviceRemote)
-	return nil
+	return ready("ready (direct)")
 }
 
 func (t *Tunnel) attachTCPRelay(agentHost string, agentPort int, token string) error {

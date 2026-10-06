@@ -24,6 +24,7 @@ type formField struct {
 	def      string
 	validate func(string) string
 	pass     bool
+	pick     pickMode
 	input    textinput.Model
 	strVal   string
 	intVal   int
@@ -68,6 +69,12 @@ func (f *formState) setDefault(v string) {
 	fld.input.SetValue(v)
 }
 
+func (f *formState) lastPick(mode pickMode) {
+	if len(f.fields) > 0 {
+		f.fields[len(f.fields)-1].pick = mode
+	}
+}
+
 func (f *formState) addInt(label string, def int) {
 	ti := textinput.New()
 	ti.CharLimit = 12
@@ -105,6 +112,9 @@ func (f *formState) curIsBool() bool {
 func (f *formState) helpLine() string {
 	if f.curIsBool() {
 		return tr("y/n - да/нет · enter - далее · q - выход · esc - в меню")
+	}
+	if f.cur < len(f.fields) && f.fields[f.cur].kind == fStr && !f.fields[f.cur].pass && f.fields[f.cur].pick != pickNone {
+		return tr("enter - далее · ctrl+f - файловый менеджер · esc - в меню · ctrl+c - выход")
 	}
 	return tr("enter - далее · esc - в меню · ctrl+c - выход")
 }

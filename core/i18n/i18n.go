@@ -225,6 +225,16 @@ var en = map[string]string{
 
 	"Это бета версия":        "This is a beta",
 	"нажми любую клавишу...": "press any key...",
+
+	"выбери файл":            "pick a file",
+	"выбери папку":           "pick a folder",
+	"[ выбрать эту папку ]":  "[ use this folder ]",
+	"(папка пуста)":          "(folder is empty)",
+	"↑↓ навигация · enter - открыть/выбрать · ← - наверх · esc - назад · q - выход": "↑↓ navigate · enter - open/select · ← - up · esc - back · q - quit",
+	"enter - далее · ctrl+f - файловый менеджер · esc - в меню · ctrl+c - выход":    "enter - next · ctrl+f - file manager · esc - menu · ctrl+c - quit",
+	"файл не найден: ":       "file not found: ",
+	"это папка, а не файл: ": "that's a folder, not a file: ",
+	"файл не читается: ":     "file read error: ",
 }
 
 func Tr(s string) string {

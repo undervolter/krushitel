@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -32,6 +33,7 @@ const (
 	stGreet
 	stUpdate
 	stUpdating
+	stFilePick
 )
 
 type tickMsg time.Time
@@ -49,6 +51,7 @@ type model struct {
 
 	form       *formState
 	run        *runState
+	picker     *pickState
 	msgLines   []string
 	msgPanel   string
 	quitting   bool
@@ -187,6 +190,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateMenu(msg)
 		case stForm:
 			return m.updateForm(msg)
+		case stFilePick:
+			return m.updateFilePick(msg)
 		case stRun:
 			return m.updateRun(msg)
 		case stXMLMenu:
@@ -355,6 +360,15 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.state = stMenu
 		}
 		return m, nil
+	case tea.KeyCtrlF:
+		if m.form.cur < len(m.form.fields) {
+			fld := &m.form.fields[m.form.cur]
+			if fld.kind == fStr && !fld.pass && fld.pick != pickNone {
+				m.picker = newPicker(fld.pick, m.form.cur, fld.input.Value())
+				m.state = stFilePick
+				return m, nil
+			}
+		}
 	case tea.KeyRunes:
 		if m.form.curIsBool() && strings.ToLower(string(msg.Runes)) == "q" {
 			m.quitting = true
@@ -362,6 +376,32 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	m.form.update(&m, msg)
+	return m, nil
+}
+
+func (m model) updateFilePick(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.picker == nil || m.form == nil {
+		m.picker = nil
+		m.state = stForm
+		return m, nil
+	}
+	if msg.Type == tea.KeyRunes && strings.EqualFold(string(msg.Runes), "q") {
+		m.quitting = true
+		return m, tea.Quit
+	}
+	if m.picker.update(msg) {
+		if m.picker.selected != "" && m.picker.field < len(m.form.fields) {
+			fld := &m.form.fields[m.picker.field]
+			fld.input.SetValue(m.picker.selected)
+			fld.strVal = m.picker.selected
+			if dir := filepath.Dir(m.picker.selected); dir != "" {
+				lastPickDir = dir
+			}
+		}
+		m.picker = nil
+		m.state = stForm
+		m.form.focus()
+	}
 	return m, nil
 }
 
@@ -774,6 +814,12 @@ func (m model) View() string {
 		content = m.menuView()
 	case stForm:
 		content, help = m.form.view(), m.form.helpLine()
+	case stFilePick:
+		if m.picker != nil {
+			content, help = m.picker.view(), pickHelpLine()
+		} else {
+			content, help = m.form.view(), m.form.helpLine()
+		}
 	case stRun:
 		content = m.run.view()
 		help = tr("esc/b — стоп и в меню  ·  q — выход")

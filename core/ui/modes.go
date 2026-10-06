@@ -26,10 +26,12 @@ func exploitForm() *formState {
 		startExploitRun(m)
 	})
 	f.addStr(tr("префикс или файл (префиксы/серийники)"), true, false)
+	f.lastPick(pickFile)
 	if cfg.LastInput != "" {
 		f.setDefault(cfg.LastInput)
 	}
 	f.addStr(tr("папка для результатов"), true, false)
+	f.lastPick(pickDir)
 	if cfg.LastOut != "" {
 		f.setDefault(cfg.LastOut)
 	}
@@ -179,6 +181,7 @@ func titlesForm() *formState {
 		startTitlesRun(m)
 	})
 	f.addStr(tr("файл с камерами (results.txt)"), true, true)
+	f.lastPick(pickFile)
 	f.addInt(tr("потоков"), 200)
 	return f
 }
@@ -254,6 +257,7 @@ func xmlXMLForm() *formState {
 			green(fmt.Sprintf(tr("[+] %d кред(ов) -> %s"), len(creds), outFile)))
 	})
 	f.addStr(tr("файл с результатами (SmartPSS export)"), true, true)
+	f.lastPick(pickFile)
 	f.addStr(tr("название файла для кредов"), true, false)
 	return f
 }
@@ -306,6 +310,7 @@ func txtXMLForm() *formState {
 		showMsg(m, tr("креды → xml"), msg)
 	})
 	f.addStr(tr("файл с кредами (SN,login:pass)"), true, true)
+	f.lastPick(pickFile)
 	f.addStr(tr("выходной xml-файл"), true, false)
 	return f
 }
@@ -315,6 +320,7 @@ func prefixForm() *formState {
 		startPrefixRun(m)
 	})
 	f.addStr(tr("IP цели или файл со списком хостов"), true, false)
+	f.lastPick(pickFile)
 	f.addInt(tr("порт"), 37777)
 	f.addInt(tr("потоков"), 500)
 	f.addStr(tr("выходной файл (база, без расширения)"), true, false)
