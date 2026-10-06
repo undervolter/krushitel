@@ -5,50 +5,54 @@ import (
 	"os"
 	"strings"
 
+	toml "github.com/pelletier/go-toml/v2"
 	"krushitel/core/fwd"
 	"krushitel/core/i18n"
 	"krushitel/core/scanner"
 )
 
 type Settings struct {
-	Snaps  bool `json:"snaps"`
-	XML    bool `json:"xml"`
-	Titles bool `json:"titles"`
+	Snaps  bool `json:"snaps" toml:"snaps"`
+	XML    bool `json:"xml" toml:"xml"`
+	Titles bool `json:"titles" toml:"titles"`
 
-	Destructive bool `json:"destructive"`
+	Destructive bool `json:"destructive" toml:"destructive"`
 
-	WipeUsers bool `json:"wipe_users"`
+	WipeUsers bool `json:"wipe_users" toml:"wipe_users"`
 
-	AntiCumShot bool `json:"antiCumShot"`
+	AntiCumShot bool `json:"antiCumShot" toml:"antiCumShot"`
 
-	LastInput   string `json:"last_input"`
-	LastOut     string `json:"last_out"`
-	LastThreads int    `json:"last_threads"`
+	LastInput   string `json:"last_input" toml:"last_input"`
+	LastOut     string `json:"last_out" toml:"last_out"`
+	LastThreads int    `json:"last_threads" toml:"last_threads"`
 
-	Lang        string `json:"lang"`
-	IsActivated bool   `json:"isActivated"`
+	Lang        string `json:"lang" toml:"lang"`
+	IsActivated bool   `json:"isActivated" toml:"isActivated"`
 
-	Debug bool `json:"debug"`
+	Debug bool `json:"debug" toml:"debug"`
 
-	ChannelText string    `json:"channel_text"`
-	CustomTexts [4]string `json:"custom_texts"`
+	ChannelText string    `json:"channel_text" toml:"channel_text"`
+	CustomTexts [4]string `json:"custom_texts" toml:"custom_texts"`
 
-	Text string `json:"text,omitempty"`
+	Text string `json:"text,omitempty" toml:"text,omitempty"`
 
-	DummyLogin string `json:"dummy_login"`
-	DummyPass  string `json:"dummy_pass"`
+	DummyLogin string `json:"dummy_login" toml:"dummy_login"`
+	DummyPass  string `json:"dummy_pass" toml:"dummy_pass"`
 
-	BrutePasswords []string `json:"brute_passwords"`
+	BrutePasswords []string `json:"brute_passwords" toml:"brute_passwords"`
 
-	DiscordRPC bool `json:"discord_rpc"`
+	DiscordRPC bool `json:"discord_rpc" toml:"discord_rpc"`
 
-	Governor    bool `json:"governor"`
-	GovernorCap int  `json:"governor_cap"`
+	Governor    bool `json:"governor" toml:"governor"`
+	GovernorCap int  `json:"governor_cap" toml:"governor_cap"`
 
-	Profile string `json:"profile"`
+	Profile string `json:"profile" toml:"profile"`
 }
 
-const configFile = "config.json"
+const (
+	configFile     = "config.toml"
+	configFileJSON = "config.json"
+)
 
 var cfg = Settings{
 	Snaps:       true,
@@ -66,11 +70,12 @@ var cfg = Settings{
 }
 
 func loadSettings() {
-	data, err := os.ReadFile(configFile)
-	if err != nil {
-		return
+	if data, err := os.ReadFile(configFile); err == nil {
+		_ = toml.Unmarshal(data, &cfg)
+	} else if data, err := os.ReadFile(configFileJSON); err == nil {
+		_ = json.Unmarshal(data, &cfg)
+		saveSettings()
 	}
-	_ = json.Unmarshal(data, &cfg)
 	if cfg.Lang == "" {
 		cfg.Lang = "ru"
 	}
@@ -106,7 +111,7 @@ func RememberRun(inFile, outDir string, threads int) {
 }
 
 func saveSettings() {
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	data, err := toml.Marshal(cfg)
 	if err != nil {
 		return
 	}

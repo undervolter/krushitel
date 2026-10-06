@@ -93,7 +93,7 @@ func headlessUsage() {
 	for _, r := range rows {
 		out("%-22s %s", r[0], r[1])
 	}
-	out(i18n.Tr("Большинство параметров есть в config.json."))
+	out(i18n.Tr("Большинство параметров есть в config.toml."))
 }
 
 func runHeadless() bool {

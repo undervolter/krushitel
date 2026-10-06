@@ -221,7 +221,7 @@ var en = map[string]string{
 	"папка куда выводятся результаты (по умолчанию - имя входного файла)": "folder with results (by default - name of input file)",
 	"кол-во потоков (по умолчанию 30)":                                    "workers (30 by default)",
 	"игнорировать session-маркер и done.txt":                              "ignore session-mark and done.txt",
-	"Большинство параметров есть в config.json.":                          "config.json contains more parameters.",
+	"Большинство параметров есть в config.toml.":                          "config.toml contains more parameters.",
 
 	"Это бета версия":        "This is a beta",
 	"нажми любую клавишу...": "press any key...",
