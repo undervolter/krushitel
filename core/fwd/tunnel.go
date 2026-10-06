@@ -881,6 +881,7 @@ func (t *Tunnel) establish() error {
 		}
 	}
 	t.setStage("stun punch")
+	t.logf("phase: ptcp sign ok (%d bytes), stun punch…", len(sign))
 	var resp []byte
 	var pctx *punchCtx
 	if earlyPunch != nil {
