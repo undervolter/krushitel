@@ -31,12 +31,19 @@ var (
 	start   time.Time
 )
 
+const flogStdout = true
+
 func flog(format string, args ...any) {
 	logMu.Lock()
 	defer logMu.Unlock()
+	stamp := time.Now().Format("15:04:05")
+	msg := fmt.Sprintf(format, args...)
+	if flogStdout {
+		fmt.Printf("[%s] %s\n", stamp, msg)
+	}
 	if logFile != nil {
-		fmt.Fprintf(logFile, "[%s] ", time.Now().Format("15:04:05"))
-		fmt.Fprintf(logFile, format+"\n", args...)
+		fmt.Fprintf(logFile, "[%s] ", stamp)
+		fmt.Fprintf(logFile, "%s\n", msg)
 	}
 }
 
