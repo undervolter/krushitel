@@ -114,7 +114,7 @@ func saveSettings() {
 }
 
 func mergeBrutePasswords(custom []string) []string {
-	out := make([]string, 0, len(custom)+8)
+	out := make([]string, 0, len(custom))
 	seen := make(map[string]struct{})
 	for _, p := range custom {
 		p = strings.TrimSpace(p)
@@ -127,12 +127,8 @@ func mergeBrutePasswords(custom []string) []string {
 		seen[p] = struct{}{}
 		out = append(out, p)
 	}
-	for _, p := range fwd.GetDefaultPasswordsBase() {
-		if _, ok := seen[p]; ok {
-			continue
-		}
-		seen[p] = struct{}{}
-		out = append(out, p)
+	if len(out) > 0 {
+		return out
 	}
-	return out
+	return fwd.GetDefaultPasswordsBase()
 }
