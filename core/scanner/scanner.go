@@ -39,12 +39,13 @@ const (
 
 	SEND_STAGGER = 100 * time.Microsecond
 
-	ACK_GRACE = 15 * time.Second
+	ACK_GRACE = 30 * time.Second
 
 	CHANNEL_RETRIES = 2
 
-	MAX_RPS     = 3000
-	BURST_LIMIT = 64
+	MAX_RPS        = 3000
+	BURST_LIMIT    = 64
+	countedFlushAt = 500_000
 
 	TEARDOWN_ALIVE = true
 )
@@ -370,6 +371,9 @@ func (p *channelPipeline) markChecked(serial string, stats *ScanStats) {
 	if _, ok := p.counted[serial]; !ok {
 		p.counted[serial] = struct{}{}
 		atomic.AddInt64(&stats.Checked, 1)
+	}
+	if len(p.counted) >= countedFlushAt {
+		p.counted = make(map[string]struct{})
 	}
 }
 

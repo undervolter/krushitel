@@ -11,10 +11,10 @@ import (
 const (
 	govTick         = 2500 * time.Millisecond
 	govStartPPS     = 150
-	govFloorPPS     = 50
+	govFloorPPS     = 80
 	govSlowStartPct = 3
 	govCaPct        = 15
-	govBackoffPct   = 15
+	govBackoffPct   = 20
 	govRTTRing      = 512
 )
 
@@ -83,7 +83,7 @@ func (rl *rateLimiter) setRPS(rps int) {
 }
 
 func govErrBackoff(er, total int64) bool {
-	return er >= 3 && er*100 >= total*5
+	return er >= 5 && er*100 >= total*8
 }
 
 func governorLoop(ctx context.Context, rl *rateLimiter) {
