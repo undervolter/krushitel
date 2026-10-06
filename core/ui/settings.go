@@ -3,6 +3,7 @@ package ui
 import (
 	"encoding/json"
 	"os"
+	"strings"
 
 	"krushitel/core/fwd"
 	"krushitel/core/i18n"
@@ -36,6 +37,8 @@ type Settings struct {
 
 	DummyLogin string `json:"dummy_login"`
 	DummyPass  string `json:"dummy_pass"`
+
+	BrutePasswords []string `json:"brute_passwords"`
 
 	DiscordRPC bool `json:"discord_rpc"`
 
@@ -73,6 +76,7 @@ func loadSettings() {
 	}
 	cfg.Profile = "smartpss"
 	_ = fwd.SetProfile(cfg.Profile)
+	fwd.SetDefaultCreds("", mergeBrutePasswords(cfg.BrutePasswords))
 	scanner.GovernorOn = cfg.Governor
 	scanner.GovernorCap = cfg.GovernorCap
 	if cfg.ChannelText == "" && cfg.Text != "" {
@@ -107,4 +111,28 @@ func saveSettings() {
 		return
 	}
 	_ = os.WriteFile(configFile, data, 0644)
+}
+
+func mergeBrutePasswords(custom []string) []string {
+	out := make([]string, 0, len(custom)+8)
+	seen := make(map[string]struct{})
+	for _, p := range custom {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	for _, p := range fwd.GetDefaultPasswordsBase() {
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return out
 }

@@ -29,21 +29,29 @@ var ErrDeviceNotFound = errDeviceNotFound
 
 var DefaultPoolSize = 50
 
+var basePasswords = []string{
+	"admin",
+	"admin123",
+	"123456",
+	"password",
+	"tlJwpbo6",
+	"admin777",
+	"888888",
+	"dahua",
+}
+
 var (
 	defaultCredsMu   sync.RWMutex
 	DefaultLogin     = "admin"
-	DefaultPasswords = []string{
-		"admin",
-		"admin123",
-		"123456",
-		"password",
-		"tlJwpbo6",
-		"admin777",
-		"888888",
-		"dahua",
-	}
-	LockoutCooldown = 8 * time.Second
+	DefaultPasswords = append([]string(nil), basePasswords...)
+	LockoutCooldown  = 8 * time.Second
 )
+
+func GetDefaultPasswordsBase() []string {
+	out := make([]string, len(basePasswords))
+	copy(out, basePasswords)
+	return out
+}
 
 func SetDefaultCreds(login string, passwords []string) {
 	defaultCredsMu.Lock()
