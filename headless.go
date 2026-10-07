@@ -243,6 +243,14 @@ func runHeadlessBot(cfg ui.Settings, threads int) int {
 	}
 	headlessBanner(false)
 	out("started tgbot mode")
+	lockF, lerr := os.OpenFile("tgbot.lock", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if lerr != nil {
+		out("[!] err: tgbot уже запущен (второй инстанс дерётся за getUpdates). если процесс мёртв — удали tgbot.lock")
+		return 2
+	}
+	fmt.Fprintf(lockF, "%d", os.Getpid())
+	lockF.Close()
+	defer os.Remove("tgbot.lock")
 	headlessLogOpen("tgbot.log")
 	unhook := wireHooks(cfg)
 	defer unhook()
