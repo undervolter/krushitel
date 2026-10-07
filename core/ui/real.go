@@ -348,10 +348,9 @@ func (r *runState) exploitView() string {
 	}
 	pwned := atomic.LoadInt64(&st.Pwned) + atomic.LoadInt64(&st.Added)
 	sb.WriteString(centerLine(fmt.Sprintf("%s %.1f%%", bar(progress, st.Total, 30), pct)) + "\n")
-	sb.WriteString(centerLine(fmt.Sprintf("%d/%d | pwned: %s | fail: %s | snaps: %s | %s",
+	sb.WriteString(centerLine(fmt.Sprintf("%d/%d | pwned: %s | snaps: %s | %s",
 		progress, st.Total,
 		green(fmt.Sprint(pwned)),
-		red(fmt.Sprint(atomic.LoadInt64(&st.Failed))),
 		snapStr,
 		r.elapsed())) + "\n\n")
 	sb.WriteString(r.eventsBlock())

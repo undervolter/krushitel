@@ -17,6 +17,8 @@ type Settings struct {
 	XML    bool `json:"xml" toml:"xml"`
 	Titles bool `json:"titles" toml:"titles"`
 
+	SkipShitty bool `json:"skip_shitty" toml:"skip_shitty"`
+
 	Destructive bool `json:"destructive" toml:"destructive"`
 
 	WipeUsers bool `json:"wipe_users" toml:"wipe_users"`

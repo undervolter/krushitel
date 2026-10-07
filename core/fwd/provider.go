@@ -70,6 +70,10 @@ type InProcessProvider struct {
 	onLog    func(string)
 	attempts map[string]int
 
+	// SkipProblematic: туннель не поднялся — серийник скипается сразу
+	// (OnDead) вместо ре-очереди второго круга.
+	SkipProblematic bool
+
 	OnDead func(serial, reason string)
 }
 
@@ -146,7 +150,11 @@ func (p *InProcessProvider) Acquire(ctx context.Context) (Binding, error) {
 				p.logf(i18n.Tr("%s — устройство требует Type 1 auth"), serial)
 			} else {
 				p.attempts[serial]++
-				if p.attempts[serial] >= maxAcquireAttempts {
+				max := maxAcquireAttempts
+				if p.SkipProblematic {
+					max = 1
+				}
+				if p.attempts[serial] >= max {
 					p.logf(i18n.Tr("%s — исчерпан (%d туннель-подъёма за прогон)"), serial, p.attempts[serial])
 					if p.OnDead != nil {
 						p.OnDead(serial, fmt.Sprintf("туннель: %v", err))

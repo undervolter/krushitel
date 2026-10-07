@@ -42,6 +42,7 @@ func exploitForm() *formState {
 	f.addInt(tr("потоков"), defThreads)
 	f.addBool(tr("снапы?"), cfg.Snaps)
 	f.addBool("autogen .xml?", cfg.XML)
+	f.addBool(tr("пропускать проблемные?"), cfg.SkipShitty)
 	return f
 }
 
@@ -52,6 +53,7 @@ func startExploitRun(m *model) {
 	threads := m.threadsVal(2)
 	cfg.Snaps = m.form.fields[3].boolVal
 	cfg.XML = m.form.fields[4].boolVal
+	cfg.SkipShitty = m.form.fields[5].boolVal
 	saveSettings()
 
 	prefixes, direct, err := exploit.LoadTargetInput(inFile)
@@ -152,17 +154,18 @@ func launchExploitRun(m *model, inFile, outDir string, threads int, prefixes, di
 	}
 
 	opts := exploit.Opts{
-		OutDir:      outDir,
-		Snaps:       cfg.Snaps,
-		XML:         cfg.XML,
-		Titles:      cfg.Titles,
-		ChanText:    cfg.ChannelText,
-		CustomTexts: cfg.CustomTexts[:],
-		DummyLogin:  cfg.DummyLogin,
-		DummyPass:   cfg.DummyPass,
-		Resume:      resume,
-		Destructive: cfg.Destructive,
-		WipeUsers:   cfg.WipeUsers,
+		OutDir:          outDir,
+		Snaps:           cfg.Snaps,
+		XML:             cfg.XML,
+		SkipProblematic: cfg.SkipShitty,
+		Titles:          cfg.Titles,
+		ChanText:        cfg.ChannelText,
+		CustomTexts:     cfg.CustomTexts[:],
+		DummyLogin:      cfg.DummyLogin,
+		DummyPass:       cfg.DummyPass,
+		Resume:          resume,
+		Destructive:     cfg.Destructive,
+		WipeUsers:       cfg.WipeUsers,
 	}
 
 	go func() {
