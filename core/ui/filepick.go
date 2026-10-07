@@ -206,7 +206,6 @@ func fmtSize(n int64) string {
 }
 
 const (
-	fmTitle      = "krushfm 1.0"
 	fmTimeLayout = "02.01.06 15:04"
 	fmTimeW      = 16
 	fmSizeW      = 9
@@ -244,18 +243,7 @@ func (p *pickState) view(w, h int) string {
 		nameW = fmMinNameW
 	}
 
-	tw := len([]rune(fmTitle)) + 2
-	left := (panelW - 2 - tw) / 2
-	if left < 1 {
-		left = 1
-	}
-	right := panelW - 2 - tw - left
-	if right < 1 {
-		right = 1
-	}
-	top := "╭" + styleDim.Render(strings.Repeat("─", left)) +
-		styleWhite.Render(" "+fmTitle+" ") +
-		styleDim.Render(strings.Repeat("─", right)) + "╮"
+	top := "╭" + styleDim.Render(strings.Repeat("─", panelW-2)) + "╮"
 	bottom := "╰" + styleDim.Render(strings.Repeat("─", panelW-2)) + "╯"
 
 	wrap := func(s string, selected bool) string {
