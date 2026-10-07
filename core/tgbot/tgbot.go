@@ -152,6 +152,46 @@ func (b *API) Poll() (*Update, error) {
 	return nil, nil
 }
 
+func (b *API) SendMsg(chat int64, text string) int64 {
+	if len([]rune(text)) > maxTextLen {
+		text = string([]rune(text)[:maxTextLen])
+	}
+	b.sendMu <- struct{}{}
+	defer func() { <-b.sendMu }()
+	q := url.Values{}
+	q.Set("chat_id", fmt.Sprintf("%d", chat))
+	q.Set("text", text)
+	q.Set("disable_web_page_preview", "true")
+	raw, err := b.api("sendMessage", q, nil, "", shortTimeout)
+	if err != nil {
+		return 0
+	}
+	var m struct {
+		MessageID int64 `json:"message_id"`
+	}
+	_ = json.Unmarshal(raw, &m)
+	time.Sleep(60 * time.Millisecond)
+	return m.MessageID
+}
+
+func (b *API) Edit(chat, msgID int64, text string) {
+	if msgID == 0 || text == "" {
+		return
+	}
+	if len([]rune(text)) > maxTextLen {
+		text = string([]rune(text)[:maxTextLen])
+	}
+	b.sendMu <- struct{}{}
+	defer func() { <-b.sendMu }()
+	q := url.Values{}
+	q.Set("chat_id", fmt.Sprintf("%d", chat))
+	q.Set("message_id", fmt.Sprintf("%d", msgID))
+	q.Set("text", text)
+	q.Set("disable_web_page_preview", "true")
+	_, _ = b.api("editMessageText", q, nil, "", shortTimeout)
+	time.Sleep(60 * time.Millisecond)
+}
+
 func (b *API) Send(chat int64, text string) {
 	if len([]rune(text)) > maxTextLen {
 		text = string([]rune(text)[:maxTextLen])

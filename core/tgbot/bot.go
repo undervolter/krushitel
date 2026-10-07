@@ -42,14 +42,15 @@ var helpText = strings.Join([]string{
 }, "\n")
 
 type scanState struct {
-	mu      sync.Mutex
-	busy    bool
-	cancel  context.CancelFunc
-	outDir  string
-	tp      *exploit.TwoPhaseStats
-	events  chan string
-	chat    int64
-	started time.Time
+	mu       sync.Mutex
+	busy     bool
+	cancel   context.CancelFunc
+	outDir   string
+	tp       *exploit.TwoPhaseStats
+	events   chan string
+	chat     int64
+	started  time.Time
+	statusID int64
 }
 
 type Bot struct {
@@ -230,6 +231,10 @@ func (b *Bot) runScan(chat int64, args, docID string) {
 		close(doneEvents)
 	}()
 
+	b.st.mu.Lock()
+	b.st.statusID = b.api.SendMsg(chat, b.summary())
+	b.st.mu.Unlock()
+
 	ticker := time.NewTicker(statusEvery)
 	tickerStop := make(chan struct{})
 	go func() {
@@ -239,9 +244,7 @@ func (b *Bot) runScan(chat int64, args, docID string) {
 			case <-tickerStop:
 				return
 			case <-ticker.C:
-				if s := b.status(); s != "" {
-					b.api.Send(chat, s)
-				}
+				b.updateStatus()
 			}
 		}
 	}()
@@ -263,7 +266,15 @@ func (b *Bot) runScan(chat int64, args, docID string) {
 	if ctx.Err() != nil {
 		final += "\n(остановлено командой /stop — session-маркер сохранён)"
 	}
-	b.api.Send(chat, final)
+	b.st.mu.Lock()
+	sid := b.st.statusID
+	b.st.statusID = 0
+	b.st.mu.Unlock()
+	if sid != 0 {
+		b.api.Edit(chat, sid, final)
+	} else {
+		b.api.Send(chat, final)
+	}
 }
 
 func (b *Bot) stopScan(u *Update) {
@@ -284,6 +295,23 @@ func (b *Bot) status() string {
 		return "сканов нет — /scan <цели>"
 	}
 	return b.summary()
+}
+
+func (b *Bot) updateStatus() {
+	b.st.mu.Lock()
+	defer b.st.mu.Unlock()
+	if !b.st.busy {
+		return
+	}
+	s := b.summary()
+	if s == "" {
+		return
+	}
+	if b.st.statusID != 0 {
+		b.api.Edit(b.st.chat, b.st.statusID, s)
+	} else {
+		b.st.statusID = b.api.SendMsg(b.st.chat, s)
+	}
 }
 
 func (b *Bot) summary() string {
