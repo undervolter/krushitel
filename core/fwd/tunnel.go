@@ -1,6 +1,7 @@
 package fwd
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -973,33 +974,18 @@ func (t *Tunnel) runStunPunch(deviceRemote *UDP, devParts []string, devPort int,
 		}
 		magic := data[:4]
 		t.logf("STUN <<< %s magic=%x len=%d", addr, magic, len(data))
-		switch string(magic) {
-		case "þþÿç":
+		switch {
+		case bytes.Equal(magic, []byte{0xFE, 0xFE, 0xFF, 0xE7}):
 			stunResponse = data
 			via = "response fefeffe7"
 			t.logf("Got STUN response (fefeffe7)")
 			punchSucceed()
-		case "þþÿó":
+		case bytes.Equal(magic, []byte{0xFE, 0xFE, 0xFF, 0xF3}):
 			stunResponse = data
 			via = "confirm fefefff3"
-			t.logf("Got camera confirm (fefefff3) — punch converged")
+			t.logf("Got camera confirm (fefefff3) - punch converged")
 			punchSucceed()
-		case "ÿþÿç":
-			if len(data) < 40 {
-				t.logf("STUN <<< cross-STUN init too short (%d bytes) — ignored", len(data))
-				continue
-			}
-			t.logf("Got device cross-STUN init (fffeffe7), responding...")
-			resp := make([]byte, 0, 40)
-			resp = append(resp, []byte{0xFE, 0xFE, 0xFF, 0xE7}...)
-			resp = append(resp, data[4:8]...)
-			resp = append(resp, data[8:20]...)
-			resp = append(resp, []byte{0x7F, 0xD6, 0xFF, 0xF7}...)
-			resp = append(resp, invAid...)
-			resp = append(resp, []byte{0xFF, 0xFB, 0xFF, 0xF7, 0xFF, 0xFE}...)
-			resp = append(resp, data[34:40]...)
-			deviceRemote.SendTo(resp, addr)
-			t.logf("STUN >>> %s response sent", addr)
+		case bytes.Equal(magic, []byte{0xFF, 0xFE, 0xFF, 0xE7}):
 		default:
 			t.logf("Unknown magic: %x", magic)
 			if t.debug {
