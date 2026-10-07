@@ -21,6 +21,7 @@ import (
 	"krushitel/core/ironscan"
 	"krushitel/core/rtsp"
 	"krushitel/core/scanner"
+	"krushitel/core/tgbot"
 	"krushitel/core/ui"
 	"krushitel/core/update"
 )
@@ -89,6 +90,7 @@ func headlessUsage() {
 		{"  -o, --output DIR", i18n.Tr("папка куда выводятся результаты (по умолчанию - имя входного файла)")},
 		{"  -t, --threads N", i18n.Tr("кол-во потоков (по умолчанию 30)")},
 		{"  -f, --fresh", i18n.Tr("игнорировать session-маркер и done.txt")},
+		{"  -m tgbot", "telegram bot: /scan /scanfile /status /results /stop"},
 	}
 	for _, r := range rows {
 		out("%-22s %s", r[0], r[1])
@@ -202,6 +204,10 @@ func runHeadless() bool {
 		os.Exit(1)
 	}
 
+	if *mode != "tgbot" && cfg.TgEnabled && cfg.TgBotToken != "" {
+		out("[i] tg_enabled игнорируется вне режима -m tgbot")
+	}
+
 	switch *mode {
 	case "exploit":
 		os.Exit(runHeadlessExploit(cfg, *inFile, *outDir, *threads, *fresh, progress, renderDone))
@@ -209,8 +215,57 @@ func runHeadless() bool {
 		os.Exit(runHeadlessTitles(cfg, *inFile, *threads, progress, renderDone))
 	case "ironscan":
 		os.Exit(runHeadlessIronScan(cfg, *inFile, *outDir, *threads, *port, progress, renderDone))
+	case "tgbot":
+		os.Exit(runHeadlessBot(cfg, *threads))
 	}
 	return true
+}
+
+func runHeadlessBot(cfg ui.Settings, threads int) int {
+	if cfg.TgBotToken == "" {
+		out("[!] err: tg_bot_token пуст в config.toml")
+		return 2
+	}
+	if !cfg.TgEnabled {
+		out("[!] err: tg_enabled выключен в config.toml")
+		return 2
+	}
+	if threads <= 0 {
+		threads = 30
+	}
+	headlessBanner(false)
+	out("started tgbot mode")
+	headlessLogOpen("tgbot.log")
+	unhook := wireHooks(cfg)
+	defer unhook()
+	fwd.InitLimit = 100
+	ctx, stop := headlessSignals()
+	defer stop()
+	err := tgbot.Run(tgbot.Options{
+		Ctx:     ctx,
+		Token:   cfg.TgBotToken,
+		ChatIDs: cfg.TgChatIDs,
+		Threads: threads,
+		OutRoot: ".",
+		Opts: exploit.Opts{
+			Snaps:       cfg.Snaps,
+			XML:         cfg.XML,
+			Titles:      cfg.Titles,
+			ChanText:    cfg.ChannelText,
+			CustomTexts: cfg.CustomTexts[:],
+			DummyLogin:  cfg.DummyLogin,
+			DummyPass:   cfg.DummyPass,
+			Destructive: cfg.Destructive,
+			WipeUsers:   cfg.WipeUsers,
+			AntiCumShot: cfg.AntiCumShot,
+		},
+		Log: func(format string, args ...any) { flog("%s", fmt.Sprintf(format, args...)) },
+	})
+	if err != nil {
+		out("[!] err: tgbot: %v", err)
+		return 1
+	}
+	return 0
 }
 
 func runHeadlessIronScan(cfg ui.Settings, inFile, outFile string, threads, port int,

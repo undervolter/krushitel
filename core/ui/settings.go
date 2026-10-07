@@ -41,6 +41,10 @@ type Settings struct {
 
 	BrutePasswords []string `json:"brute_passwords" toml:"brute_passwords"`
 
+	TgBotToken string  `json:"tg_bot_token" toml:"tg_bot_token"`
+	TgChatIDs  []int64 `json:"tg_chat_ids" toml:"tg_chat_ids"`
+	TgEnabled  bool    `json:"tg_enabled" toml:"tg_enabled"`
+
 	DiscordRPC bool `json:"discord_rpc" toml:"discord_rpc"`
 
 	Governor    bool `json:"governor" toml:"governor"`
