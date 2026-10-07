@@ -885,6 +885,7 @@ func (t *Tunnel) establish() error {
 	stunInit = append(stunInit, []byte{0x7F, 0xD5, 0xFF, 0xF7}...)
 	stunInit = append(stunInit, invAid...)
 	stunInit = append(stunInit, []byte{0xFF, 0xFB, 0xFF, 0xF7, 0xFF, 0xFE}...)
+	stunInit = append(stunInit, eaddr...)
 	var localPortVal int
 	var localIPs []string
 	var localIPStr string
@@ -1001,16 +1002,10 @@ func (t *Tunnel) establish() error {
 		t.logf("app-parity data path: SYNC only, no 0x17/0x19 auth")
 		deviceRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
 		if _, err := deviceRemote.ReadPTCP(3 * time.Second); err != nil {
-			t.logf("app-parity sync: %v", err)
-			if agentOK {
-				t.logf("direct sync timed out — falling back to relay agent")
-				if StunFailHook != nil {
-					StunFailHook(t.serial)
-				}
-				t.setStage("ready (relay)")
-				t.setPrimary(mainRemote)
-				return nil
-			}
+			// dmss dialect: the device may stay silent to the direct SYNC ack;
+			// BIND/DATA still flow on the punched channel (dh-fwd live capture).
+			// The relay path is a zombie on 2024+ firmware — never fall back to it.
+			t.logf("app-parity sync: %v (continuing on the punched channel)", err)
 		}
 		t.setStage("ready (direct)")
 		t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
@@ -1022,16 +1017,7 @@ func (t *Tunnel) establish() error {
 			t.logf("ptcp auth 0x00 — устройство использует апп-диалект")
 			deviceRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
 			if _, perr := deviceRemote.ReadPTCP(3 * time.Second); perr != nil {
-				t.logf("app-parity sync: %v", perr)
-				if agentOK {
-					t.logf("direct sync timed out — falling back to relay agent")
-					if StunFailHook != nil {
-						StunFailHook(t.serial)
-					}
-					t.setStage("ready (relay)")
-					t.setPrimary(mainRemote)
-					return nil
-				}
+				t.logf("app-parity sync: %v (continuing on the punched channel)", perr)
 			}
 			t.setStage("ready (direct, app dialect)")
 			t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
@@ -1076,18 +1062,14 @@ func (t *Tunnel) waitRelayChannelAck(mainRemote *UDP, agentHost string, agentPor
 		mainRemote.SetRemote(agentHost, agentPort)
 	}
 
-	deadline := time.Now().Add(15 * time.Second)
+	interval := relayChannelFirstInterval
 	sendRelayChannel()
-	t.logf("waiting for relay-channel ack from agent %s:%d (timeout 15s)", agentHost, agentPort)
+	t.logf("waiting for relay-channel ack from agent %s:%d (interval %v, max %d retries)",
+		agentHost, agentPort, interval, relayChannelMaxRetransmits)
 
 	var lastErr error
-	attempt := 0
-	for time.Now().Before(deadline) {
-		wait := time.Until(deadline)
-		if wait > relayChannelRetransInterval {
-			wait = relayChannelRetransInterval
-		}
-		if res, err := mainRemote.Read(true, wait); err == nil {
+	for attempt := 0; attempt <= relayChannelMaxRetransmits; attempt++ {
+		if res, err := mainRemote.Read(true, interval); err == nil {
 			t.logf("relay-channel ack received from agent")
 			if v := res.Body["body/version"]; isModernAppRelayVersion(v) {
 				t.forceAppRelay = true
@@ -1100,11 +1082,16 @@ func (t *Tunnel) waitRelayChannelAck(mainRemote *UDP, agentHost string, agentPor
 			}
 			return nil
 		} else {
+			// Retransmit only on timeouts: a closed/reset socket is terminal —
+			// spinning retransmits into it burns the budget instantly.
+			if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+				return fmt.Errorf("relay-channel read: %w", err)
+			}
 			lastErr = err
-			if time.Now().Before(deadline) {
-				attempt++
-				t.logf("relay-channel ack timed out (%v) — retransmitting (attempt %d)", err, attempt)
+			if attempt < relayChannelMaxRetransmits {
+				t.logf("relay-channel ack timed out (%v) — retransmitting %d/%d", err, attempt+1, relayChannelMaxRetransmits)
 				sendRelayChannel()
+				interval = relayChannelRetransInterval
 			}
 		}
 	}
