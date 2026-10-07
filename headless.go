@@ -283,8 +283,7 @@ func runHeadlessBot(cfg ui.Settings, threads int) int {
 			DummyPass:   cfg.DummyPass,
 			Destructive: cfg.Destructive,
 			WipeUsers:   cfg.WipeUsers,
-			AntiCumShot: cfg.AntiCumShot,
-		},
+			},
 		Log: func(format string, args ...any) { flog("%s", fmt.Sprintf(format, args...)) },
 	})
 	if err != nil {
@@ -636,7 +635,6 @@ func runHeadlessExploit(cfg ui.Settings, inFile, outDir string, threads int, fre
 		Resume:      resume,
 		Destructive: cfg.Destructive,
 		WipeUsers:   cfg.WipeUsers,
-		AntiCumShot: cfg.AntiCumShot,
 	}, tp, events)
 
 	close(doneEvents)

@@ -21,8 +21,6 @@ type Settings struct {
 
 	WipeUsers bool `json:"wipe_users" toml:"wipe_users"`
 
-	AntiCumShot bool `json:"antiCumShot" toml:"antiCumShot"`
-
 	LastInput   string `json:"last_input" toml:"last_input"`
 	LastOut     string `json:"last_out" toml:"last_out"`
 	LastThreads int    `json:"last_threads" toml:"last_threads"`
