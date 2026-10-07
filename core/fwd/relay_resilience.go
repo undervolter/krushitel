@@ -244,7 +244,6 @@ func (t *Tunnel) zombieWatchdog(done chan struct{}) {
 		if zombie {
 			t.logf("zombie data path: realm=%#010x port=%d sent %d bytes, 0 back for %.0fs — fail for retry (app dialect next)",
 				rid, port, up, age.Seconds())
-			MarkTunnelDead(t.serial)
 			t.forceAppRelay = true
 			t.fail(errZombieRelay)
 			return

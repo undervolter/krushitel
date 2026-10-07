@@ -40,18 +40,27 @@ var basePasswords = []string{
 	"dahua",
 }
 
-var (
-	defaultCredsMu   sync.RWMutex
-	DefaultLogin     = "admin"
-	DefaultPasswords = append([]string(nil), basePasswords...)
-	LockoutCooldown  = 8 * time.Second
-)
-
 func GetDefaultPasswordsBase() []string {
 	out := make([]string, len(basePasswords))
 	copy(out, basePasswords)
 	return out
 }
+
+var (
+	defaultCredsMu   sync.RWMutex
+	DefaultLogin     = "admin"
+	DefaultPasswords = []string{
+		"admin",
+		"admin123",
+		"123456",
+		"password",
+		"tlJwpbo6",
+		"admin777",
+		"888888",
+		"dahua",
+	}
+	LockoutCooldown = 8 * time.Second
+)
 
 func SetDefaultCreds(login string, passwords []string) {
 	defaultCredsMu.Lock()
@@ -138,7 +147,6 @@ func StartContext(ctx context.Context, serial string, specs []PortSpec, dtype in
 		t.Terminate()
 		return nil, ctx.Err()
 	case <-t.Ready():
-		ClearTunnelDead(serial)
 		f.Ports = t.LocalPorts()
 		go func() {
 			select {
