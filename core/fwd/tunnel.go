@@ -18,7 +18,7 @@ import (
 
 const (
 	BIND_TIMEOUT   = 10 * time.Second
-	RETRY_ATTEMPTS = 3
+	RETRY_ATTEMPTS = 2
 	RETRY_DELAY    = 2 * time.Second
 	CSEQ_BASE      = 100
 	CSEQ_STEP      = 1000
@@ -1365,7 +1365,9 @@ var (
 
 	smallPoolForce = 4
 
-	zombieTimeout = 60 * time.Second
+	// Установка туннеля: живая камера отвечает за секунды (live: 1-13с).
+	// 35с — уже 2.5х запаса; хвост прогона на мёртвых серийниках раньше ждал 60с ×3×3×2.
+	zombieTimeout = 35 * time.Second
 
 	punchWindowFull  = 10 * time.Second
 	punchWindowHalf  = 5 * time.Second

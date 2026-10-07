@@ -266,7 +266,7 @@ func StartSupervised(ctx context.Context, serial string, specs []PortSpec, onEve
 }
 
 func StartSupervisedWithAuth(ctx context.Context, serial, user, pass string, specs []PortSpec, onEvent func(string)) (*Forwarder, error) {
-	const maxAttempts = 3
+	const maxAttempts = 2
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
