@@ -132,13 +132,14 @@ func launchExploitRun(m *model, inFile, outDir string, threads int, prefixes, di
 	})
 
 	logLine := func(line string) {
-		r.writeLog(line)
 		if cfg.Debug {
 			select {
-			case r.eventsCh <- "[dbg] " + line:
+			case r.eventsCh <- line:
 			default:
 			}
+			return
 		}
+		r.writeLog(line)
 	}
 	fwd.Debug = cfg.Debug
 	fwd.LogHook = logLine
@@ -217,7 +218,6 @@ func launchTitlesRun(m *model, inFile string, threads int, cams []exploit.CamCre
 
 	if skipped > 0 {
 		line := fmt.Sprintf(tr("[!] пропущено строк мимо формата: %d"), skipped)
-		r.writeLog(line)
 		r.eventsCh <- line
 	}
 

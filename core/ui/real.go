@@ -125,6 +125,11 @@ func LastCrashLines(n int) []string {
 	return out
 }
 
+var (
+	dedupeLast    string
+	dedupeLastSet bool
+)
+
 func (r *runState) writeLog(line string) {
 	noteCrashLine(line)
 	if r.logFile == nil {
@@ -133,6 +138,12 @@ func (r *runState) writeLog(line string) {
 	ts := time.Now().Format("15:04:05")
 	plain := stripANSI(line)
 	r.logMu.Lock()
+	if dedupeLastSet && plain == dedupeLast {
+		r.logMu.Unlock()
+		return
+	}
+	dedupeLast = plain
+	dedupeLastSet = true
 	r.logFile.WriteString(fmt.Sprintf("[%s] %s\n", ts, plain))
 	r.logMu.Unlock()
 }

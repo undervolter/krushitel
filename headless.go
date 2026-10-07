@@ -35,11 +35,21 @@ var (
 
 const flogStdout = true
 
+var (
+	flogLast    string
+	flogLastSet bool
+)
+
 func flog(format string, args ...any) {
 	logMu.Lock()
 	defer logMu.Unlock()
 	stamp := time.Now().Format("15:04:05")
 	msg := fmt.Sprintf(format, args...)
+	if flogLastSet && msg == flogLast {
+		return
+	}
+	flogLast = msg
+	flogLastSet = true
 	if flogStdout {
 		fmt.Printf("[%s] %s\n", stamp, msg)
 	}
