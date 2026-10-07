@@ -34,52 +34,6 @@ func isTransportDead(err error) bool {
 
 var errZombieRelay = errors.New("relay zombie: bind acks pass but no DATA comes back")
 
-var errRelayDeadProbe = errors.New("relay dead at birth: no answer to post-punch probe")
-
-// RelaySessionLimit — cap on SIMULTANEOUS live relay sessions (establishment + data path).
-// Evidence: with 29-30 parallel relays, zombies (everything after the first ~4),
-// with a direct-dominant mix — units. Direct tunnels do not consume the slot.
-var RelaySessionLimit = 4
-
-var (
-	relaySessionOnce sync.Once
-	relaySessionSem  chan struct{}
-)
-
-func relaySessionSlot() chan struct{} {
-	relaySessionOnce.Do(func() { relaySessionSem = make(chan struct{}, RelaySessionLimit) })
-	return relaySessionSem
-}
-
-// Dead tunnels: a serial whose data path died as a zombie or probe. Cleared
-// by runWithRetries on any successful re-establishment; the verdict layer
-// (exploit) checks the mark before reporting "not vulnerable".
-var deadTunnels sync.Map
-
-func MarkTunnelDead(serial string) { deadTunnels.Store(serial, true) }
-func ClearTunnelDead(serial string) {
-	if serial != "" {
-		deadTunnels.Delete(serial)
-	}
-}
-func TunnelWasDead(serial string) bool {
-	_, ok := deadTunnels.Load(serial)
-	return ok
-}
-
-// Zombie deaths by relay agents — telemetry + basis for avoiding the agent.
-var (
-	zombieAgentsMu sync.Mutex
-	zombieAgents   = map[string]int{}
-)
-
-func noteZombieAgent(agent string) int {
-	zombieAgentsMu.Lock()
-	defer zombieAgentsMu.Unlock()
-	zombieAgents[agent]++
-	return zombieAgents[agent]
-}
-
 var RelayAllocLimit = 6
 
 var (
@@ -176,7 +130,7 @@ func (s *relayDispatchState) nextTo(current string) string {
 	return ""
 }
 
-func (t *Tunnel) allocRelayAgent(mainRemote *UDP, dispatcher, avoid string) (host string, port int, token string, ok bool) {
+func (t *Tunnel) allocRelayAgent(mainRemote *UDP, dispatcher string) (host string, port int, token string, ok bool) {
 	relayAllocSlot()
 	select {
 	case relayAllocSem <- struct{}{}:
@@ -241,23 +195,7 @@ func (t *Tunnel) allocRelayAgent(mainRemote *UDP, dispatcher, avoid string) (hos
 			continue
 		}
 		port, _ = strconv.Atoi(agent[1])
-		host, token = agent[0], res.Body["body/Token"]
-		if avoid != "" && host+":"+strconv.Itoa(port) == avoid {
-			// Dispatcher handed back the agent this serial just lost to a
-			// zombie death — one re-request for a different assignment.
-			t.logf("dispatcher handed zombie agent %s — re-requesting", avoid)
-			mainRemote.RequestEx("/relay/agent", "", true, false, reqOpts{})
-			if res2, err2 := mainRemote.Read(true, relayAgentAllocTimeout); err2 == nil && res2 != nil && res2.Body["body/Token"] != "" {
-				agent2 := strings.SplitN(res2.Body["body/Agent"], ":", 2)
-				if len(agent2) == 2 && agent2[0] != "" {
-					if p2, e2 := strconv.Atoi(agent2[1]); e2 == nil && agent2[0]+":"+agent2[1] != avoid {
-						return agent2[0], p2, res2.Body["body/Token"], true
-					}
-				}
-			}
-			t.logf("re-request did not yield a different agent — keeping %s", avoid)
-		}
-		return host, port, token, true
+		return agent[0], port, res.Body["body/Token"], true
 	}
 	return "", 0, "", false
 }
@@ -306,11 +244,6 @@ func (t *Tunnel) zombieWatchdog(done chan struct{}) {
 		if zombie {
 			t.logf("zombie data path: realm=%#010x port=%d sent %d bytes, 0 back for %.0fs — fail for retry (app dialect next)",
 				rid, port, up, age.Seconds())
-			MarkTunnelDead(t.serial)
-			if t.agentAddr != "" {
-				t.avoidAgent = t.agentAddr
-				t.logf("relay agent %s flagged as zombie source (deaths: %d)", t.agentAddr, noteZombieAgent(t.agentAddr))
-			}
 			t.forceAppRelay = true
 			t.fail(errZombieRelay)
 			return
