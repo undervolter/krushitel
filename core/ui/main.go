@@ -816,7 +816,7 @@ func (m model) View() string {
 		content, help = m.form.view(), m.form.helpLine()
 	case stFilePick:
 		if m.picker != nil {
-			content, help = m.picker.view(), pickHelpLine()
+			content, help = m.picker.view(m.w, m.h), pickHelpLine()
 		} else {
 			content, help = m.form.view(), m.form.helpLine()
 		}
