@@ -90,7 +90,7 @@ func headlessUsage() {
 		{"  -o, --output DIR", i18n.Tr("папка куда выводятся результаты (по умолчанию - имя входного файла)")},
 		{"  -t, --threads N", i18n.Tr("кол-во потоков (по умолчанию 30)")},
 		{"  -f, --fresh", i18n.Tr("игнорировать session-маркер и done.txt")},
-		{"  -m tgbot", "telegram bot: /scan /scanfile /status /results /stop"},
+		{"  -tg, --tgbot", "telegram bot: /scan /scanfile /status /results /stop"},
 	}
 	for _, r := range rows {
 		out("%-22s %s", r[0], r[1])
@@ -134,23 +134,30 @@ func runHeadless() bool {
 	fs.BoolVar(fresh, "fresh", false, "алиас -f")
 	port := fs.Int("p", 0, "порт для ipscan (5000) / ironscan (37777)")
 	fs.IntVar(port, "port", 0, "алиас -p")
+	tgFlag := fs.Bool("tg", false, "tgbot-режим (алиас -m tgbot)")
+	fs.BoolVar(tgFlag, "tgbot", false, "алиас -tg")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		headlessUsage()
 		os.Exit(2)
 	}
+	if *tgFlag {
+		*mode = "tgbot"
+	}
 	cfg := ui.Config()
 	start = time.Now()
-	if *inFile == "" && cfg.LastInput != "" {
-		*inFile = cfg.LastInput
-		out("[i] using last input: %s", *inFile)
-	}
-	if *inFile == "" {
-		out("[!] err: нужен -i/--input (префиксы/серийники или results.txt для titles)")
+	if *mode != "exploit" && *mode != "titles" && *mode != "ironscan" && *mode != "tgbot" {
+		out("[!] err: неизвестный режим %q — доступен exploit | titles | ironscan | tgbot", *mode)
 		os.Exit(2)
 	}
-	if *mode != "exploit" && *mode != "titles" && *mode != "ironscan" {
-		out("[!] err: неизвестный режим %q — доступен exploit | titles | ironscan", *mode)
-		os.Exit(2)
+	if *mode != "tgbot" {
+		if *inFile == "" && cfg.LastInput != "" {
+			*inFile = cfg.LastInput
+			out("[i] using last input: %s", *inFile)
+		}
+		if *inFile == "" {
+			out("[!] err: нужен -i/--input (префиксы/серийники или results.txt для titles)")
+			os.Exit(2)
+		}
 	}
 
 	tty := isTTY()
