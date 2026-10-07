@@ -41,6 +41,8 @@ var (
 	relayChannelFirstInterval   = 700 * time.Millisecond
 	relayChannelRetransInterval = 1200 * time.Millisecond
 	relayChannelMaxRetransmits  = 9
+
+	relayProbeTimeout = 3 * time.Second
 )
 
 var readLoopIdleTimeout = 5 * time.Second
@@ -277,6 +279,12 @@ type Tunnel struct {
 	pools        map[int]*poolState
 	poolTarget   int
 	poolExplicit bool
+
+	agentAddr  string
+	avoidAgent string
+
+	slotMu   sync.Mutex
+	slotHeld bool
 }
 
 type poolState struct {
@@ -288,6 +296,61 @@ func (t *Tunnel) setPrimary(u *UDP) {
 	t.socksMu.Lock()
 	t.primary = u
 	t.socksMu.Unlock()
+}
+
+// relaySessionSlotAcquire занимает слот живой релей-сессии (см. RelaySessionLimit).
+// Блокируется, пока другой туннель не освободит слот; escape по t.done.
+func (t *Tunnel) relaySessionSlotAcquire() bool {
+	sem := relaySessionSlot()
+	for {
+		if t.isStopped() {
+			return false
+		}
+		select {
+		case sem <- struct{}{}:
+			t.slotMu.Lock()
+			t.slotHeld = true
+			t.slotMu.Unlock()
+			return true
+		case <-t.done:
+			return false
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// relaySessionSlotRelease отдаёт слот. Idempotent: без holding — no-op.
+func (t *Tunnel) relaySessionSlotRelease() {
+	t.slotMu.Lock()
+	held := t.slotHeld
+	t.slotHeld = false
+	t.slotMu.Unlock()
+	if held {
+		<-relaySessionSlot()
+	}
+}
+
+// probeRelay проверяет, что релей возит PTCP прямо сейчас: SYNC + ответ + ack.
+// Тот же exchange, что при установлении — двойной SYNC на relay-сокете
+// безопасен (dh-fwd делает re-SYNC в app fallback).
+func (t *Tunnel) probeRelay(u *UDP) bool {
+	u.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
+	if _, err := u.ReadPTCP(relayProbeTimeout); err != nil {
+		return false
+	}
+	u.RequestPTCP(nil)
+	return true
+}
+
+// markRelayDead помечает серийник для честного вердикта и запоминает агента
+// как источник зомби (следующая аллокация перепросит диспетчера).
+func (t *Tunnel) markRelayDead(reason string) {
+	MarkTunnelDead(t.serial)
+	if t.agentAddr != "" {
+		t.avoidAgent = t.agentAddr
+		t.logf("relay agent %s flagged as zombie source (%s; deaths: %d)",
+			t.agentAddr, reason, noteZombieAgent(t.agentAddr))
+	}
 }
 
 func (t *Tunnel) getPrimary() *UDP {
@@ -337,6 +400,7 @@ func newTunnelWithProfile(serial string, prof *appProfile, dtype int, username, 
 
 func (t *Tunnel) reset() {
 	t.readerWG.Wait()
+	t.relaySessionSlotRelease()
 	t.listeners = nil
 	t.clients = make(map[uint32]*Client)
 	t.acceptCh = make(chan acceptConn, 16)
@@ -377,6 +441,7 @@ func (t *Tunnel) close() {
 	default:
 		close(t.done)
 	}
+	t.relaySessionSlotRelease()
 	for _, ln := range t.listeners {
 		ln.Close()
 	}
@@ -696,7 +761,19 @@ func (t *Tunnel) establish() error {
 	var agentHost string
 	var agentPort int
 	var agentToken string
+	// Слот живой релей-сессии: держим от аллокации агента до конца попытки.
+	// ready(relay) переводит слот в режим "до закрытия туннеля" (keepSlot),
+	// ready(direct)/ошибка — освобождают через defer.
+	keepSlot := false
 	if relayHost != "" {
+		if !t.relaySessionSlotAcquire() {
+			return errors.New("tunnel stopped")
+		}
+		defer func() {
+			if !keepSlot {
+				t.relaySessionSlotRelease()
+			}
+		}()
 		if prof.relayAgentOptional {
 			mainRemote.SetRemote(relayHost, relayPort)
 			mainRemote.RequestEx("/relay/agent", "", true, false, reqOpts{})
@@ -711,7 +788,8 @@ func (t *Tunnel) establish() error {
 			}
 		} else {
 			var ok bool
-			agentHost, agentPort, agentToken, ok = t.allocRelayAgent(mainRemote, fmt.Sprintf("%s:%d", relayHost, relayPort))
+			agentHost, agentPort, agentToken, ok = t.allocRelayAgent(mainRemote,
+				fmt.Sprintf("%s:%d", relayHost, relayPort), t.avoidAgent)
 			if !ok {
 				return fmt.Errorf("relay agent: all dispatchers silent (%s and cached alternates)", relayHost)
 			}
@@ -719,6 +797,7 @@ func (t *Tunnel) establish() error {
 	}
 	agentOK := agentHost != ""
 	if agentOK {
+		t.agentAddr = fmt.Sprintf("%s:%d", agentHost, agentPort)
 		t.startRelayAgent(mainRemote, agentHost, agentPort, agentToken)
 	}
 
@@ -971,6 +1050,14 @@ func (t *Tunnel) establish() error {
 		if StunFailHook != nil {
 			StunFailHook(t.serial)
 		}
+		// Гейт: релей мог умереть за пунч-окно. Молчание = фейл попытки,
+		// ретрай перепросит агента — вместо 60-90с таймаутов эксплойта.
+		if !t.probeRelay(mainRemote) {
+			t.markRelayDead("probe silent after punch window")
+			return errRelayDeadProbe
+		}
+		t.logf("relay probe ok — relay path alive")
+		keepSlot = true
 		t.setStage("ready (relay)")
 		t.setPrimary(mainRemote)
 		return nil
@@ -1026,6 +1113,12 @@ func (t *Tunnel) establish() error {
 		}
 		t.logf("ptcp device handshake failed (%v) — using relay agent as the data path", err)
 		if agentOK {
+			if !t.probeRelay(mainRemote) {
+				t.markRelayDead("probe silent after handshake fail")
+				return errRelayDeadProbe
+			}
+			t.logf("relay probe ok — relay path alive")
+			keepSlot = true
 			t.setStage("ready (relay)")
 			t.setPrimary(mainRemote)
 			return nil
@@ -2526,6 +2619,7 @@ func runWithRetries(t *Tunnel, onExhausted func(err error)) {
 		}
 		err := t.Run()
 		if err == nil {
+			ClearTunnelDead(t.serial)
 			return
 		}
 		if t.isStopped() {
