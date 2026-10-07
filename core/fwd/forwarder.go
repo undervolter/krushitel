@@ -138,6 +138,7 @@ func StartContext(ctx context.Context, serial string, specs []PortSpec, dtype in
 		t.Terminate()
 		return nil, ctx.Err()
 	case <-t.Ready():
+		ClearTunnelDead(serial)
 		f.Ports = t.LocalPorts()
 		go func() {
 			select {

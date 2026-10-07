@@ -82,6 +82,25 @@ var InitLimit = 32
 
 var StunFailHook func(serial string)
 
+var deadTunnels sync.Map
+
+func MarkTunnelDead(serial string) {
+	if serial != "" {
+		deadTunnels.Store(serial, struct{}{})
+	}
+}
+
+func ClearTunnelDead(serial string) {
+	if serial != "" {
+		deadTunnels.Delete(serial)
+	}
+}
+
+func TunnelWasDead(serial string) bool {
+	_, ok := deadTunnels.Load(serial)
+	return ok
+}
+
 func isModernAppRelayVersion(v string) bool {
 	if v == "" {
 		return false
@@ -1244,7 +1263,10 @@ func (t *Tunnel) waitForPTCPToken(u *UDP, timeout time.Duration) (*PTCP, error) 
 		if shorts >= 10 {
 			return nil, errPTCPAppFallback
 		}
-		t.logf("ptcp 0x17: discarding short body (%d bytes: %x) — waiting for token", len(p.Body), p.Body)
+		if shorts == 1 {
+			t.logf("ptcp 0x17: device sends %d-byte heartbeats instead of token — app dialect (%d bytes: %x)",
+				len(p.Body), len(p.Body), p.Body)
+		}
 	}
 }
 
