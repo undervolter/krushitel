@@ -2,6 +2,7 @@ package ui
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 
@@ -41,9 +42,8 @@ type Settings struct {
 
 	BrutePasswords []string `json:"brute_passwords" toml:"brute_passwords"`
 
-	TgBotToken string  `json:"tg_bot_token" toml:"tg_bot_token"`
-	TgChatIDs  []int64 `json:"tg_chat_ids" toml:"tg_chat_ids"`
-	TgEnabled  bool    `json:"tg_enabled" toml:"tg_enabled"`
+	TgBotToken string   `json:"tg_bot_token" toml:"tg_bot_token"`
+	TgChatIDs  []string `json:"tg_chat_ids" toml:"tg_chat_ids"`
 
 	DiscordRPC bool `json:"discord_rpc" toml:"discord_rpc"`
 
@@ -75,7 +75,9 @@ var cfg = Settings{
 
 func loadSettings() {
 	if data, err := os.ReadFile(configFile); err == nil {
-		_ = toml.Unmarshal(data, &cfg)
+		if uerr := toml.Unmarshal(data, &cfg); uerr != nil {
+			fmt.Fprintf(os.Stderr, "[!] config.toml: %v (применены дефолты)"+"\n", uerr)
+		}
 	} else if data, err := os.ReadFile(configFileJSON); err == nil {
 		_ = json.Unmarshal(data, &cfg)
 		saveSettings()

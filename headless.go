@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -211,10 +212,6 @@ func runHeadless() bool {
 		os.Exit(1)
 	}
 
-	if *mode != "tgbot" && cfg.TgEnabled && cfg.TgBotToken != "" {
-		out("[i] tg_enabled игнорируется вне режима -m tgbot")
-	}
-
 	switch *mode {
 	case "exploit":
 		os.Exit(runHeadlessExploit(cfg, *inFile, *outDir, *threads, *fresh, progress, renderDone))
@@ -233,9 +230,13 @@ func runHeadlessBot(cfg ui.Settings, threads int) int {
 		out("[!] err: tg_bot_token пуст в config.toml")
 		return 2
 	}
-	if !cfg.TgEnabled {
-		out("[!] err: tg_enabled выключен в config.toml")
-		return 2
+	var chatIDs []int64
+	for _, s := range cfg.TgChatIDs {
+		if id, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil {
+			chatIDs = append(chatIDs, id)
+		} else {
+			out("[!] tg_chat_ids: %q не число, скип", s)
+		}
 	}
 	if threads <= 0 {
 		threads = 30
@@ -251,7 +252,7 @@ func runHeadlessBot(cfg ui.Settings, threads int) int {
 	err := tgbot.Run(tgbot.Options{
 		Ctx:     ctx,
 		Token:   cfg.TgBotToken,
-		ChatIDs: cfg.TgChatIDs,
+		ChatIDs: chatIDs,
 		Threads: threads,
 		OutRoot: ".",
 		Opts: exploit.Opts{
