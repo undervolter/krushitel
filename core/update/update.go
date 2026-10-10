@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,10 +34,30 @@ var BuildDate string
 // суффикс и штамп туда не лезут.
 func FullVersion() string {
 	v := CurrentVersion + VersionSuffix
-	if BuildDate != "" {
-		v += " (build " + BuildDate + ")"
+	if stamp := buildStamp(); stamp != "" {
+		v += " (build " + stamp + ")"
 	}
 	return v
+}
+
+// buildStamp — дата сборки ddmmyy. Приоритет: явный ldflags-штамп из
+// сборочных скриптов; иначе дата HEAD-коммита из vcs-инфы, которую Go
+// вшивает сам (поэтому штамп есть и у обычного `go build` из гит-дерева).
+// Вне git-дерева и без ldflags — пусто, показываем голую версию.
+func buildStamp() string {
+	if BuildDate != "" {
+		return BuildDate
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "vcs.time" {
+				if t, err := time.Parse(time.RFC3339, s.Value); err == nil {
+					return t.Format("020106")
+				}
+			}
+		}
+	}
+	return ""
 }
 
 const (
