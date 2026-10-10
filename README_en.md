@@ -1,5 +1,5 @@
 <div align="center">
-<h2>This is an alpha version - some features may be extremely unstable </h2>
+<h2>This is a beta version - some features may be extremely unstable </h2>
 </div>
 
 <div align="center">
