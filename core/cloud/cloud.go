@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode/utf16"
+
+	"krushitel/core/cloudip"
 )
 
 const (
@@ -53,8 +55,8 @@ func cloudLog(format string, args ...any) {
 }
 
 func CheckOnline(serial string) bool {
-	raddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", MainServer, MainPort))
-	if err != nil {
+	addrs := cloudip.Addrs(MainServer, MainPort)
+	if len(addrs) == 0 {
 		return false
 	}
 	conn, err := net.ListenUDP("udp4", nil)
@@ -65,32 +67,34 @@ func CheckOnline(serial string) bool {
 
 	req := buildRequest(serial)
 	buf := make([]byte, 8192)
-	for i := 0; i < 2; i++ {
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
-		if _, err := conn.WriteToUDP([]byte(req), raddr); err != nil {
-			cloudLog("%s: send try %d: %v", serial, i+1, err)
-			continue
-		}
-		cloudLog("%s: >>> /online/p2psrv (try %d)", serial, i+1)
-		n, _, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			cloudLog("%s: <<< silent (try %d): %v", serial, i+1, err)
-			continue
-		}
-		resp := string(buf[:n])
-		first := resp
-		if j := strings.Index(resp, "\r\n"); j >= 0 {
-			first = resp[:j]
-		}
-		cloudLog("%s: <<< %s (US=%v)", serial, first, strings.Contains(resp, "<US>"))
-		if strings.HasPrefix(resp, "HTTP/1.1 200") && strings.Contains(resp, "<US>") {
-			return true
-		}
-		if strings.Contains(resp, " 404 ") {
-			return false
+	for _, raddr := range addrs {
+		for i := 0; i < 2; i++ {
+			conn.SetDeadline(time.Now().Add(2 * time.Second))
+			if _, err := conn.WriteToUDP([]byte(req), raddr); err != nil {
+				cloudLog("%s: send try %d to %s: %v", serial, i+1, raddr.IP, err)
+				continue
+			}
+			cloudLog("%s: >>> /online/p2psrv %s (try %d)", serial, raddr.IP, i+1)
+			n, _, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				cloudLog("%s: <<< silent %s (try %d): %v", serial, raddr.IP, i+1, err)
+				continue
+			}
+			resp := string(buf[:n])
+			first := resp
+			if j := strings.Index(resp, "\r\n"); j >= 0 {
+				first = resp[:j]
+			}
+			cloudLog("%s: <<< %s (US=%v)", serial, first, strings.Contains(resp, "<US>"))
+			if strings.HasPrefix(resp, "HTTP/1.1 200") && strings.Contains(resp, "<US>") {
+				return true
+			}
+			if strings.Contains(resp, " 404 ") {
+				return false
+			}
 		}
 	}
-	cloudLog("%s: тишина после 2 попыток", serial)
+	cloudLog("%s: тишина после попыток по %d адресам", serial, len(addrs)*2)
 	return false
 }
 
@@ -141,12 +145,18 @@ func (c *Checker) Start() error {
 	c.started = true
 	c.startMu.Unlock()
 
-	raddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", MainServer, MainPort))
-	if err != nil {
-		return fmt.Errorf("resolve cloud: %w", err)
+	// One socket per worker, spread round-robin over the resolved cloud pool
+	// instead of every worker hammering a single IP.
+	addrs := cloudip.NextN(MainServer, MainPort, c.Workers)
+	if len(addrs) == 0 {
+		return fmt.Errorf("resolve cloud %s: no addresses", MainServer)
+	}
+	if cloudip.Static() {
+		cloudLog("DNS недоступен — используем захардкоженный пул %s (%d адресов)", MainServer, len(addrs))
 	}
 
 	for i := 0; i < c.Workers; i++ {
+		raddr := addrs[i%len(addrs)]
 		conn, err := net.DialUDP("udp4", nil, raddr)
 		if err != nil {
 			continue

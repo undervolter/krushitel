@@ -77,6 +77,22 @@ var LogHook func(string)
 
 var InitLimit = 32
 
+// InitLimitFromEnv — грязный эксперимент core-rebuild: ручка газу без пересборки.
+//
+//	KRUSH_INIT_LIMIT=256 ./krushitel -i ... -t 128
+//
+// Поднимает глобальный семафор concurrent установок туннелей. Дефолт не меняем:
+// больше 100 одновременных установок долбит облако öngörülemeyen — крутить
+// осознанно и смотреть loss/retry в логах.
+func InitLimitFromEnv(def int) int {
+	if v := os.Getenv("KRUSH_INIT_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
 var StunFailHook func(serial string)
 
 func isModernAppRelayVersion(v string) bool {

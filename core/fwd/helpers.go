@@ -23,6 +23,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/pbkdf2"
+
+	"krushitel/core/cloudip"
 )
 
 const (
@@ -336,9 +338,10 @@ func NewUDP(host string, port int, debug bool, prof *appProfile) *UDP {
 	}
 
 	if host != "" {
-		u.raddr, err = net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", host, port))
-		if err != nil {
-			u.initErr = err
+		if a := cloudip.Next(host, port); a != nil {
+			u.raddr = a
+		} else if _, perr := net.ResolveUDPAddr("udp4", net.JoinHostPort(host, strconv.Itoa(port))); perr != nil {
+			u.initErr = perr
 		}
 	}
 	u.lastRecv = time.Now()
@@ -356,7 +359,11 @@ func (u *UDP) Close() {
 func (u *UDP) SetRemote(host string, port int) {
 	u.rhost = host
 	u.rport = port
-	u.raddr, _ = net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", host, port))
+	if a := cloudip.Next(host, port); a != nil {
+		u.raddr = a
+		return
+	}
+	u.raddr, _ = net.ResolveUDPAddr("udp4", net.JoinHostPort(host, strconv.Itoa(port)))
 }
 
 func (u *UDP) Send(data []byte) {
@@ -448,6 +455,63 @@ func (u *UDP) SetTimeout(d time.Duration) {
 		u.readTimeout = 0
 		_ = u.conn.SetReadDeadline(time.Time{})
 	}
+}
+
+// ReadCtx — Read, но с отменой по контексту.
+//
+// Recv сидит в ReadFromUDP до полного таймаута, поэтому длинный вызов в VerifyDevice
+// нельзя было прервать ни /stop'ом, ни Ctrl+C: воркер висел до 16 секунд вслепую.
+// Здесь ожидание нарезается на короткие интервалы, между которыми проверяется ctx,
+// поэтому отмена видна с задержкой ctxPollSlice, а не по полному таймауту.
+func (u *UDP) ReadCtx(ctx context.Context, returnError bool, timeout time.Duration) (*DHResponse, error) {
+	if ctx == nil {
+		return u.Read(returnError, timeout)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		step := ctxPollSlice
+		if remaining := time.Until(deadline); remaining < step {
+			step = remaining
+		}
+		if step <= 0 {
+			// исчерпали timeout — отдаём пустой результат, как и Read
+			data, err := u.Recv(4096, 0)
+			if err != nil {
+				return nil, err
+			}
+			return ParseDHResponse(string(data)), nil
+		}
+		data, err := u.Recv(4096, step)
+		if err == nil {
+			return u.parseRead(data, returnError)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !time.Now().Before(deadline) {
+			return nil, err
+		}
+	}
+}
+
+// ctxPollSlice — как часто длинное чтение просыпается проверить отмену.
+const ctxPollSlice = 200 * time.Millisecond
+
+func (u *UDP) parseRead(data []byte, returnError bool) (*DHResponse, error) {
+	if u.debug {
+		u.logf(":%d <<< %s:%d\n%s", u.lport, u.rhost, u.rport, string(data))
+	}
+	res := ParseDHResponse(string(data))
+	if !returnError && res.Code >= 400 {
+		return nil, fmt.Errorf("error %d: %s", res.Code, res.Status)
+	}
+	if u.debug {
+		u.logf("Parsed <<< code=%d status=%s", res.Code, res.Status)
+	}
+	return res, nil
 }
 
 func (u *UDP) Read(returnError bool, timeout time.Duration) (*DHResponse, error) {

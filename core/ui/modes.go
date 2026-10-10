@@ -35,7 +35,7 @@ func exploitForm() *formState {
 	if cfg.LastOut != "" {
 		f.setDefault(cfg.LastOut)
 	}
-	defThreads := 30
+	defThreads := 64
 	if cfg.LastThreads > 0 {
 		defThreads = cfg.LastThreads
 	}
@@ -47,10 +47,10 @@ func exploitForm() *formState {
 }
 
 func startExploitRun(m *model) {
-	RememberRun(m.form.fields[0].strVal, m.form.fields[1].strVal, m.threadsVal(30))
+	threads := m.threadsVal(2)
+	RememberRun(m.form.fields[0].strVal, m.form.fields[1].strVal, threads)
 	inFile := m.form.fields[0].strVal
 	outDir := m.form.fields[1].strVal
-	threads := m.threadsVal(2)
 	cfg.Snaps = m.form.fields[3].boolVal
 	cfg.XML = m.form.fields[4].boolVal
 	cfg.SkipShitty = m.form.fields[5].boolVal
@@ -118,7 +118,7 @@ func launchExploitRun(m *model, inFile, outDir string, threads int, prefixes, di
 	r.exp = tp
 	r.saveDir = outDir
 	r.openLog(filepath.Join(outDir, "log.txt"))
-	fwd.InitLimit = 100
+	fwd.InitLimit = fwd.InitLimitFromEnv(100)
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
 	m.form = nil
@@ -152,6 +152,15 @@ func launchExploitRun(m *model, inFile, outDir string, threads int, prefixes, di
 	exploit.LogHook = func(format string, args ...any) {
 		logLine(fmt.Sprintf(format, args...))
 	}
+	// Детальный лог фазы скана серийников: alive все, dead/retry семпл 1/256.
+	// Идёт в ленту и лог-файл без включения Debug. Скан — единственный writer
+	// пайплайна channelPipeline, так что хук не заденет фазу эксплоита.
+	scanner.ScanLog = func(line string) {
+		select {
+		case r.eventsCh <- line:
+		default:
+		}
+	}
 
 	opts := exploit.Opts{
 		OutDir:          outDir,
@@ -164,7 +173,6 @@ func launchExploitRun(m *model, inFile, outDir string, threads int, prefixes, di
 		DummyLogin:      cfg.DummyLogin,
 		DummyPass:       cfg.DummyPass,
 		Resume:          resume,
-		Destructive:     cfg.Destructive,
 		WipeUsers:       cfg.WipeUsers,
 	}
 
@@ -174,6 +182,7 @@ func launchExploitRun(m *model, inFile, outDir string, threads int, prefixes, di
 			cloud.LogHook = nil
 			dhip.LogHook = nil
 			exploit.LogHook = nil
+			scanner.ScanLog = nil
 		}()
 		exploit.RunPrefixExploit(ctx, prefixes, direct, outDir, threads, opts, tp, r.eventsCh)
 	}()

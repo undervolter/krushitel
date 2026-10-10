@@ -18,6 +18,27 @@ import (
 
 const CurrentVersion = "1.4"
 
+// VersionSuffix — стадия: релизы идут как v1.4, ветка-core как v1.4-beta.
+const VersionSuffix = "-beta"
+
+// BuildDate вшивается на сборке скриптами (build_all.cmd / build_release.ps1):
+//
+//	go build -ldflags "-X krushitel/core/update.BuildDate=101026" .
+//
+// Формат ddmmyy. Пусто = локальная сборка без штампа.
+var BuildDate string
+
+// FullVersion — служебная строка для баннеров: v1.4-beta (build 101026).
+// Сравнение с релизами (Check/newerThan) идёт по голому CurrentVersion,
+// суффикс и штамп туда не лезут.
+func FullVersion() string {
+	v := CurrentVersion + VersionSuffix
+	if BuildDate != "" {
+		v += " (build " + BuildDate + ")"
+	}
+	return v
+}
+
 const (
 	repoOwner = "undervolter"
 	repoName  = "krushitel"

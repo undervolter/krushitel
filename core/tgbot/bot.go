@@ -28,13 +28,16 @@ type Options struct {
 }
 
 const (
-	statusEvery = 60 * time.Second
+	// statusEvery — как часто обновляется статусное сообщение скана. Сообщение
+	// одно и то же, меняется только текст (editMessageText), поэтому в чате
+	// остаётся ровно одна плашка со свежими цифрами.
+	statusEvery = 10 * time.Second
 )
 
 var helpText = strings.Join([]string{
 	"krushitel tgbot — базовый контрол:",
 	"/scan <цели> — брут по префиксам/серийникам (пробел или новые строки)",
-	"/scanfile — пришли списком файлом вместе с командой",
+	"/scanfile — жду файл следующим сообщением (или прикрепи файл с подписью /scanfile)",
 	"/status — статус текущего скана",
 	"/results — прислать архив с результатами последнего скана",
 	"/stop — остановить текущий скан",
@@ -60,10 +63,17 @@ type Bot struct {
 	st     scanState
 	outMu  sync.Mutex
 	outDir string
+	// waitFile: чаты, где /scanfile без файла перевёл бота в режим
+	// ожидания — следующий документ из чата идёт в скан.
+	waitMu   sync.Mutex
+	waitFile map[int64]time.Time
 }
 
+// waitFileTimeout — сколько живёт режим ожидания файла.
+const waitFileTimeout = 10 * time.Minute
+
 func Run(opts Options) error {
-	b := &Bot{opts: opts, logFn: opts.Log}
+	b := &Bot{opts: opts, logFn: opts.Log, waitFile: make(map[int64]time.Time)}
 	b.api = New(opts.Token, opts.ChatIDs)
 	if opts.OutRoot == "" {
 		opts.OutRoot = "."
@@ -110,6 +120,11 @@ func (b *Bot) logf(format string, args ...any) {
 }
 
 func (b *Bot) handle(u *Update) {
+	// Файл отдельным сообщением — имеет смысл только в режиме ожидания.
+	if u.DocID != "" && u.Text == "" {
+		b.gotFile(u)
+		return
+	}
 	cmd := u.Text
 	args := ""
 	if i := strings.IndexAny(cmd, " \n"); i >= 0 {
@@ -121,9 +136,19 @@ func (b *Bot) handle(u *Update) {
 	case "/scan":
 		b.startScan(u, args, "")
 	case "/scanfile":
-		b.startScan(u, args, u.DocID)
+		// Файл подписью к команде — старт сразу, как раньше.
+		if u.DocID != "" {
+			b.startScan(u, args, u.DocID)
+			return
+		}
+		// Текст вместо файла — как /scan.
+		if args != "" {
+			b.startScan(u, args, "")
+			return
+		}
+		b.waitForFile(u)
 	case "/status":
-		b.api.Send(u.ChatID, b.status())
+		b.api.Send(u.ChatID, b.status(u.ChatID))
 	case "/stop":
 		b.stopScan(u)
 	case "/results":
@@ -143,6 +168,10 @@ func (b *Bot) startScan(u *Update, args, docID string) {
 	b.st.busy = true
 	b.st.chat = u.ChatID
 	b.st.mu.Unlock()
+
+	b.waitMu.Lock()
+	delete(b.waitFile, u.ChatID)
+	b.waitMu.Unlock()
 
 	go b.runScan(u.ChatID, args, docID)
 }
@@ -201,7 +230,7 @@ func (b *Bot) runScan(chat int64, args, docID string) {
 		len(prefixes), scanTotal, len(direct), outDir)
 	b.api.Send(chat, head)
 
-	fwd.InitLimit = 100
+	fwd.InitLimit = fwd.InitLimitFromEnv(100)
 	ctx, cancel := context.WithCancel(context.Background())
 	tp := &exploit.TwoPhaseStats{
 		Scan:        &scanner.ScanStats{},
@@ -237,7 +266,9 @@ func (b *Bot) runScan(chat int64, args, docID string) {
 
 	ticker := time.NewTicker(statusEvery)
 	tickerStop := make(chan struct{})
+	tickerExited := make(chan struct{})
 	go func() {
+		defer close(tickerExited)
 		defer ticker.Stop()
 		for {
 			select {
@@ -254,7 +285,13 @@ func (b *Bot) runScan(chat int64, args, docID string) {
 
 	close(events)
 	<-doneEvents
+
+	// Тикер гасим ДО финальной правки сообщения, и ждём его выхода. Иначе
+	// поздний тик успевает встретиться с финишем: statusID уже обнулён,
+	// тикер создаёт второе сообщение со сводкой, и в чате остаётся плашка
+	// после «финиш».
 	close(tickerStop)
+	<-tickerExited
 
 	final := "финиш: " + b.summary()
 	if msg := tp.Scan.ErrorMsg; msg != "" {
@@ -264,7 +301,7 @@ func (b *Bot) runScan(chat int64, args, docID string) {
 		final += "\n[!] " + msg
 	}
 	if ctx.Err() != nil {
-		final += "\n(остановлено командой /stop — session-маркер сохранён)"
+		final += "\n(остановлено: /stop или CTRL+C — session-маркер сохранён)"
 	}
 	b.st.mu.Lock()
 	sid := b.st.statusID
@@ -278,23 +315,91 @@ func (b *Bot) runScan(chat int64, args, docID string) {
 }
 
 func (b *Bot) stopScan(u *Update) {
+	b.waitMu.Lock()
+	_, waiting := b.waitFile[u.ChatID]
+	if waiting {
+		delete(b.waitFile, u.ChatID)
+	}
+	b.waitMu.Unlock()
+
 	b.st.mu.Lock()
 	defer b.st.mu.Unlock()
 	if !b.st.busy || b.st.cancel == nil {
-		b.api.Send(u.ChatID, "[!] скана нет")
+		if waiting {
+			b.api.Send(u.ChatID, "ожидание файла снято")
+		} else {
+			b.api.Send(u.ChatID, "[!] скана нет")
+		}
 		return
 	}
 	b.st.cancel()
-	b.api.Send(u.ChatID, "стопаю...")
+	b.api.Send(u.ChatID, fmt.Sprintf("стопаю... (бюджет %s на серийник, освобождаю воркеры)", exploit.SerialBudget))
 }
 
-func (b *Bot) status() string {
+func (b *Bot) status(chatID int64) string {
 	b.st.mu.Lock()
 	defer b.st.mu.Unlock()
-	if !b.st.busy {
-		return "сканов нет — /scan <цели>"
+	if b.st.busy {
+		return b.summary()
 	}
-	return b.summary()
+	b.waitMu.Lock()
+	since, ok := b.waitFile[chatID]
+	if ok && time.Since(since) > waitFileTimeout {
+		delete(b.waitFile, chatID)
+		ok = false
+	}
+	left := (waitFileTimeout - time.Since(since)).Truncate(time.Second)
+	b.waitMu.Unlock()
+	if ok {
+		return fmt.Sprintf("жду файл для /scanfile (осталось %s) — кидай файл или /stop", left)
+	}
+	return "сканов нет — /scan <цели>"
+}
+
+// waitForFile переводит чат в режим ожидания файла.
+func (b *Bot) waitForFile(u *Update) {
+	b.st.mu.Lock()
+	busy := b.st.busy
+	b.st.mu.Unlock()
+	if busy {
+		b.api.Send(u.ChatID, "[!] скан уже идёт — /stop или /status")
+		return
+	}
+	b.waitMu.Lock()
+	b.waitFile[u.ChatID] = time.Now()
+	b.waitMu.Unlock()
+	b.api.Send(u.ChatID, "ок, жду файл (10 мин) — кидай следующим сообщением\n/stop — выйти из ожидания")
+}
+
+// gotFile — прилетел документ отдельным сообщением.
+func (b *Bot) gotFile(u *Update) {
+	b.waitMu.Lock()
+	since, ok := b.waitFile[u.ChatID]
+	if ok {
+		delete(b.waitFile, u.ChatID)
+	}
+	b.waitMu.Unlock()
+	if !ok {
+		b.api.Send(u.ChatID, "файл вижу, но я его не ждал — пришли сначала /scanfile")
+		return
+	}
+	if time.Since(since) > waitFileTimeout {
+		b.api.Send(u.ChatID, "[!] ожидание протухло (10 мин) — пришли /scanfile ещё раз")
+		return
+	}
+	b.st.mu.Lock()
+	busy := b.st.busy
+	b.st.mu.Unlock()
+	if busy {
+		// Скан поднялся между командой и файлом — ожидание возвращаем,
+		// файл не потерян: пришли его ещё раз после финиша.
+		b.waitMu.Lock()
+		b.waitFile[u.ChatID] = time.Now()
+		b.waitMu.Unlock()
+		b.api.Send(u.ChatID, "[!] скан уже идёт — файл не взят, пришли его ещё раз после финиша (/status)")
+		return
+	}
+	b.startScan(u, "", u.DocID)
 }
 
 func (b *Bot) updateStatus() {

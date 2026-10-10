@@ -12,12 +12,15 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"krushitel/core/cloudip"
 	"krushitel/core/i18n"
 	"krushitel/core/ironscan"
 	"krushitel/core/syslimits"
@@ -32,16 +35,49 @@ const (
 
 	PIPELINE_WINDOW = 32
 	W_MIN           = 8
-	W_MAX           = 128
+	W_MAX           = 256
 	GOV_GROW        = 8
 	GOV_SHRINK      = 16
 	ACK_TIMEOUT     = 15 * time.Second
 
+	// Адаптивный таймаут (перелопачивание механики, core-rebuild):
+	//
+	// Физика, а не баг: чтобы держать X rps при T-секундном таймауте, нужно
+	// X*T inflight-слотов (закон Литтла). 10к rps × 15с = 150 000 слотов
+	// против максимум 128 воркеров × 128 окно = 16к. При любой заметной доле
+	// тишины труба ОБЯЗАНА вставать — окно забито, все ждут дедлайны.
+	// Лечится только быстрым провалом: таймаут едет от медианы RTT.
+	TIMEOUT_MIN        = 2 * time.Second
+	TIMEOUT_RTT_FACTOR = 10
+
+	// Шторм: доля протухших выше — тишина почти наверняка наш дроп от
+	// перегруза, ретраи только добавят нагрузки. Тишина в шторм идёт сразу
+	// в dead без могильника. Явные вердикты (401) ретраятся как раньше.
+	STORM_EXPIRED_EMA = 0.25
+
+	// Кап могильника на воркер: без bound он растёт тысячами и каждый pump
+	// ходит по O(n) (minDeadline + expire по всем). Лишнее вытесняется.
+	GRAVE_CAP = 1024
+
 	SEND_STAGGER = 100 * time.Microsecond
 
-	ACK_GRACE = 30 * time.Second
+	// Пересмотр механики (core-rebuild): grace ужата 30с → 10с. Поздние ответы
+	// облака — это миллисекунды-секунды, а не десятки секунд: alive-вердикты
+	// генерирует облако, а не камера, и они быстрые. 30с держали могильник и
+	// худший кейс молчуна на уровне ~105с, теперь ~26с (2+10+2+10+2).
+	ACK_GRACE = 10 * time.Second
 
 	CHANNEL_RETRIES = 2
+
+	// PUMP_MAX_WAIT — потолок одного Read в pump. Дедлайны висят по 15с
+	// (grace — 30с), а блокирующий Read не смотрит на ctx: без капа Esc/стоп
+	// висит до 15с и ретраи из graveyard стреляют пачкой. С капом воркер
+	// просыпается раз в секунду, expire идёт инкрементально.
+	PUMP_MAX_WAIT = time.Second
+
+	// SEND_JITTER_BOUND — разброс дедлайна. Пачка, ушедшая burst'ом, иначе
+	// протухает в одну миллисекунду, и ретраи 30 воркеров бьют herd'ом.
+	SEND_JITTER_BOUND = 500 * time.Millisecond
 
 	MAX_RPS        = 3000
 	BURST_LIMIT    = 64
@@ -183,6 +219,154 @@ func crashGuard(r any) {
 	}
 }
 
+// FatalHook вызывается вместо переподнятия паники из горутины воркера.
+//
+// Зачем: defer-recover в main() ловит только паники ГЛАВНОЙ горутины. Паника
+// в scanWorker уносила процесс дефолтным обработчиком Go — голый трейс на
+// stderr, без сплэша «krushitel crashed». Хук выносит обработку туда же, где
+// жив сплэш, и он начинает работать для любых горутин.
+//
+// nil означает «не задан»: поведение прежнее, переподнять панику.
+var FatalHook func(reason string, stack []byte)
+
+// raiseOrReraise — единая точка обработки паники из горутины воркера: сначала
+// даём записать состояние прогона, затем отдаём управление хуку (он сам
+// напечатает сплэш и выйдет). Хука нет — переподнимаем, как раньше.
+func raiseOrReraise(r any) {
+	crashGuard(r)
+	if FatalHook != nil {
+		FatalHook(panicReason(r), debug.Stack())
+		return
+	}
+	panic(r)
+}
+
+// panicReason вытаскивает короткую причину без стектрейса.
+// PanicReason — публичная обёртка для слоёв, которые ловят паники сами.
+func PanicReason(r any) string { return panicReason(r) }
+
+func panicReason(r any) string {
+	if r == nil {
+		return "unknown panic"
+	}
+	s := fmt.Sprint(r)
+	if i := strings.IndexByte(s, 10); i >= 0 {
+		s = s[:i]
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "unknown panic"
+	}
+	return s
+}
+
+// TestCrashAfter — через сколько ОТ ВКЛЮЧЕНИЯ ГУБЕРНАТОРА уронить процесс
+// настоящей ошибкой. Ноль означает «выключено», и это значение по умолчанию.
+//
+// Зачем это нужно: проверить, что путь восстановления действительно
+// срабатывает, а не просто существует в коде. Паника поднимается ВНУТРИ
+// горутины воркера, поэтому идёт ровно через ту же цепочку, что и настоящий
+// баг:
+//
+//	nil map -> panic -> recover в scanWorker -> crashGuard -> CrashHook
+//	         -> scanCrashDumper.dump -> crashscan.json -> FatalHook -> сплэш
+//
+// Дальше повторный запуск обязан подхватить позицию и продолжить. Поднимать
+// панику отдельной горутиной было бы бессмысленно: recover в воркере её бы не
+// увидел и проверка ничего не доказала бы.
+//
+// ВКЛЮЧАЕТСЯ ТОЛЬКО ЯВНО, переменной окружения:
+//
+//	KRUSHITEL_TEST_CRASH_AFTER=5s ./krushitel -i prefixes.txt
+//	KRUSHITEL_TEST_CRASH_AFTER=off ./krushitel      # принудительно выключить
+//
+// Без переменной триггер не существует: инжектор не создаётся, отсчёт не идёт.
+// Никакого влияния на обычный прогон.
+var TestCrashAfter time.Duration
+
+// envTestCrash — переменная, которой триггер управляется.
+const envTestCrash = "KRUSHITEL_TEST_CRASH_AFTER"
+
+func init() {
+	TestCrashAfter = parseCrashAfter(os.Getenv(envTestCrash))
+	cachedTimeoutNs.Store(int64(ACK_TIMEOUT))
+}
+
+// parseCrashAfter разбирает значение переменной окружения триггера.
+// Пусто, «off», «0» и прочие слова выключения дают ноль; мусор тоже даёт
+// ноль, чтобы опечатка не ломала обычный запуск.
+func parseCrashAfter(v string) time.Duration {
+	norm := strings.ToLower(strings.TrimSpace(v))
+	switch norm {
+	case "", "off", "0", "no", "false", "disabled", "none", "выкл", "нет":
+		return 0
+	}
+	// Приводим к нижнему регистру: time.ParseDuration понимает только
+	// строчные единицы, а человек в переменной окружения спокойно напишет
+	// «5S» или «250MS». Заодно «5M» становится пятью минутами, а не ошибкой.
+	d, err := time.ParseDuration(norm)
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
+}
+
+// armInjector взводит крэш-таймер в момент включения губернатора. Отсчёт
+// именно оттуда: губернатор поднимается после создания сокетов и резолва
+// облака, и «через 5 секунд после включения губернатора» должно означать
+// ровно это, а не 5 секунд от начала скана.
+func armInjector(ci *crashInjector, events chan<- string) {
+	if ci == nil {
+		return
+	}
+	ci.arm(TestCrashAfter)
+	emitEvent(events, "[SYS] "+fmt.Sprintf(
+		"[gov] test-crash armed: упаду через %s от включения губернатора", TestCrashAfter))
+}
+
+// fatalDrainTimeout — сколько ждём, пока воркеры свернутся после краша, прежде
+// чем показать сплэш. Нужно, чтобы терминал не сыпал [VALID] поверх рамки.
+const fatalDrainTimeout = 2 * time.Second
+
+// crashInjector однократно роняет процесс из тела воркера.
+type crashInjector struct {
+	deadline time.Time
+	mu       sync.RWMutex
+	once     sync.Once
+}
+
+func (ci *crashInjector) arm(d time.Duration) {
+	if ci == nil || d <= 0 {
+		return
+	}
+	ci.mu.Lock()
+	ci.deadline = time.Now().Add(d)
+	ci.mu.Unlock()
+}
+
+func (ci *crashInjector) armed() bool {
+	if ci == nil {
+		return false
+	}
+	ci.mu.Lock()
+	dl := ci.deadline
+	ci.mu.Unlock()
+	return !dl.IsZero() && time.Now().After(dl)
+}
+
+// fire поднимает настоящую рантайм-панику Go. assignment to entry in nil map —
+// это не искусственный panic("..."), а реальная ошибка, которую Go порождает
+// сам: ровно такие летят из прод-кода при неинициализированной карте.
+func (ci *crashInjector) fire() {
+	if !ci.armed() {
+		return
+	}
+	ci.once.Do(func() {
+		var m map[string]int
+		m["pipeline"] = 1 // panic: assignment to entry in nil map
+	})
+}
+
 type dhResp struct {
 	Code   int
 	CSeq   int64
@@ -280,6 +464,9 @@ type graveEntry struct {
 	aid      []byte
 	retries  int
 	deadline time.Time
+	// explicit — вердикт сервера (401), а не тишина. Такой ретраится даже
+	// в шторм: ответ неизвестен, хоронить нельзя.
+	explicit bool
 }
 
 type channelPipeline struct {
@@ -299,6 +486,9 @@ type channelPipeline struct {
 	buf                       []byte
 	limiter                   *rateLimiter
 	ctx                       context.Context
+	injector                  *crashInjector
+	lastReconnect             time.Time
+	lastRaw                   []byte
 }
 
 func (p *channelPipeline) tryRate() bool {
@@ -324,6 +514,66 @@ func (p *channelPipeline) nextRateDelay() time.Duration {
 		return 0
 	}
 	return p.limiter.nextDelay()
+}
+
+// curTimeout — адаптивный таймаут ответа: медиана RTT × фактор, в клещах
+// [TIMEOUT_MIN, ACK_TIMEOUT]. Облако отвечает 404 за ~70-350мс — ждать 15с
+// каждого молчуна нет смысла, это и есть залипание. Без статистики RTT
+// (старт прогона) — консервативные ACK_TIMEOUT.
+//
+// ВАЖНО: медиана считается не чаще раза в секунду (кэш). govMedianRTT — это
+// аллокация + до 512 атомарных чтений + сортировка; на каждый пакет при
+// 10к rps это был бы отдельный CPU-пожар.
+func (p *channelPipeline) curTimeout() time.Duration {
+	now := time.Now()
+	if last := timeoutUpdatedAt.Load(); now.Sub(time.Unix(0, last)) > time.Second {
+		if timeoutUpdatedAt.CompareAndSwap(last, now.UnixNano()) {
+			to := int64(ACK_TIMEOUT)
+			if med := govMedianRTT(); med > 0 {
+				to = med * TIMEOUT_RTT_FACTOR
+				if to < int64(TIMEOUT_MIN) {
+					to = int64(TIMEOUT_MIN)
+				}
+				if to > int64(ACK_TIMEOUT) {
+					to = int64(ACK_TIMEOUT)
+				}
+			}
+			cachedTimeoutNs.Store(to)
+		}
+	}
+	return time.Duration(cachedTimeoutNs.Load())
+}
+
+var (
+	cachedTimeoutNs atomic.Int64
+	timeoutUpdatedAt atomic.Int64
+)
+
+// stormMode — шторм потерь: тишина сейчас почти наверняка конгестия.
+func (p *channelPipeline) stormMode() bool {
+	return p.emaSet && p.expiredEMA > STORM_EXPIRED_EMA
+}
+
+// gravePut кладёт в могильник с капом: лишнее (самый старый дедлайн) —
+// сразу в dead, иначе рост без bound и O(n) на каждый pump.
+func (p *channelPipeline) gravePut(c int64, g *graveEntry, stats *ScanStats) {
+	if len(p.graveyard) >= GRAVE_CAP {
+		var oldC int64
+		var oldD time.Time
+		first := true
+		for cc, gg := range p.graveyard {
+			if first || gg.deadline.Before(oldD) {
+				oldC, oldD, first = cc, gg.deadline, false
+			}
+		}
+		if !first {
+			og := p.graveyard[oldC]
+			delete(p.graveyard, oldC)
+			atomic.AddInt64(&stats.Dead, 1)
+			protolog("× %s dead (graveyard overflow)", og.serial)
+		}
+	}
+	p.graveyard[c] = g
 }
 
 func newChannelPipeline(conn *net.UDPConn, timeout time.Duration) *channelPipeline {
@@ -361,10 +611,70 @@ func newChannelPipeline(conn *net.UDPConn, timeout time.Duration) *channelPipeli
 	return p
 }
 
-func (p *channelPipeline) write(method, path, body string, cseq int64) bool {
+func (p *channelPipeline) write(method, path, body string, cseq int64) error {
+	// P2PWN-ПАРИТЕТ: auth свежий на КАЖДЫЙ запрос. Раньше nonce/created/digest
+	// считались раз на воркер при старте пайплайна и жили весь прогон (часы).
+	// Облако валидирует свежесть Created — через ~10 минут всё начинало
+	// сыпать 401+TimeOut. У p2pwn buildRequest считает fresh nonce/created/
+	// digest на каждый запрос, поэтому там 401 и не видно.
+	p.refreshAuth()
 	p.conn.SetWriteDeadline(time.Now().Add(p.timeout))
 	_, err := p.conn.Write([]byte(dhReq(method, path, body, cseq, p.digest, p.nonceStr, p.curdate)))
-	return err == nil
+	return err
+}
+
+// refreshAuth пересчитывает WSSE-auth под текущий момент. Дешёво (один sha1),
+// зовётся на каждый запрос — см. write.
+func (p *channelPipeline) refreshAuth() {
+	nonce := rand.Int63n(1<<32) - (1 << 31)
+	p.nonceStr = strconv.FormatInt(nonce, 10)
+	p.curdate = time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	hash := sha1.Sum([]byte(p.nonceStr + p.curdate + "DHP2P:" + USERNAME + ":" + USERKEY))
+	p.digest = base64.StdEncoding.EncodeToString(hash[:])
+}
+
+// isUDPHardError — ошибка уровня сокета, а не обычный таймаут.
+//
+// Зачем: connected UDP + ICMP unreachable (облако/фаервол режет при высоком
+// RPS) = Read/Write падают мгновенно с connection refused вместо блокировки
+// до дедлайна. Без обработки воркер крутится вхолостую: expire нечего
+// (дедлайны в будущем), губернатор ничего не видит (ни TO, ни ERR), счётчики
+// стоят. Порт из p2pwn (thebadinteger/p2pwn, chanpipe.go).
+func isUDPHardError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "forcibly closed") ||
+		strings.Contains(s, "broken pipe")
+}
+
+// reconnect меняет отравленный ICMP-сокет на чистый.
+//
+// Отравление держится, пока прилетают ICMP: каждый Read падает мгновенно и
+// пайплайн busy-spin'ится. Redial даёт воркеру чистый сокет. Троттл 1с —
+// чтобы 30 воркеров не долбили переподключениями синхронно.
+func (p *channelPipeline) reconnect() {
+	if time.Since(p.lastReconnect) < time.Second {
+		return
+	}
+	p.lastReconnect = time.Now()
+	raddr, _ := p.conn.RemoteAddr().(*net.UDPAddr)
+	if raddr == nil {
+		return
+	}
+	conn, err := net.DialUDP("udp", nil, raddr)
+	if err != nil {
+		return
+	}
+	conn.SetWriteBuffer(SOCKET_BUF)
+	conn.SetReadBuffer(256 * 1024)
+	old := p.conn
+	p.conn = conn
+	p.lport = conn.LocalAddr().(*net.UDPAddr).Port
+	old.Close()
 }
 
 func (p *channelPipeline) markChecked(serial string, stats *ScanStats) {
@@ -382,16 +692,28 @@ func (p *channelPipeline) sendFail(serial string, stats *ScanStats) {
 	atomic.AddInt64(&stats.Dead, 1)
 }
 
+// sendJitter растаскивает дедлайны пачки, ушедшей burst'ом.
+func sendJitter() time.Duration {
+	return time.Duration(rand.Int63n(int64(SEND_JITTER_BOUND)))
+}
+
 func (p *channelPipeline) send(serial string) bool {
 	cseq := atomic.AddInt64(&cseqCounter, 1)
 	aid := randomAID()
-	if !p.write("DHPOST", fmt.Sprintf("/device/%s/p2p-channel", serial), p2pChannelBody(p.lport, aid), cseq) {
+	if err := p.write("DHPOST", fmt.Sprintf("/device/%s/p2p-channel", serial), p2pChannelBody(p.lport, aid), cseq); err != nil {
+		if isUDPHardError(err) {
+			p.reconnect()
+		}
 		protolog("× %s send fail (socket write, cseq=%d)", serial, cseq)
+		scanlog("[SCAN] %s send-fail cseq=%d", serial, cseq)
 		govRecordErr()
 		return false
 	}
 	protolog("> DHPOST /device/%s/p2p-channel cseq=%d", serial, cseq)
-	p.inflight[cseq] = &inflightChannel{serial: serial, aid: aid, deadline: time.Now().Add(p.timeout), sentAt: time.Now()}
+	p.inflight[cseq] = &inflightChannel{serial: serial, aid: aid, deadline: time.Now().Add(p.curTimeout() + sendJitter()), sentAt: time.Now()}
+	// SEND_STAGGER висел константой и нигде не использовался — пачка из окна
+	// уходила в один syscall-такт и будила троттлинг облака. Растаскиваем.
+	time.Sleep(SEND_STAGGER)
 	return true
 }
 
@@ -399,9 +721,59 @@ func (p *channelPipeline) readResp(dl time.Time) (dhResp, bool) {
 	p.conn.SetReadDeadline(dl)
 	n, err := p.conn.Read(p.buf)
 	if err != nil {
+		if isUDPHardError(err) {
+			p.reconnect()
+		}
 		return dhResp{}, false
 	}
+	// Сырой ответ держим для дампа 401: копия, т.к. p.buf переиспользуется
+	// следующим Read. Копируем всегда — дешевле одного if на пакет.
+	p.lastRaw = append(p.lastRaw[:0], p.buf[:n]...)
 	return parseDHResp(p.buf[:n]), true
+}
+
+// On401 — подлянка для отладки 401: каждый ответ сервера с кодом 401 уходит
+// сюда целиком (сырой текст: статус, заголовки, тело), как логгирование в
+// dh-fwd. Ставится фазой скана, пишет в 401.txt с капом (см. prefixrun).
+// nil = не пишем. Вызывается из воркеров, хук обязан быть потокобезопасным.
+var On401 func(serial, raw string)
+
+func record401(serial string, raw []byte) {
+	if On401 == nil {
+		return
+	}
+	On401(serial, string(raw))
+}
+
+// Wire401Dump пишет каждый 401-ответ сервера в файл целиком (сырой текст).
+// Возвращает unwire (снимает хук, закрывает файл). Кап max штук: 401-х при
+// троттлинге могут быть миллионы, для разбора хватает первых.
+func Wire401Dump(path string, max int64) func() {
+	if max <= 0 {
+		max = 1000
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return func() {}
+	}
+	var mu sync.Mutex
+	var n int64
+	On401 = func(serial, raw string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if n >= max {
+			return
+		}
+		n++
+		fmt.Fprintf(f, "=== %s %s (%d/%d) ===\n%s\n", time.Now().Format("15:04:05"), serial, n, max, raw)
+	}
+	return func() {
+		On401 = nil
+		mu.Lock()
+		defer mu.Unlock()
+		_ = f.Sync()
+		_ = f.Close()
+	}
 }
 
 func (p *channelPipeline) minDeadline() time.Time {
@@ -421,13 +793,21 @@ func (p *channelPipeline) minDeadline() time.Time {
 
 func (p *channelPipeline) expire(stats *ScanStats) {
 	now := time.Now()
+	storm := p.stormMode()
 	for c, ir := range p.inflight {
 		if now.After(ir.deadline) {
 			delete(p.inflight, c)
 			p.expiredCycle++
 			govRecordTO()
 			p.markChecked(ir.serial, stats)
-			p.graveyard[c] = &graveEntry{serial: ir.serial, aid: ir.aid, retries: ir.retries, deadline: now.Add(p.graceTTL)}
+			if storm {
+				// Шторм: тишина — почти наверняка наш дроп от перегруза.
+				// Ретраи только добавят нагрузки — сразу в dead.
+				atomic.AddInt64(&stats.Dead, 1)
+				protolog("× %s dead (silence in storm, no retry)", ir.serial)
+				continue
+			}
+			p.gravePut(c, &graveEntry{serial: ir.serial, aid: ir.aid, retries: ir.retries, deadline: now.Add(p.graceTTL)}, stats)
 		}
 	}
 	for c, g := range p.graveyard {
@@ -436,6 +816,15 @@ func (p *channelPipeline) expire(stats *ScanStats) {
 				delete(p.graveyard, c)
 				atomic.AddInt64(&stats.Dead, 1)
 				protolog("× %s dead (silence, retries exhausted)", g.serial)
+				scanlogSampled("[SCAN] %s dead (silence, retries exhausted)", g.serial)
+				continue
+			}
+			if storm && !g.explicit {
+				// Шторм: молчуна не дёргаем повторно — в dead. Явный 401
+				// ждёт своей очереди ниже: вердикт неизвестен.
+				delete(p.graveyard, c)
+				atomic.AddInt64(&stats.Dead, 1)
+				protolog("× %s dead (silence in storm, no retry)", g.serial)
 				continue
 			}
 			if !p.tryRate() {
@@ -451,20 +840,25 @@ func (p *channelPipeline) expire(stats *ScanStats) {
 func (p *channelPipeline) sendRetry(g *graveEntry, stats *ScanStats) {
 	cseq := atomic.AddInt64(&cseqCounter, 1)
 	aid := randomAID()
-	if !p.write("DHPOST", fmt.Sprintf("/device/%s/p2p-channel", g.serial), p2pChannelBody(p.lport, aid), cseq) {
+	if err := p.write("DHPOST", fmt.Sprintf("/device/%s/p2p-channel", g.serial), p2pChannelBody(p.lport, aid), cseq); err != nil {
+		if isUDPHardError(err) {
+			p.reconnect()
+		}
 		govRecordErr()
 		p.sendFail(g.serial, stats)
 		return
 	}
 	protolog("~ %s retry %d/%d cseq=%d", g.serial, g.retries+1, CHANNEL_RETRIES, cseq)
-	p.inflight[cseq] = &inflightChannel{serial: g.serial, aid: aid, retries: g.retries + 1, deadline: time.Now().Add(p.timeout), sentAt: time.Now()}
+	scanlogSampled("[SCAN] %s retry %d/%d", g.serial, g.retries+1, CHANNEL_RETRIES)
+	p.inflight[cseq] = &inflightChannel{serial: g.serial, aid: aid, retries: g.retries + 1, deadline: time.Now().Add(p.curTimeout() + sendJitter()), sentAt: time.Now()}
+	time.Sleep(SEND_STAGGER)
 }
 
 func (p *channelPipeline) resolve(r dhResp, aliveCh chan<- string, stats *ScanStats) {
 	if r.Code < 200 {
 		if ir, ok := p.inflight[r.CSeq]; ok && !ir.extended {
 			ir.extended = true
-			ir.deadline = time.Now().Add(p.timeout)
+			ir.deadline = time.Now().Add(p.curTimeout())
 			protolog("< %d cseq=%d %s (provisional, deadline+)", r.Code, r.CSeq, ir.serial)
 		}
 		return
@@ -479,11 +873,26 @@ func (p *channelPipeline) resolve(r dhResp, aliveCh chan<- string, stats *ScanSt
 		if channelAckAlive(r) {
 			atomic.AddInt64(&stats.Alive, 1)
 			protolog("< %d cseq=%d %s (alive)", r.Code, r.CSeq, ir.serial)
+			scanlog("[SCAN] %s alive code=%d rtt=%s", ir.serial, r.Code, time.Since(ir.sentAt).Round(time.Millisecond))
 			aliveCh <- ir.serial
 			p.teardown(ir.aid, r)
+		} else if r.Code == 401 {
+			// 401 с телом <Error>TimeOut</Error> — облако сбросило нагрузку,
+			// вердикт неизвестен. Не dead: в могильник на ретрай, как тишину.
+			// Ретраи идут через лимитер и grace, шторм к тому же давит
+			// губернатор — долбёжки не будет.
+			delete(p.inflight, r.CSeq)
+			p.expiredCycle++
+			govRecordTO()
+			p.markChecked(ir.serial, stats)
+			p.gravePut(r.CSeq, &graveEntry{serial: ir.serial, aid: ir.aid, retries: ir.retries, deadline: time.Now().Add(p.graceTTL), explicit: true}, stats)
+			protolog("< %d cseq=%d %s (401 cloud-timeout, queued retry)", r.Code, r.CSeq, ir.serial)
+			scanlogSampled("[SCAN] %s 401 (cloud timeout) → retry", ir.serial)
+			record401(ir.serial, p.lastRaw)
 		} else {
 			atomic.AddInt64(&stats.Dead, 1)
 			protolog("< %d cseq=%d %s (dead)", r.Code, r.CSeq, ir.serial)
+			scanlogSampled("[SCAN] %s dead code=%d rtt=%s", ir.serial, r.Code, time.Since(ir.sentAt).Round(time.Millisecond))
 		}
 		return
 	}
@@ -493,11 +902,25 @@ func (p *channelPipeline) resolve(r dhResp, aliveCh chan<- string, stats *ScanSt
 		if channelAckAlive(r) {
 			atomic.AddInt64(&stats.Alive, 1)
 			protolog("< %d cseq=%d %s (late alive)", r.Code, r.CSeq, g.serial)
+			scanlog("[SCAN] %s alive (late) code=%d", g.serial, r.Code)
 			aliveCh <- g.serial
 			p.teardown(g.aid, r)
+		} else if r.Code == 401 && g.retries < CHANNEL_RETRIES {
+			// Поздний 401 на уже ретраенный запрос: бюджет ещё есть —
+			// обратно в могильник, expire добьёт по счётчику.
+			govRecordTO()
+			p.gravePut(r.CSeq, &graveEntry{serial: g.serial, aid: g.aid, retries: g.retries, deadline: time.Now().Add(p.graceTTL), explicit: true}, stats)
+			protolog("< %d cseq=%d %s (late 401, queued retry)", r.Code, r.CSeq, g.serial)
+			scanlogSampled("[SCAN] %s 401 (late) → retry", g.serial)
+			record401(g.serial, p.lastRaw)
 		} else {
 			atomic.AddInt64(&stats.Dead, 1)
 			protolog("< %d cseq=%d %s (late dead)", r.Code, r.CSeq, g.serial)
+			scanlogSampled("[SCAN] %s dead (late) code=%d", g.serial, r.Code)
+			if r.Code == 401 {
+				record401(g.serial, p.lastRaw)
+				govRecordTO()
+			}
 		}
 		return
 	}
@@ -584,6 +1007,11 @@ func (p *channelPipeline) run(ctx context.Context, jobs <-chan string, aliveCh c
 		if ctx.Err() != nil {
 			return
 		}
+		// Тестовый крэш: срабатывает в теле воркера, поэтому поднимается
+		// внутри горутицы scanWorker и проходит её recover -> crashGuard.
+		if p.injector != nil && p.injector.armed() {
+			p.injector.fire()
+		}
 		pumpCap = 0
 
 		for len(p.inflight) < p.window {
@@ -654,6 +1082,9 @@ func (p *channelPipeline) pump(ctx context.Context, aliveCh chan<- string, stats
 	if maxWait > 0 && maxWait < wait {
 		wait = maxWait
 	}
+	if wait > PUMP_MAX_WAIT {
+		wait = PUMP_MAX_WAIT
+	}
 	if wait < time.Millisecond {
 		wait = time.Millisecond
 	}
@@ -666,9 +1097,10 @@ func (p *channelPipeline) pump(ctx context.Context, aliveCh chan<- string, stats
 	p.expire(stats)
 }
 
-func scanWorker(ctx context.Context, conn *net.UDPConn, jobs <-chan string, aliveCh chan<- string, stats *ScanStats, timeout time.Duration, limiter *rateLimiter) {
+func scanWorker(ctx context.Context, conn *net.UDPConn, jobs <-chan string, aliveCh chan<- string, stats *ScanStats, timeout time.Duration, limiter *rateLimiter, injector *crashInjector) {
 	p := newChannelPipeline(conn, timeout)
 	p.limiter = limiter
+	p.injector = injector
 	p.run(ctx, jobs, aliveCh, stats)
 }
 
@@ -710,6 +1142,37 @@ func protolog(format string, args ...any) {
 		return
 	}
 	LogHook(fmt.Sprintf(format, args...))
+}
+
+// ScanLog — детальный лог фазы скана серийников (а не эксплоита).
+//
+// protolog виден только в Debug-режиме, а в обычном прогоне фаза [1/2] идёт
+// молча: только бар и found. ScanLog светит каждый alive и семплированные
+// dead/retry прямо в ленту и лог-файл, без включения Debug со всем его спамом.
+//
+// Семплинг обязателен: на 3к rps полный лог dead — это 3к строк/с и гигабайты
+// за прогон 75М серийников. Alive редкие — идут все.
+var ScanLog func(string)
+
+var scanLogTick uint64
+
+const scanLogSample = 256
+
+func scanlog(format string, args ...any) {
+	if ScanLog == nil {
+		return
+	}
+	ScanLog(fmt.Sprintf(format, args...))
+}
+
+func scanlogSampled(format string, args ...any) {
+	if ScanLog == nil {
+		return
+	}
+	if atomic.AddUint64(&scanLogTick, 1)&(scanLogSample-1) != 0 {
+		return
+	}
+	ScanLog(fmt.Sprintf(format, args...))
 }
 
 func streamSerials(ctx context.Context, f *os.File, stats *ScanStats, events chan<- string, out chan<- string, dedupWindow int) (int64, string) {
@@ -769,18 +1232,10 @@ func streamSerials(ctx context.Context, f *os.File, stats *ScanStats, events cha
 	return emitted, ""
 }
 
+// lookupCloudIPs returns the cloud edge IPs. Resolution failures are absorbed:
+// cloudip falls back to its hardcoded pool, so a dead resolver costs us nothing.
 func lookupCloudIPs() []net.IP {
-	ips, err := net.LookupIP(MAIN_SERVER)
-	if err != nil {
-		return nil
-	}
-	var v4 []net.IP
-	for _, ip := range ips {
-		if ip4 := ip.To4(); ip4 != nil {
-			v4 = append(v4, ip4)
-		}
-	}
-	return v4
+	return cloudip.IPs(MAIN_SERVER)
 }
 
 func newEgress(ip net.IP) (*net.UDPConn, error) {
@@ -818,12 +1273,10 @@ func runPipe(ctx context.Context, stats *ScanStats, events chan<- string, sink f
 
 	cloudIPs := lookupCloudIPs()
 	if len(cloudIPs) == 0 {
-		if raddr, rerr := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", MAIN_SERVER, MAIN_PORT)); rerr == nil {
-			cloudIPs = []net.IP{raddr.IP}
-		}
-	}
-	if len(cloudIPs) == 0 {
 		return i18n.Tr("ошибка резолва сервера: ") + MAIN_SERVER
+	}
+	if cloudip.Static() {
+		emitEvent(events, "[SYS] "+i18n.Tr("DNS недоступен, беру захардкоженный пул: ")+fmt.Sprintf("%d шт.", len(cloudIPs)))
 	}
 	emitEvent(events, "[SYS] "+fmt.Sprintf(i18n.Tr("пинг %s — ок"), fmt.Sprintf("%s:%d", MAIN_SERVER, MAIN_PORT)))
 
@@ -851,30 +1304,61 @@ func runPipe(ctx context.Context, stats *ScanStats, events chan<- string, sink f
 	}()
 
 	var limiter *rateLimiter
+
+	// Крэш-триггер: создаётся здесь, но не взводится. Отсчёт пойдёт от
+	// включения губернатора — см. armInjector в ветке default.
+	injector := &crashInjector{}
+	if TestCrashAfter <= 0 {
+		injector = nil
+	}
+
 	switch {
 	case !GovernorOn:
 	case GovernorCap > 0:
 		limiter = newRateLimiter(GovernorCap, BURST_LIMIT)
+		// governor_cap задан: адаптивного губернатора нет, но фиксированный
+		// кап всё равно «включение ограничителя» — взводим и здесь.
+		armInjector(injector, events)
 	default:
 		resetGov()
 		limiter = newRateLimiter(govStartPPS, BURST_LIMIT)
+		armInjector(injector, events)
 		go governorLoop(ctx, limiter)
 	}
 	jobs := make(chan string, workers*10)
 	aliveCh := make(chan string, workers*10)
 
+	// Свой контекст прогона. При краше одного воркера остальные 29 продолжают
+	// работать и сыпать [VALID] поверх сплэша, пока главная горутина висит в
+	// WaitForKey. Отменяем его ДО показа сплэша, чтобы терминал был тихим.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+
 	var rwg sync.WaitGroup
+	var wgOnce sync.Once
+	// stopAll гасит конвейер и ждёт, пока воркеры свернутся.
+	stopAll := func() {
+		wgOnce.Do(func() {
+			cancelRun()
+			done := make(chan struct{})
+			go func() { rwg.Wait(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(fatalDrainTimeout):
+			}
+		})
+	}
 	for _, conn := range conns {
 		rwg.Add(1)
 		go func(c *net.UDPConn) {
 			defer rwg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					crashGuard(r)
-					panic(r)
+					stopAll()
+					raiseOrReraise(r)
 				}
 			}()
-			scanWorker(ctx, c, jobs, aliveCh, stats, ACK_TIMEOUT, limiter)
+			scanWorker(runCtx, c, jobs, aliveCh, stats, ACK_TIMEOUT, limiter, injector)
 		}(conn)
 	}
 
@@ -888,8 +1372,7 @@ func runPipe(ctx context.Context, stats *ScanStats, events chan<- string, sink f
 		defer writeWg.Done()
 		defer func() {
 			if r := recover(); r != nil {
-				crashGuard(r)
-				panic(r)
+				raiseOrReraise(r)
 			}
 		}()
 		for s := range aliveCh {
@@ -903,9 +1386,19 @@ func runPipe(ctx context.Context, stats *ScanStats, events chan<- string, sink f
 	}()
 
 	start := time.Now()
+
 	updStop := make(chan struct{})
-	var lastAliveMark int64
+
+	// На resume счётчик Checked уже предзаполнен на skip (см. RunPrefixesMem),
+	// а Alive — находками из чекпоинта. Если считать скорость и темп находок
+	// от нуля, первый же тик выдаёт checked/elapsed на миллионы серийников в
+	// секунду и AliveRate со всеми накопленными находками разом. Окно
+	// наблюдения надо открывать с текущего состояния — так же, как при первом
+	// запуске скана.
+	statsBase := atomic.LoadInt64(&stats.Checked)
+	lastAliveMark := atomic.LoadInt64(&stats.Alive)
 	lastAliveT := start
+
 	go func() {
 		ticker := time.NewTicker(300 * time.Millisecond)
 		defer ticker.Stop()
@@ -916,15 +1409,22 @@ func runPipe(ctx context.Context, stats *ScanStats, events chan<- string, sink f
 			case <-updStop:
 				return
 			case <-ticker.C:
-				checked := atomic.LoadInt64(&stats.Checked)
 				elapsed := time.Since(start).Seconds()
 				if elapsed > 0 {
-					stats.Speed = float64(checked) / elapsed
+					delta := atomic.LoadInt64(&stats.Checked) - statsBase
+					if delta < 0 {
+						delta = 0
+					}
+					stats.Speed = float64(delta) / elapsed
 				}
 				now := time.Now()
 				if now.Sub(lastAliveT) >= 10*time.Second {
 					alive := atomic.LoadInt64(&stats.Alive)
-					stats.AliveRate = float64(alive-lastAliveMark) / now.Sub(lastAliveT).Seconds() * 60
+					d := alive - lastAliveMark
+					if d < 0 {
+						d = 0
+					}
+					stats.AliveRate = float64(d) / now.Sub(lastAliveT).Seconds() * 60
 					lastAliveMark, lastAliveT = alive, now
 				}
 			}
@@ -969,6 +1469,10 @@ func RunScanner(ctx context.Context, inputFile, outputFile string, appendMode bo
 		return
 	}
 	defer outFile.Close()
+
+	// Подлянка для 401 и здесь: сырые ответы сервера в 401.txt рядом с выходом.
+	unwire401 := Wire401Dump(filepath.Join(filepath.Dir(outputFile), "401.txt"), 1000)
+	defer unwire401()
 
 	sink := func(s string) {
 		outWriter.WriteString(s + "\n")

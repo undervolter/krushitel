@@ -11,16 +11,27 @@ import (
 
 var checkReadTimeout = 8 * time.Second
 
-func VerifyDevice(serial string, logf func(string, ...any)) (bool, bool, error) {
-	return verifyDeviceOn(serial, smartpssProfile.mainServer, smartpssProfile.mainPort, smartpssProfile, logf)
+// VerifyDevice проверяет, отвечает ли серийник, до подъёма туннеля.
+//
+// ctx обязателен и не декоративен: функция блокируется в чтениях облака, и без
+// отменяемого контекста она висела до 16 секунд на серийник вслепую — /stop и
+// Ctrl+C не могли её прервать.
+func VerifyDevice(ctx context.Context, serial string, logf func(string, ...any)) (bool, bool, error) {
+	return verifyDeviceOn(ctx, serial, smartpssProfile.mainServer, smartpssProfile.mainPort, smartpssProfile, logf)
 }
 
-func verifyDeviceOn(serial, host string, port int, prof *appProfile, logf func(string, ...any)) (bool, bool, error) {
+func verifyDeviceOn(ctx context.Context, serial, host string, port int, prof *appProfile, logf func(string, ...any)) (bool, bool, error) {
 	if prof == nil {
 		prof = smartpssProfile
 	}
 	if logf == nil {
 		logf = func(string, ...any) {}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, false, err
 	}
 	u := NewUDP(host, port, false, prof)
 	defer u.Close()
@@ -58,13 +69,19 @@ func verifyDeviceOn(serial, host string, port int, prof *appProfile, logf func(s
 	}
 	if ack == nil {
 		var rerr error
-		ack, rerr = u.Read(true, checkReadTimeout)
+		ack, rerr = u.ReadCtx(ctx, true, checkReadTimeout)
 		if rerr == nil && ack.Code < 200 {
-			ack, rerr = u.Read(true, checkReadTimeout)
+			ack, rerr = u.ReadCtx(ctx, true, checkReadTimeout)
 		}
 		if rerr != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return false, false, cerr
+			}
 			return false, false, fmt.Errorf("verify channel silent: %w", rerr)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return false, false, err
 	}
 	if ack.Code == 404 {
 		return false, false, nil
@@ -97,8 +114,12 @@ func checkSerialsOn(ctx context.Context, serials []string, concurrency int, host
 		go func(serial string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
-			alive, needsAuth, err := verifyDeviceOn(serial, host, port, smartpssProfile, nil)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(rand.Intn(50)) * time.Millisecond):
+			}
+			alive, needsAuth, err := verifyDeviceOn(ctx, serial, host, port, smartpssProfile, nil)
 			onResult(serial, alive, needsAuth, err)
 		}(sn)
 	}

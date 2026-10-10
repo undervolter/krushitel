@@ -34,6 +34,27 @@ func pickSerial(s string) string {
 			return m
 		}
 	}
+	// Запасной путь. reDahua требует букву 'P' на 8-м месте (типовой вид
+	// Dahua — 7L06563PA12345), но реальные серийники из облака бывают и без
+	// неё: 7L06563RAG523EC, 3E06AF0PAK00048, 1M00DA1PAN и так далее.
+	//
+	// Раньше такие строки молча отбрасывались, а это ломало ВСЁ, что читает
+	// файлы состояния: ReadDoneSet, readCrashSerials, readAliveFile,
+	// streamSerials. Проверено на реальном прогоне — отбрасывалось 100%
+	// серийников из results.csv, то есть resume терял весь прогресс.
+	return pickSerialLoose(up)
+}
+
+var reSerialLoose = regexp.MustCompile(`[A-Z0-9]{14,15}`)
+
+// pickSerialLoose достаёт серийник без требования к шаблону Dahua: любая
+// последовательность из 14-15 букв и цифр.
+func pickSerialLoose(up string) string {
+	for _, m := range reSerialLoose.FindAllString(up, -1) {
+		if len(m) >= 14 && len(m) <= 15 {
+			return m
+		}
+	}
 	return ""
 }
 

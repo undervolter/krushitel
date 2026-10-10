@@ -229,6 +229,13 @@ func (b *API) SendDocument(chat int64, name string, data []byte) error {
 	return err
 }
 
+// fileURL собирает ссылку на скачивание файла. По Bot API это
+// https://api.telegram.org/file/bot<token>/<file_path> — именно в таком
+// порядке: /file/bot, а не /bot.../file (иначе телега отвечает 404).
+func (b *API) fileURL(filePath string) string {
+	return "https://api.telegram.org/file/bot" + b.token + "/" + filePath
+}
+
 func (b *API) Download(fileID string) ([]byte, error) {
 	q := url.Values{}
 	q.Set("file_id", fileID)
@@ -246,7 +253,7 @@ func (b *API) Download(fileID string) ([]byte, error) {
 		return nil, errors.New("empty file_path")
 	}
 	resp, err := (&http.Client{Timeout: 60 * time.Second}).
-		Get(apiBase + b.token + "/file/" + fi.FilePath)
+		Get(b.fileURL(fi.FilePath))
 	if err != nil {
 		return nil, err
 	}

@@ -114,20 +114,45 @@ func (p *InProcessProvider) Acquire(ctx context.Context) (Binding, error) {
 		if err := ctx.Err(); err != nil {
 			return Binding{}, err
 		}
+		tSerial := time.Now()
 
-		if alive, _, verr := VerifyDevice(serial, p.logf); verr == nil && !alive {
+		alive, _, verr := VerifyDevice(ctx, serial, p.logf)
+		tVerify := time.Since(tSerial)
+		if verr == nil && !alive {
 			if p.OnDead != nil {
 				p.OnDead(serial, "offline (verify)")
 			}
+			p.logf("[EXP] %s offline (verify) verify=%s", serial, tVerify.Round(time.Millisecond))
 			p.logf("%s — offline (verify)", serial)
 			continue
 		}
+		// Таймаут в verify — это тоже «камера не отвечает». Раньше условие
+		// выше проверялось как verr == nil && !alive, и на ошибке таймаута
+		// провалывал: серийник дожидался ещё и полного подъёма туннеля,
+		// то есть мёртвая камера стоила и verify, и туннеля. Считаем явный
+		// отказ отказом.
+		if verr != nil && !errors.Is(verr, context.Canceled) && !errors.Is(verr, context.DeadlineExceeded) {
+			if p.OnDead != nil {
+				p.OnDead(serial, "offline (verify silent)")
+			}
+			p.logf("[EXP] %s offline (verify-silent) verify=%s err=%v", serial, tVerify.Round(time.Millisecond), verr)
+			p.logf("%s — offline (verify silent: %v)", serial, verr)
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return Binding{}, err
+		}
 
-		time.Sleep(time.Duration(20+rand.Intn(60)) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return Binding{}, ctx.Err()
+		case <-time.After(time.Duration(20+rand.Intn(60)) * time.Millisecond):
+		}
 
 		f, err := StartSupervised(ctx, serial, portSpecs(defaultTunnelPorts), func(line string) {
 			p.logf("%s", line)
 		})
+		tTunnel := time.Since(tSerial) - tVerify
 		if err != nil {
 			if ctx.Err() != nil {
 				return Binding{}, ctx.Err()
@@ -137,16 +162,19 @@ func (p *InProcessProvider) Acquire(ctx context.Context) (Binding, error) {
 				if p.OnDead != nil {
 					p.OnDead(serial, "offline (404)")
 				}
+				p.logf("[EXP] %s offline (404) verify=%s tunnel=%s", serial, tVerify.Round(time.Millisecond), tTunnel.Round(time.Millisecond))
 				p.logf("%s — offline (404)", serial)
 			} else if errors.Is(err, ErrNoDeviceLife) {
 				if p.OnDead != nil {
 					p.OnDead(serial, fmt.Sprintf("нет ответа за %v", zombieTimeout))
 				}
+				p.logf("[EXP] %s no-life verify=%s tunnel=%s", serial, tVerify.Round(time.Millisecond), tTunnel.Round(time.Millisecond))
 				p.logf(i18n.Tr("%s — нет ответа за %v — из очереди исключён"), serial, zombieTimeout)
 			} else if errors.Is(err, ErrAuthRequired) || isAuthError(err) {
 				if p.OnDead != nil {
 					p.OnDead(serial, "нужны креды (type 1)")
 				}
+				p.logf("[EXP] %s type1-auth verify=%s tunnel=%s", serial, tVerify.Round(time.Millisecond), tTunnel.Round(time.Millisecond))
 				p.logf(i18n.Tr("%s — устройство требует Type 1 auth"), serial)
 			} else {
 				p.attempts[serial]++
@@ -155,11 +183,13 @@ func (p *InProcessProvider) Acquire(ctx context.Context) (Binding, error) {
 					max = 1
 				}
 				if p.attempts[serial] >= max {
+					p.logf("[EXP] %s tunnel-fail verify=%s tunnel=%s err=%v", serial, tVerify.Round(time.Millisecond), tTunnel.Round(time.Millisecond), err)
 					p.logf(i18n.Tr("%s — исчерпан (%d туннель-подъёма за прогон)"), serial, p.attempts[serial])
 					if p.OnDead != nil {
 						p.OnDead(serial, fmt.Sprintf("туннель: %v", err))
 					}
 				} else {
+					p.logf("[EXP] %s tunnel-retry verify=%s tunnel=%s err=%v", serial, tVerify.Round(time.Millisecond), tTunnel.Round(time.Millisecond), err)
 					p.logf(i18n.Tr("%s — туннель не встал (%v) — в ре-очередь (попытка %d/%d)"), serial, err, p.attempts[serial], maxAcquireAttempts)
 					p.dead = append(p.dead, serial)
 				}
@@ -172,6 +202,7 @@ func (p *InProcessProvider) Acquire(ctx context.Context) (Binding, error) {
 		if camHTTP != 0 && camHTTP != 80 || camPriv != 0 && camPriv != 37777 || camRTSP != 0 && camRTSP != 554 {
 			p.logf(i18n.Tr("%s — порты из Info: http=%d priv=%d rtsp=%d"), serial, camHTTP, camPriv, camRTSP)
 		}
+		p.logf("[EXP] %s ok verify=%s tunnel=%s", serial, tVerify.Round(time.Millisecond), tTunnel.Round(time.Millisecond))
 		return Binding{
 			Serial:  serial,
 			Tunnel:  fwdTunnel{f: f},

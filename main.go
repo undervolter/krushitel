@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"os"
 	"runtime/debug"
-	"strings"
 	"time"
 
+	"krushitel/core/scanner"
 	"krushitel/core/ui"
 	"krushitel/core/update"
 )
@@ -17,20 +17,18 @@ func main() {
 		defer lf.Close()
 		redirectToCrashLog(lf)
 	}
+
+	// Паники из горутин воркеров main-recover не ловит: recover работает
+	// только на той горутине, где стоит defer. Поэтому сплэш «krushitel
+	// crashed» показывался лишь для крашей UI, а любой panic в scanWorker
+	// печатал голый трейс Go и просто уносил процесс. Здесь поднимаем
+	// общий обработчик, чтобы сплэш был для всех паник.
+	scanner.FatalHook = func(reason string, stack []byte) {
+		fatalCrash(lf, reason, stack)
+	}
 	defer func() {
 		if r := recover(); r != nil {
-			stack := debug.Stack()
-			msg := fmt.Sprintf("=== PANIC %s ===\n%v\n%s\n", time.Now().Format("02.01.2006 15:04:05"), r, string(stack))
-			if lf != nil {
-				_, _ = lf.WriteString(msg)
-			}
-			reason := strings.TrimSpace(strings.SplitN(fmt.Sprintf("%v", r), "\n", 2)[0])
-			if reason == "" {
-				reason = "unknown (see crash.log)"
-			}
-			fmt.Fprint(os.Stdout, ui.CrashSplash(reason, string(stack)))
-			ui.WaitForKey(os.Stdout)
-			os.Exit(1)
+			fatalCrash(lf, scanner.PanicReason(r), debug.Stack())
 		}
 	}()
 	if runHeadless() {
@@ -45,4 +43,17 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+// fatalCrash — единая точка смерти: пишем в crash.log, показываем сплэш,
+// выходим. Зовется и из main-recover, и из scanner.FatalHook.
+func fatalCrash(lf *os.File, reason string, stack []byte) {
+	if lf != nil {
+		fmt.Fprintf(lf, "=== PANIC %s ===\n%s\n%s\n",
+			time.Now().Format("02.01.2006 15:04:05"), reason, string(stack))
+		_ = lf.Sync()
+	}
+	// Логика и сплэш живут в ui.Fatal: там гасится TUI и пишется в
+	// настоящий терминал, а не в devNull, куда Run() уводит os.Stdout.
+	ui.Fatal(reason, stack)
 }

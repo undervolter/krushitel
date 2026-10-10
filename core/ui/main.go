@@ -71,8 +71,25 @@ type model struct {
 
 var teaProg *tea.Program
 
+// realTerm — настоящий терминал. В Run() os.Stdout уводится в devNull, чтобы
+// TUI-рендер не пачкал вывод, поэтому сплэш после краша нужно писать сюда.
+var realTerm = os.Stdout
+
+// StopForFatal гасит TUI и отдаёт настоящий терминал для сплэша.
+// Без этого bubbletea продолжит рисовать поверх рамки со стектрейсом.
+func StopForFatal() *os.File {
+	if teaProg != nil {
+		_ = teaProg.ReleaseTerminal()
+	}
+	if realTerm != nil {
+		return realTerm
+	}
+	return os.Stdout
+}
+
 func Run() bool {
 	realStdout := os.Stdout
+	realTerm = realStdout
 	realStderr := os.Stderr
 	if devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0); err == nil {
 		os.Stdout = devNull

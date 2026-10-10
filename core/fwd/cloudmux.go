@@ -7,6 +7,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"krushitel/core/cloudip"
 )
 
 const (
@@ -51,9 +53,9 @@ func GetCloudMux() (*cloudMux, error) {
 }
 
 func newCloudMux() (*cloudMux, error) {
-	raddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", MAIN_SERVER, MAIN_PORT))
-	if err != nil {
-		return nil, fmt.Errorf("resolve %s: %w", MAIN_SERVER, err)
+	raddr := cloudip.Next(MAIN_SERVER, MAIN_PORT)
+	if raddr == nil {
+		return nil, fmt.Errorf("resolve %s: no addresses", MAIN_SERVER)
 	}
 	pc, err := udpListenCfg.ListenPacket(context.Background(), "udp4", "0.0.0.0:0")
 	if err != nil {

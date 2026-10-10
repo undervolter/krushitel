@@ -30,7 +30,11 @@ func SnapshotChannel(addr, user, pass string, channel int, timeout time.Duration
 		timeout = 10 * time.Second
 	}
 	var lastErr error
-	for _, subtype := range []int{1, 0} {
+	// subtype=0 — ужатый подпоток, subtype=1 — основной (4K). Для снапшота
+	// 4K не нужен: декодирование кадра 4K H.265 жрёт сотни миллисекунд CPU,
+	// при сотне воркеров это starvation. Подпоток быстрее, легче и его
+	// хватает за глаза — поэтому он первый.
+	for _, subtype := range []int{0, 1} {
 		rtspURL := fmt.Sprintf("rtsp://%s/cam/realmonitor?channel=%d&subtype=%d", addr, channel, subtype)
 		data, err := snapshotURL(rtspURL, user, pass, timeout)
 		if err == nil {

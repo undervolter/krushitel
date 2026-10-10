@@ -62,7 +62,7 @@ func CrashSplash(reason string, stack string) string {
 	info := []string{
 		"krushitel crashed :(",
 		"reason - " + truncateRunesCrash(reason, 100),
-		"version v" + update.CurrentVersion,
+		"version v" + update.FullVersion(),
 		"stacktrace in crash.log",
 		"dev - t.me/kronaphasia",
 		"discord: undervolter",
@@ -118,6 +118,52 @@ func WaitForKey(out *os.File) {
 	}
 	fmt.Fprintln(out, tr("нажми любую клавишу..."))
 	waitKey()
+}
+
+// Fatal — единая точка смерти для краша из ЛЮБОЙ горутины.
+//
+// Зачем отдельный путь, если в Run() уже есть recover: тот ловит только
+// главную горутину. Паника в горутине воркера scanWorker шла мимо, и в TUI
+// получалось так: os.Stdout в это время перенаправлен в devNull, поэтому
+// сплэш уезжал в никуда, а bubbletea продолжал рендерить счётчики поверх
+// сплэша — экран превращался в кашу из рамки стектрейса и счётчиков.
+//
+// Здесь три шага в правильном порядке: гасим TUI и возвращаем настоящий
+// stdout, печатаем сплэш в терминал, ждём клавишу (только если это TTY —
+// в headless/cron ждать некого).
+func Fatal(reason string, stack []byte) {
+	crashDumpStack(reason, stack)
+	term := StopForFatal()
+	if reason == "" {
+		reason = "unknown (see crash.log)"
+	}
+	fmt.Fprint(term, CrashSplash(reason, string(stack)))
+	if isTTYFile(term) {
+		WaitForKey(term)
+	}
+	os.Exit(1)
+}
+
+func crashDumpStack(reason string, stack []byte) {
+	f, err := os.OpenFile("crash.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "=== PANIC %s ===\n%s\n%s\n",
+		time.Now().Format("02.01.2006 15:04:05"), reason, string(stack))
+	_ = f.Sync()
+}
+
+func isTTYFile(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return st.Mode()&os.ModeCharDevice != 0
 }
 
 func crashDump(stack []byte, r interface{}) {

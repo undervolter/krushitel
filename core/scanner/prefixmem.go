@@ -3,7 +3,10 @@ package scanner
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"sync/atomic"
+	"time"
 
 	"krushitel/core/i18n"
 )
@@ -27,10 +30,44 @@ func ResumeSkip(emitted, checked int64, workers int) int64 {
 	return skip
 }
 
-func streamSerialsMem(prefixes []string, skip int64, emit func(string) bool) int64 {
+// defaultPrefixPause — пауза между префиксами в фазе скана.
+//
+// Наблюдение с прогона: при долбёжке без передышки облако начинает отвечать
+// 401 без LocalAddr (вердикт падает в dead), пауза между префиксами это снимает.
+// Медленно (8с на ~1М серийников — единицы процентов времени), но это байпасс
+// троттлинга. 0/off — выключить.
+//
+//	KRUSH_PREFIX_PAUSE=15s ./krushitel
+//	KRUSH_PREFIX_PAUSE=off ./krushitel
+const defaultPrefixPause = 8 * time.Second
+
+// PrefixPause читается один раз на старте из KRUSH_PREFIX_PAUSE.
+var PrefixPause = parsePrefixPause(os.Getenv(envPrefixPause))
+
+// envPrefixPause — переменная, которой задаётся пауза.
+const envPrefixPause = "KRUSH_PREFIX_PAUSE"
+
+func parsePrefixPause(v string) time.Duration {
+	norm := strings.ToLower(strings.TrimSpace(v))
+	if norm == "" {
+		return defaultPrefixPause
+	}
+	switch norm {
+	case "off", "0", "no", "false", "disabled", "none", "выкл", "нет":
+		return 0
+	}
+	d, err := time.ParseDuration(norm)
+	if err != nil || d < 0 {
+		return 0
+	}
+	return d
+}
+
+func streamSerialsMem(ctx context.Context, prefixes []string, skip int64, emit func(string) bool, events chan<- string) int64 {
 	var fed, out int64
 	var buf [15]byte
-	for _, p := range prefixes {
+	for pi, p := range prefixes {
+		fedPrefix := out
 		copy(buf[:10], p)
 		for i := 0; i < SuffixCombos; i++ {
 			if fed < skip {
@@ -47,6 +84,16 @@ func streamSerialsMem(prefixes []string, skip int64, emit func(string) bool) int
 				return out
 			}
 			fed++
+		}
+		// Пауза между префиксами (см. PrefixPause). Полностью пропущенные
+		// по skip префиксы не ждут — там сканировать нечего.
+		if PrefixPause > 0 && out > fedPrefix && pi < len(prefixes)-1 {
+			emitEvent(events, "[SYS] "+fmt.Sprintf("пауза %s перед префиксом %d/%d", PrefixPause, pi+2, len(prefixes)))
+			select {
+			case <-ctx.Done():
+				return out
+			case <-time.After(PrefixPause):
+			}
 		}
 	}
 	return out
@@ -73,13 +120,13 @@ func RunPrefixesMem(ctx context.Context, prefixes []string, skip int64, workers 
 			case jobs <- s:
 			}
 			fed := atomic.AddInt64(&stats.Fed, 1)
-			if fed&4095 == 0 {
+			if fed&255 == 0 {
 				stats.LastSerial.Store(s)
 			}
 			atomic.StoreInt64(&stats.PrefixDone, (skip+fed)/SuffixCombos)
 			return true
 		}
-		streamSerialsMem(prefixes, skip, emit)
+		streamSerialsMem(ctx, prefixes, skip, emit, events)
 	}
 	return runPipe(ctx, stats, events, onAlive, workers, feed, nil)
 }

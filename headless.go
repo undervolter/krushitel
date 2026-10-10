@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"krushitel/core/cloud"
+	"krushitel/core/cloudip"
 	"krushitel/core/dhip"
 	"krushitel/core/exploit"
 	"krushitel/core/fwd"
@@ -59,6 +59,19 @@ func flog(format string, args ...any) {
 	}
 }
 
+// scanflog — детальный лог скана серийников: только в файл, без спама в stdout.
+// В headless stdout и так обновляется строкой прогресса, а [SCAN]-семпл
+// (десятки строк/с) её забивает.
+func scanflog(format string, args ...any) {
+	logMu.Lock()
+	defer logMu.Unlock()
+	if logFile == nil {
+		return
+	}
+	stamp := time.Now().Format("15:04:05")
+	fmt.Fprintf(logFile, "[%s] %s\n", stamp, fmt.Sprintf(format, args...))
+}
+
 func out(format string, args ...any) {
 	logMu.Lock()
 	defer logMu.Unlock()
@@ -85,15 +98,11 @@ func elapsed() string {
 }
 
 func cloudAlive() bool {
-	r := &net.Resolver{}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	addrs, err := r.LookupHost(ctx, fwd.MAIN_SERVER)
-	return err == nil && len(addrs) > 0
+	return cloudip.Alive(fwd.MAIN_SERVER)
 }
 
 func headlessUsage() {
-	out("[%s] krushitel v%s", time.Now().Format("15:04"), update.CurrentVersion)
+	out("[%s] krushitel v%s", time.Now().Format("15:04"), update.FullVersion())
 	rows := [][2]string{
 		{"  -i, --input FILE", i18n.Tr("Файл с серийниками/префиксами")},
 		{"  -m, --mode MODE", i18n.Tr("Режимы работы  (exploit (по умолчанию) | titles | ironscan)")},
@@ -139,7 +148,7 @@ func runHeadless() bool {
 	fs.StringVar(mode, "mode", "exploit", "алиас -m")
 	outDir := fs.String("o", "", "папка результатов")
 	fs.StringVar(outDir, "output", "", "алиас -o")
-	threads := fs.Int("t", 30, "потоки")
+	threads := fs.Int("t", 64, "потоки")
 	fs.IntVar(threads, "threads", 30, "алиас -t")
 	fresh := fs.Bool("f", false, "прогон заново, без resume")
 	fs.BoolVar(fresh, "fresh", false, "алиас -f")
@@ -264,7 +273,7 @@ func runHeadlessBot(cfg ui.Settings, threads int) int {
 	headlessLogOpen("tgbot.log")
 	unhook := wireHooks(cfg)
 	defer unhook()
-	fwd.InitLimit = 100
+	fwd.InitLimit = fwd.InitLimitFromEnv(100)
 	ctx, stop := headlessSignals()
 	defer stop()
 	err := tgbot.Run(tgbot.Options{
@@ -281,7 +290,6 @@ func runHeadlessBot(cfg ui.Settings, threads int) int {
 			CustomTexts: cfg.CustomTexts[:],
 			DummyLogin:  cfg.DummyLogin,
 			DummyPass:   cfg.DummyPass,
-			Destructive: cfg.Destructive,
 			WipeUsers:   cfg.WipeUsers,
 			},
 		Log: func(format string, args ...any) { flog("%s", fmt.Sprintf(format, args...)) },
@@ -398,17 +406,17 @@ func runHeadlessIronScan(cfg ui.Settings, inFile, outFile string, threads, port 
 func headlessBanner(online bool) {
 	now := time.Now().Format("15:04")
 	if !online {
-		out("[%s] krushitel v%s-beta", now, update.CurrentVersion)
+		out("[%s] krushitel v%s", now, update.FullVersion())
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	rel, err := update.Check(ctx)
 	if err != nil || rel == nil {
-		out("[%s] krushitel v%s-beta (latest)", now, update.CurrentVersion)
+		out("[%s] krushitel v%s (latest)", now, update.FullVersion())
 		return
 	}
-	out("[%s] krushitel v%s-beta", now, update.CurrentVersion)
+	out("[%s] krushitel v%s", now, update.FullVersion())
 	out("new update! (v%s)", rel.Version)
 	out("do you want to update? (y/n)")
 	var ans string
@@ -426,21 +434,32 @@ func headlessBanner(online bool) {
 	os.Exit(0)
 }
 
+// forceExitAfter — сколько ждём после отмены, прежде чем выйти принудительно.
+// Раньше первый Ctrl+C просто звал cancel() и возвращал управление терминалу:
+// воркеры ещё минутами сидели в неотменяемых блокировках, и единственным
+// способом остановить процесс был второй Ctrl+C (os.Exit). Теперь эскалация
+// автоматическая — второй палец не нужен.
+const forceExitAfter = 15 * time.Second
+
 func headlessSignals() (context.Context, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 4)
 	signal.Notify(sigCh, os.Interrupt)
 	go func() {
-		n := 0
+		forced := false
 		for range sigCh {
-			n++
-			if n == 1 {
-				out("[!] detected CTRL + C! exiting... - 1x")
-				cancel()
-			} else {
-				out("[!] Force shutdown - 2x")
+			if forced {
+				out("[!] Force shutdown")
 				os.Exit(130)
 			}
+			forced = true
+			out("[!] CTRL+C: останавливаюсь, воркеры выкарабкиваются до %s. Повтор — принудительно.", forceExitAfter)
+			cancel()
+			go func() {
+				time.Sleep(forceExitAfter)
+				out("[!] не дождался воркеров за %s — выхожу принудительно", forceExitAfter)
+				os.Exit(130)
+			}()
 		}
 	}()
 	return ctx, func() { signal.Stop(sigCh); cancel() }
@@ -481,11 +500,13 @@ func wireHooks(cfg ui.Settings) func() {
 	exploit.LogHook = func(format string, args ...any) {
 		flog("%s", fmt.Sprintf(format, args...))
 	}
+	scanner.ScanLog = func(line string) { scanflog("%s", line) }
 	return func() {
 		fwd.LogHook = nil
 		cloud.LogHook = nil
 		dhip.LogHook = nil
 		exploit.LogHook = nil
+		scanner.ScanLog = nil
 	}
 }
 
@@ -510,7 +531,7 @@ func runHeadlessExploit(cfg ui.Settings, inFile, outDir string, threads int, fre
 		}
 	}
 	if threads <= 0 {
-		threads = 30
+		threads = 64
 	}
 
 	headlessBanner(true)
@@ -561,7 +582,7 @@ func runHeadlessExploit(cfg ui.Settings, inFile, outDir string, threads int, fre
 		Prefixes: prefixes,
 	})
 
-	fwd.InitLimit = 100
+	fwd.InitLimit = fwd.InitLimitFromEnv(100)
 
 	ctx, stop := headlessSignals()
 	defer stop()
@@ -633,7 +654,6 @@ func runHeadlessExploit(cfg ui.Settings, inFile, outDir string, threads int, fre
 		DummyLogin:  cfg.DummyLogin,
 		DummyPass:   cfg.DummyPass,
 		Resume:      resume,
-		Destructive: cfg.Destructive,
 		WipeUsers:   cfg.WipeUsers,
 	}, tp, events)
 

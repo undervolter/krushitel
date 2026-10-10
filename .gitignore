@@ -75,3 +75,11 @@ dhscp/
 myapp_*
 dvr_dump.json
 .zcodeignore
+
+# локальные прогоны (папки результатов, не светить)
+401test/
+401test3/
+lapoliciya/
+leetcode/
+prefixes_*/
+prefixes/

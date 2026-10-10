@@ -52,7 +52,7 @@ func bannerBlock() string {
 	art := strings.Split(strings.TrimRight(bannerArt, "\n"), "\n")
 	info := []string{
 		"",
-		styleCyan.Bold(true).Render("крушитель v" + update.CurrentVersion),
+		styleCyan.Bold(true).Render("крушитель v" + update.FullVersion()),
 		styleYellow.Bold(true).Render(tr("Это бета версия")),
 		styleDim.Render("exploit-based dahua sn scanner"),
 		styleDim.Render("t.me/kkrushitel"),

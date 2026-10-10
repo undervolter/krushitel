@@ -205,6 +205,10 @@ func feedVisible(line string) bool {
 	if cfg.Debug {
 		return true
 	}
+	// Детальный лог скана серийников: семплированный, ленту не топит.
+	if strings.HasPrefix(line, "[SCAN]") {
+		return true
+	}
 	if strings.HasPrefix(line, "[VALID]") {
 		return false
 	}
