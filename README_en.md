@@ -33,7 +33,7 @@
 
 ### Building
 ```sh
-git clone -b beta https://github.com/undervolter/krushitel
+git clone https://github.com/undervolter/krushitel
 cd krushitel
 go build .
 ```
