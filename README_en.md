@@ -47,5 +47,5 @@ go build .
 If you would like to support the development of this software, feel free to submit a pull request.
 
 <div align="center">
-<h2>t.me/kkrushitel</h2>
+<h2>t.me/bastionne</h2>
 </div>
