@@ -52,7 +52,7 @@ go build .
 
 
 <div align="center">
-<h2>t.me/kkrushitel</h2>
+<h2>t.me/bastionne</h2>
 </div>
 
 
